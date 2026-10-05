@@ -122,7 +122,7 @@ def test_pasta_nao_encontrada_diz_o_nome_esperado_sem_listar_as_existentes(monke
     monkeypatch.setattr(sp, "get_folder_contents", lambda ctx, site, caminho, base: conteudo[caminho])
 
     with pytest.raises(RuntimeError) as exc:
-        sp.navigate(None, "s", "b", "/r", sp.build_nav_steps(date(2026, 10, 2)))
+        sp.navigate(None, "s", "b", "/r", sp.build_nav_steps(date(2026, 10, 5)))
     msg = str(exc.value)
     assert "10 OUT - 2026" in msg
     assert "Dispon" not in msg and "09 SET" not in msg

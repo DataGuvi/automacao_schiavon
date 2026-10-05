@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, quote as urlquote, unquote, urlparse
 from playwright.sync_api import TimeoutError as PwTimeout
+from commons.datas import week_bounds
 from commons.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -42,6 +43,14 @@ _PT_MES = {
     1: "JAN", 2: "FEV", 3: "MAR", 4: "ABR",
     5: "MAI", 6: "JUN", 7: "JUL", 8: "AGO",
     9: "SET", 10: "OUT", 11: "NOV", 12: "DEZ",
+}
+
+# O cliente as vezes nomeia o mes em ingles ("02 FEB - 2026" na Windermere):
+# `resolve_month_folder` aceita as duas abreviacoes (spec-coleta-arquivos-soltos R16).
+_EN_MES = {
+    1: "JAN", 2: "FEB", 3: "MAR", 4: "APR",
+    5: "MAY", 6: "JUN", 7: "JUL", 8: "AUG",
+    9: "SEP", 10: "OCT", 11: "NOV", 12: "DEC",
 }
 
 
@@ -87,39 +96,57 @@ def resolve_month_folder(entries: list[dict], reference: date | None = None) -> 
     """Procura o mês da data de referência em pastas com variações de formato. Padrão: hoje."""
     ref = reference or date.today()
     expected = current_month_folder(ref).lower()
+    abreviacoes = (_PT_MES[ref.month].lower(), _EN_MES[ref.month].lower())
     for entry in entries:
         if entry["type"] != "pasta":
             continue
         name = entry["name"].strip().lower()
-        if name == expected or f"{ref.month:02d}" in name and _PT_MES[ref.month].lower() in name:
+        if name == expected or f"{ref.month:02d}" in name and any(a in name for a in abreviacoes):
             return entry
     return None
 
 
-def _match_week_folder(entries: list[dict], day: int) -> dict | None:
-    """Procura a pasta cuja faixa 'DD A DD' contém o dia informado."""
+def semanas_da_coleta(hoje: date | None = None) -> list[date]:
+    """Segundas-feiras das semanas varridas pela coleta: a anterior e a atual
+    (spec-coleta-arquivos-soltos R4/R9)."""
+    segunda, _ = week_bounds(hoje or date.today())
+    return [segunda - timedelta(days=7), segunda]
+
+
+def nome_pasta_semana(reference: date) -> str:
+    """Nome que o cliente da a pasta da semana: 'DD A DD', da segunda ao
+    domingo (ex.: '28 A 04' para 28/09 a 04/10)."""
+    segunda, domingo = week_bounds(reference)
+    return f"{segunda.day:02d} A {domingo.day:02d}"
+
+
+def _match_week_folder(entries: list[dict], dia_inicio: int) -> dict | None:
+    """Procura a pasta 'DD A DD' que COMECA no dia informado (a segunda-feira).
+
+    Casa pelo inicio, nao pela faixa: a semana que vira o mes ('28 A 04') tem
+    inicio maior que o fim e nunca caberia em `inicio <= dia <= fim`.
+    """
     for entry in entries:
         if entry["type"] != "pasta":
             continue
         name = entry["name"].strip()
         m = re.match(r"^(\d{1,2})\s*[Aa-]\s*(\d{1,2})$", name)
-        if m and int(m.group(1)) <= day <= int(m.group(2)):
+        if m and int(m.group(1)) == dia_inicio:
             return entry
     return None
 
 
 def resolve_week_folder(entries: list[dict], reference: date | None = None) -> dict | None:
     """
-    Recebe a listagem de pastas e retorna aquela cuja faixa de dias
-    contém o dia da data de referência (padrão: hoje). Padrão de nome
-    de pasta: 'DD A DD' (ex: '15 A 21'). Também aceita variações como
-    '15 a 21' e '15-21'.
+    Recebe a listagem de pastas do mês e retorna a da semana da data de
+    referência (padrão: hoje): a pasta 'DD A DD' que começa na segunda-feira
+    dessa semana. Também aceita variações como '28 a 04' e '28-04'.
 
     Sem fallback para a semana anterior: a coleta já varre as duas semanas
     em toda execução (spec-coleta-arquivos-soltos R7).
     """
-    ref = reference or date.today()
-    return _match_week_folder(entries, ref.day)
+    segunda, _ = week_bounds(reference or date.today())
+    return _match_week_folder(entries, segunda.day)
 
 
 def build_nav_steps(reference: date | None = None) -> list[Step]:
@@ -127,15 +154,18 @@ def build_nav_steps(reference: date | None = None) -> list[Step]:
     Define o caminho de navegação dentro de cada SharePoint.
     `reference` controla ano/mês/semana buscados (padrão: hoje).
     Ajuste aqui quando a estrutura de pastas mudar.
+
+    Ano e mês saem da SEGUNDA-FEIRA da semana: o cliente guarda a semana que
+    vira o mês no mês em que ela começa (ex.: '09 SET - 2026/28 A 04').
     """
-    ref = reference or date.today()
+    segunda, _ = week_bounds(reference or date.today())
     return [
         "Invoices Fornecedores",
-        current_year_folder(ref),
+        current_year_folder(segunda),
         _passo(lambda entries: resolve_invoices_launch_folder(entries),
                "_Invoices para lançamento"),
-        _passo(lambda entries: resolve_month_folder(entries, ref), current_month_folder(ref)),
-        _passo(lambda entries: resolve_week_folder(entries, ref), f"semana do dia {ref.day}"),
+        _passo(lambda entries: resolve_month_folder(entries, segunda), current_month_folder(segunda)),
+        _passo(lambda entries: resolve_week_folder(entries, segunda), nome_pasta_semana(segunda)),
     ]
 
 
@@ -1027,8 +1057,9 @@ def process_all_configs(
         for record, referencia in pares:
             nav_steps = build_nav_steps(referencia)
 
-            log.info("[%s] %s - semana do dia %s",
-                     record['id'], record['name'], referencia.strftime('%d/%m/%Y'))
+            log.info("[%s] %s - semana de %s (pasta %s)",
+                     record['id'], record['name'], referencia.strftime('%d/%m/%Y'),
+                     nome_pasta_semana(referencia))
 
             status = False
             final_path: str | None = None

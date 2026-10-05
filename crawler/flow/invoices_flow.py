@@ -41,6 +41,12 @@ _SISTEMA_POR_LOJA = {
 # proximo tick); True = processa na hora. Toggle em vez de flag de CLI.
 MODO_SINCRONO = True
 
+# Inicio da producao: semanas anteriores ja foram conciliadas a mao pelo
+# cliente e nao podem ser baixadas (ex.: 10 PDFs soltos em SET/28 A 04 da
+# Dr. Phillips). Compara com a segunda-feira da semana
+# (spec-coleta-arquivos-soltos R11).
+INICIO_COLETA = date(2026, 10, 5)
+
 
 def invoices_flow(config: Config) -> None:
     """Baixa as invoices da semana, manda ler pelo Vision e persiste.
@@ -62,8 +68,9 @@ def _coletar(config: Config) -> None:
     from commons.sharepoint import (
         current_month_folder,
         current_year_folder,
-        last_week_reference,
+        nome_pasta_semana,
         process_all_configs,
+        semanas_da_coleta,
     )
 
     username = config.sharepoint.usuario
@@ -74,13 +81,17 @@ def _coletar(config: Config) -> None:
     # Semana anterior + atual em toda execucao: o cliente pode incluir nota na
     # pasta da semana anterior dias depois. Arquivo ja baixado e pulado pelo
     # nome, entao revarrer so traz o que e novo (spec-coleta-arquivos-soltos R4).
-    referencias = [last_week_reference(today), today]
+    # Cada referencia e a segunda-feira da semana (R8/R9).
+    referencias = _semanas_a_partir_do_corte(semanas_da_coleta(today))
+    if not referencias:
+        log.info("Nenhuma semana a partir do inicio da coleta; nada a varrer.")
+        return
 
     log.info("Data : %s", today.strftime('%d/%m/%Y'))
     for ref in referencias:
         log.info(
-            "Caminho : Invoices Fornecedores / %s / _Invoices para Lancamento / %s / semana do dia %s",
-            current_year_folder(ref), current_month_folder(ref), ref.day,
+            "Caminho : Invoices Fornecedores / %s / _Invoices para Lancamento / %s / %s",
+            current_year_folder(ref), current_month_folder(ref), nome_pasta_semana(ref),
         )
 
     with conexao(config.banco) as conn:
@@ -165,6 +176,18 @@ def _coletar(config: Config) -> None:
             encoding="utf-8",
         )
         log.info("Resultado salvo em: %s", output_file.name)
+
+
+def _semanas_a_partir_do_corte(semanas: list[date]) -> list[date]:
+    """Tira as semanas anteriores a `INICIO_COLETA` (conciliadas a mao)."""
+    puladas = [s for s in semanas if s < INICIO_COLETA]
+    if puladas:
+        log.info(
+            "Semana(s) %s antes do inicio da coleta (%s): nao varridas.",
+            ", ".join(s.strftime('%d/%m/%Y') for s in puladas),
+            INICIO_COLETA.strftime('%d/%m/%Y'),
+        )
+    return [s for s in semanas if s >= INICIO_COLETA]
 
 
 def _contar_arquivos(entries: list[dict]) -> int:

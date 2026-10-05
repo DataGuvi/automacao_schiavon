@@ -33,6 +33,7 @@ __all__ = [
     "aguardar_etapa",
     "falhar_etapa",
     "registrar_contagem",
+    "status_atual",
     "buscar",
 ]
 
@@ -153,19 +154,33 @@ def registrar_contagem(
     para manter a porta única de escrita em `processo`. `COALESCE` deixa cada
     lado ser gravado numa chamada separada (navegação grava `encontrados`,
     download grava `baixados`).
+
+    `encontrados` é o retrato da última varredura; `baixados` ACUMULA: o caso
+    da semana é reaberto a cada execução e cada uma só baixa o que é novo
+    (spec-coleta-arquivos-soltos R13).
     """
     with conn.cursor() as cur:
         cur.execute(
             f"""
             UPDATE {SCHEMA}.processo
                SET arquivos_encontrados = COALESCE(%s, arquivos_encontrados),
-                   arquivos_baixados    = COALESCE(%s, arquivos_baixados),
+                   arquivos_baixados    = COALESCE(arquivos_baixados, 0) + COALESCE(%s, 0),
                    atualizado_em        = now() AT TIME ZONE 'America/Sao_Paulo'
              WHERE id = %s
             """,
             (encontrados, baixados, id_processo),
         )
     conn.commit()
+
+
+def status_atual(conn, id_processo: int) -> StatusExecucao | None:
+    """Status gravado do caso, ou None se o caso nao existe / sem status."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT cod_status FROM {SCHEMA}.processo WHERE id = %s", (id_processo,),
+        )
+        row = cur.fetchone()
+    return StatusExecucao(row[0]) if row and row[0] is not None else None
 
 
 def buscar(conn, cod_tipo: str, identificador_processo: str) -> dict | None:

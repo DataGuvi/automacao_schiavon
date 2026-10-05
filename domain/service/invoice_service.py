@@ -103,6 +103,11 @@ def abrir_coleta(conn, id_loja: int, referencia: date) -> int:
     )
 
 
+# Desfechos de uma varredura que ja baixou: nao sao rebaixados por uma
+# varredura posterior sem arquivo solto (R14).
+_COLETA_FINALIZADA = (Status.FINALIZADO, Status.FINALIZADO_COM_ALERTA)
+
+
 def registrar_navegacao(
     conn, id_coleta: int, caminho: str | None, arquivos: int,
 ) -> None:
@@ -110,10 +115,14 @@ def registrar_navegacao(
 
     Pasta encontrada e vazia não é erro — é ENCERRADO_SEM_ARQUIVO. Tratar as
     duas coisas como falha era o que fazia a semana sem entrega parecer bug.
+
+    O caso é da semana e reaberto a cada execução: semana já FINALIZADA não
+    volta para "sem arquivo" quando o cliente move as notas para LANÇADAS
+    (spec-coleta-arquivos-soltos R14).
     """
     if arquivos:
         proc.concluir_etapa(conn, id_coleta, Etapa.NAVEGAR)
-    else:
+    elif proc.status_atual(conn, id_coleta) not in _COLETA_FINALIZADA:
         proc.falhar_etapa(
             conn, id_coleta, Etapa.NAVEGAR, Status.ENCERRADO_SEM_ARQUIVO,
             f"Pasta '{caminho}' sem arquivos.",
@@ -138,7 +147,8 @@ def falhar_login(conn, id_coleta: int, mensagem: str) -> None:
 
 
 def registrar_download(conn, id_coleta: int, baixados: int) -> None:
-    """Fecha a etapa BAIXAR e, com ela, o caso da varredura."""
+    """Fecha a etapa BAIXAR e, com ela, o caso da varredura. `baixados` e
+    somado ao que o caso ja tinha (R13)."""
     proc.registrar_contagem(conn, id_coleta, baixados=baixados)
     proc.concluir_etapa(conn, id_coleta, Etapa.BAIXAR)
 
