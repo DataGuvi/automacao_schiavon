@@ -35,7 +35,7 @@ __all__ = [
     "Credencial", "DESTINATARIOS_CLIENTE", "carregar_config",
 ]
 
-# Quem recebe os relatorios .docx da conciliacao (nao e segredo). BPO desligado
+# Quem recebe os relatorios .docx da conciliacao (nao e segredo). BPO ligado em 2026-10-02.
 DESTINATARIOS_CLIENTE = (
     "bpo@rokkasmarket.com",
     "cauet.menezes@dataguvi.com.br",

@@ -35,8 +35,9 @@ def _cfg(**extra) -> Config:
     return Config.de_valores({**BANCO, **extra})
 
 
-def test_bpo_fica_desligado_por_enquanto():
-    assert "bpo@rokkasmarket.com" not in DESTINATARIOS_CLIENTE
+def test_bpo_e_dataguvi_recebem_os_relatorios():
+    """BPO ligado em 2026-10-02 (commit 94a904e)."""
+    assert "bpo@rokkasmarket.com" in DESTINATARIOS_CLIENTE
     assert "cauet.menezes@dataguvi.com.br" in DESTINATARIOS_CLIENTE
 
 
