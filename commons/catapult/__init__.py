@@ -10,8 +10,7 @@ Fase 0). Os seletores abaixo são o padrão conhecido do Cloudflare Access
 (mesmo formulário em qualquer app atrás dele), não foram testados contra o
 Catapult de verdade. Para depurar um seletor errado, rode com o navegador
 visível (`ECRS_HEADLESS=false` no profile, ver `reconcile_erp_flow`); em
-qualquer modo `_debug_dump` salva screenshot + HTML da falha — mesmo
-mecanismo já usado em `commons/sharepoint/_handle_microsoft_login`.
+qualquer modo `_debug_dump` loga a url da falha (sem gravar screenshot/HTML).
 
 Depois do Cloudflare Access, o Catapult pede login próprio (usuário/senha do
 ECRS) — tela GWT, seletores confirmados contra o ambiente real (`login()`).
@@ -286,20 +285,11 @@ def parar_playwright(pw) -> None:
 
 
 def _debug_dump(page, tag: str) -> None:
-    """Salva screenshot + url + html no momento da falha, pra diagnóstico.
-
-    Duplicado de propósito de `commons.sharepoint._debug_dump` — helper
-    pequeno e privado, sem justificar acoplar os dois módulos por ele.
-    """
-    ts = int(time.time())
+    """Loga a url no momento da falha, pra diagnostico. Nao grava arquivo."""
     try:
-        page.screenshot(path=f"debug_{tag}_{ts}.png", full_page=True)
-        with open(f"debug_{tag}_{ts}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log.info("[debug] url no momento da falha: %s", page.url)
-        log.info("[debug] screenshot salvo em debug_%s_%s.png", tag, ts)
+        log.info("[debug] falha em %s, url: %s", tag, page.url)
     except Exception as e:
-        log.error("[debug] falhou ao salvar dump: %s", e)
+        log.error("[debug] falhou ao ler a url: %s", e)
 
 
 # =============================================================================

@@ -658,20 +658,14 @@ def _dismiss_kmsi_prompt(page) -> None:
 
 
 def _debug_dump(page, tag: str) -> None:
-    """Salva screenshot + url + html no momento da falha, pra diagnóstico."""
-    import time
-    ts = int(time.time())
+    """Loga url e texto visivel da pagina na falha. Nao grava screenshot/HTML."""
     try:
-        page.screenshot(path=f"debug_{tag}_{ts}.png", full_page=True)
-        with open(f"debug_{tag}_{ts}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log.info("[debug] url no momento da falha: %s", page.url)
+        log.info("[debug] falha em %s, url: %s", tag, page.url)
         # Texto visivel da pagina: permite diagnosticar num servidor so de terminal.
         texto = " ".join(page.inner_text("body").split())
         log.info("[debug] texto da pagina: %s", texto[:600])
-        log.info("[debug] screenshot salvo em debug_%s_%s.png", tag, ts)
     except Exception as e:
-        log.error("[debug] falhou ao salvar dump: %s", e)
+        log.error("[debug] falhou ao ler a pagina: %s", e)
 
 
 def _navigate_browser_to(page, base: str, final_path: str) -> None:
