@@ -17,6 +17,7 @@ o que a governança já autoriza.
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -34,6 +35,37 @@ from pydantic import BaseModel, Field, model_validator
 _PACK_SIZE_RE = re.compile(
     r"(\d+)\s*x\s*\d+(?:[.,]\d+)?\s*(?:kg|gr|ml|lb|oz|g|l)\b", re.IGNORECASE
 )
+
+# Data impressa: tres numeros separados por '/', '-' ou '.'. A Vision converte
+# a data para ISO "de cabeca" e ja trocou dia/mes/ano em nota americana
+# (mes/dia/ano) — a nota saiu da janela da conciliacao e ficou presa.
+# A conversao sai da mao do modelo e e feita aqui (spec-data-invoice-mdy).
+_DATA_IMPRESSA_RE = re.compile(r"^\s*(\d{1,4})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})\s*$")
+
+
+def _converter_data_impressa(impressa: str | None) -> str | None:
+    """Data impressa -> ISO, ou None quando nao da para converter com certeza.
+
+    `AAAA/MM/DD` e ano/mes/dia. Os demais sao mes/dia/ano (padrao americano),
+    salvo quando o primeiro numero passa de 12 — ai so pode ser dia/mes/ano.
+    Ano com 2 digitos vira 20AA.
+    """
+    m = _DATA_IMPRESSA_RE.match(impressa or "")
+    if not m:
+        return None
+    a, b, c = m.groups()
+    if len(a) == 4:
+        ano, mes, dia = int(a), int(b), int(c)
+    elif int(a) > 12:
+        dia, mes, ano = int(a), int(b), int(c)
+    else:
+        mes, dia, ano = int(a), int(b), int(c)
+    if ano < 100:
+        ano += 2000
+    try:
+        return date(ano, mes, dia).isoformat()
+    except ValueError:
+        return None
 
 
 class InvoiceItem(BaseModel):
@@ -117,7 +149,13 @@ class InvoiceData(BaseModel):
     # ── Invoice ──────────────────────────────────────────────────────────
     invoice_number: str | None = None
     invoice_date: str | None = Field(None, description="ISO 8601: YYYY-MM-DD")
+    invoice_date_raw: str | None = Field(
+        None, description="Data de emissao exatamente como impressa (ex.: '10/05/26')",
+    )
     due_date: str | None = Field(None, description="ISO 8601: YYYY-MM-DD")
+    due_date_raw: str | None = Field(
+        None, description="Data de vencimento exatamente como impressa",
+    )
     currency: str | None = "USD"
     subtotal: float | None = None
     tax_amount: float | None = None
@@ -180,3 +218,11 @@ class InvoiceData(BaseModel):
         0.0,
         description="Custo em USD da chamada à API (input + output tokens)",
     )
+
+    @model_validator(mode="after")
+    def _converter_datas_impressas(self) -> "InvoiceData":
+        """A data impressa (mes/dia/ano nas notas americanas) manda sobre o ISO
+        que a Vision converteu. Sem data impressa legivel, fica o ISO da Vision."""
+        self.invoice_date = _converter_data_impressa(self.invoice_date_raw) or self.invoice_date
+        self.due_date = _converter_data_impressa(self.due_date_raw) or self.due_date
+        return self

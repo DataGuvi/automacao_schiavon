@@ -49,7 +49,11 @@ Pay special attention to:
      because it has no single item to attach to, and don't paraphrase it
      into `reading_notes` instead.
 
-2. DATES — ISO 8601 format: YYYY-MM-DD.
+2. DATES — ISO 8601 format: YYYY-MM-DD in `invoice_date` / `due_date`.
+   These are US invoices: a printed date like "10/05/26" or "10/05/2026" is
+   MONTH/DAY/YEAR (October 5, 2026), not day/month/year. Also copy each date
+   EXACTLY as printed, character by character, into `invoice_date_raw` /
+   `due_date_raw` (e.g. "10/05/26") — don't reformat it there.
 
 3. AMOUNTS — separate subtotal, tax, and total.
 
@@ -128,7 +132,9 @@ Return this exact JSON structure (use null for unknown fields):
 {
   "invoice_number": null,
   "invoice_date": null,
+  "invoice_date_raw": null,
   "due_date": null,
+  "due_date_raw": null,
   "currency": "USD",
   "subtotal": null,
   "tax_amount": null,
