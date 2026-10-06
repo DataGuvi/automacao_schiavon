@@ -17,6 +17,9 @@ from commons.vision import (
 
 log = get_logger(__name__)
 
+# Teto da espera pelo lote: o tick nao pode ficar preso o dia todo (spec-vision-batch R3).
+ESPERA_MAXIMA_LOTE_S = 3600
+
 
 def collect_items(conn, results: list[dict], download_dir: Path) -> list[BatchItem]:
     """
@@ -102,7 +105,9 @@ def process_invoices_batch(
     log.info("Batch API - %s arquivo(s) modelo=%s", len(items), model)
 
     batch_id, id_map = submit_batch(items, api_key, model)
-    wait_for_batch(batch_id, api_key, poll_interval=20)
+    wait_for_batch(
+        batch_id, api_key, poll_interval=20, max_wait_seconds=ESPERA_MAXIMA_LOTE_S,
+    )
 
     log.info("Processando resultados...")
     batch_results = collect_batch_results(batch_id, api_key, id_map, model)

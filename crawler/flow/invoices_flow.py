@@ -37,9 +37,10 @@ _SISTEMA_POR_LOJA = {
     2: Sistema.SHAREPOINT_DRPHILLIPS,
 }
 
-# Modo de leitura das invoices. False = Batch API (50% mais barato, resultado no
-# proximo tick); True = processa na hora. Toggle em vez de flag de CLI.
-MODO_SINCRONO = True
+# Modo de leitura das invoices. False = Batch API (50% mais barato, todas as
+# notas num lote so, espera o fim); True = uma chamada por nota, na hora.
+# Toggle em vez de flag de CLI (spec-vision-batch).
+MODO_SINCRONO = False
 
 # Inicio da producao: semanas anteriores ja foram conciliadas a mao pelo
 # cliente e nao podem ser baixadas (ex.: 10 PDFs soltos em SET/28 A 04 da
