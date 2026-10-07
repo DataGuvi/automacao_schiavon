@@ -36,14 +36,14 @@ from playwright.sync_api import TimeoutError as PwTimeout
 from commons.exception import IntegracaoException
 from commons.gmail import GmailOtpTimeout, fetch_otp_code
 from commons.logging_config import get_logger
-from commons.matcher import POLine
+from commons.matcher import POLine, match_supplier
 
 log = get_logger(__name__)
 
 __all__ = [
     "CatapultLoginError", "handle_cloudflare_access", "login", "open_catapult_session",
     "open_worksheets", "search_purchase_orders_by_supplier", "open_purchase_order",
-    "fill_receiving_invoice_info", "scrape_po_items", "to_po_lines",
+    "extrair_prefixo_nome_po", "fill_receiving_invoice_info", "scrape_po_items", "to_po_lines",
     "fechar_browser", "parar_playwright",
 ]
 
@@ -398,6 +398,7 @@ def open_worksheets(page, url: str, timeout: int = 30_000) -> None:
 
 def search_purchase_orders_by_supplier(
     page, supplier_name: str, match_type: str = "Contains", timeout: int = 20_000,
+    nomes_alternativos: tuple[str, ...] = (),
 ) -> list[dict]:
     """Busca PO pelo nome do fornecedor (filtro 'Supplier' da tela
     Worksheets, categoria 'Purchase Order', Status='Ordered', 'Show History
@@ -412,9 +413,15 @@ def search_purchase_orders_by_supplier(
     `match_type='Contains'` por padrão, não 'Begins with' (o padrão da
     tela): mesmo motivo já confirmado pra 'Invoice Reference' — nome digitado
     pode não ser um prefixo exato do nome cadastrado no Catapult.
+
+    `nomes_alternativos`: outros nomes do mesmo fornecedor (ex. o nome cru da
+    invoice quando `supplier_name` já é o termo do de-para `dim_fornecedor_alias`)
+    aceitos na conferência do filtro — ver `_conferir_filtro_aplicado`.
     """
     _preparar_filtros_po(page, timeout)
-    return _buscar_worksheets_por_fornecedor(page, supplier_name, match_type, timeout)
+    return _buscar_worksheets_por_fornecedor(
+        page, supplier_name, match_type, timeout, nomes_alternativos,
+    )
 
 
 def _preparar_filtros_po(page, timeout: int) -> None:
@@ -450,6 +457,7 @@ def _preparar_filtros_po(page, timeout: int) -> None:
 
 def _buscar_worksheets_por_fornecedor(
     page, supplier_name: str, match_type: str, timeout: int,
+    nomes_alternativos: tuple[str, ...] = (),
 ) -> list[dict]:
     """Seleciona 'Supplier'/`match_type`, digita e lê a grade de resultados."""
     _aplicar_filtro_fornecedor(page, supplier_name, match_type)
@@ -470,7 +478,7 @@ def _buscar_worksheets_por_fornecedor(
         ) from exc
 
     resultado = _ler_resultados(page)
-    _conferir_filtro_aplicado(page, resultado, supplier_name, match_type)
+    _conferir_filtro_aplicado(page, resultado, supplier_name, match_type, nomes_alternativos)
     return resultado
 
 
@@ -521,33 +529,54 @@ def _ler_resultados(page) -> list[dict]:
         ) from exc
 
 
+def extrair_prefixo_nome_po(name: str) -> str:
+    """Parte do `Name` do PO antes do primeiro '-' ('Perdomo-036998-HQ-RS2'
+    -> 'Perdomo'). Sem '-', devolve o nome inteiro."""
+    return name.split("-", 1)[0].strip()
+
+
+def casar_fornecedor_por_aproximacao(nome: str, prefixos: list[str]) -> bool:
+    """True se `nome` casa por aproximação (`match_supplier`) com algum prefixo."""
+    achado, _score = match_supplier(nome, prefixos)
+    return achado is not None
+
+
+def casar_fornecedor_por_nomes_alternativos(nomes_alternativos: tuple[str, ...], prefixos: list[str]) -> bool:
+    """True se algum nome alternativo casa com algum prefixo."""
+    return any(casar_fornecedor_por_aproximacao(n, prefixos) for n in nomes_alternativos)
+
+
 def _conferir_filtro_aplicado(
     page, resultado: list[dict], supplier_name: str, match_type: str,
+    nomes_alternativos: tuple[str, ...] = (),
 ) -> None:
     """Levanta se a grade devolveu a listagem padrão em vez do resultado
     filtrado. Não toca no navegador — só confere o que já foi lido."""
     # Sanidade: se o filtro não pegou de verdade, a grade volta pra listagem
     # padrão (com Status=Ordered ainda aplicado, mas de TODOS os fornecedores
     # — nomes bem variados, sem nada em comum). Um limite de QUANTIDADE não
-    # serve pra detectar isso (confirmado contra o ambiente real: FreshPoint
-    # sozinho tem 199+ PO 'Ordered' num store só — fornecedor de entrega
-    # frequente de verdade, não filtro quebrado). O sinal de verdade é o
-    # CONTEÚDO: o `Name` do worksheet é derivado do próprio fornecedor na
-    # criação (é assim que o catálogo de prefixos existe), então pelo menos
-    # um resultado tem que começar com o termo buscado — se NENHUM bate, a
-    # grade caiu pro padrão sem filtro nenhum, e isso sim é erro (pra não
-    # abrir o PO errado em silêncio).
-    termo_norm = supplier_name.strip().upper()
-    if resultado and termo_norm and not any(
-        r["name"].strip().upper().startswith(termo_norm) for r in resultado
-    ):
-        _debug_dump(page, "catapult_filtro_ignorado")
-        raise IntegracaoException(
-            f"busca por Supplier {match_type!r}='{supplier_name}' devolveu "
-            f"{len(resultado)} PO(s), nenhum com Name começando por "
-            f"{supplier_name!r} — parece que o filtro não foi aplicado "
-            f"(a grade voltou pra listagem padrão sem filtro de fornecedor)."
-        )
+    # serve pra detectar isso (FreshPoint sozinho tem 199+ PO 'Ordered' num
+    # store só). O sinal de verdade é o CONTEÚDO.
+    #
+    # O `Name` do PO NÃO é derivado do nome lido na invoice: é o nome que o
+    # Catapult conhece ('Perdomo-036998-HQ-RS2' para a invoice 'Perdomo
+    # Distributor'; 'Fresh Poin-008668-RS2' para 'Freshpoint Central FL'). Por
+    # isso compara o PREFIXO do Name (antes do '-') por aproximação com o nome
+    # buscado e, não achando, cai nos nomes alternativos (de-para `dim_fornecedor_alias`).
+    prefixos = [extrair_prefixo_nome_po(r["name"]) for r in resultado]
+    if not resultado or not supplier_name.strip():
+        return
+    if casar_fornecedor_por_aproximacao(supplier_name, prefixos):
+        return
+    if casar_fornecedor_por_nomes_alternativos(nomes_alternativos, prefixos):
+        return
+    _debug_dump(page, "catapult_filtro_ignorado")
+    raise IntegracaoException(
+        f"busca por Supplier {match_type!r}='{supplier_name}' devolveu "
+        f"{len(resultado)} PO(s), nenhum com Name parecido com "
+        f"{supplier_name!r} (alternativos: {list(nomes_alternativos)}) — parece que o filtro "
+        f"não foi aplicado (a grade voltou pra listagem padrão sem filtro de fornecedor)."
+    )
 
 
 def open_purchase_order(page, href: str, timeout: int = 20_000) -> None:

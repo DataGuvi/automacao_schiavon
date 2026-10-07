@@ -72,7 +72,7 @@ class _ConnQuebrada:
 
 
 @pytest.mark.parametrize("fn", [
-    svc.fetch_supplier_aliases, svc.fetch_erp_search_terms, svc.fetch_item_sinonimos,
+    svc.fetch_supplier_aliases, svc.fetch_fornecedores, svc.fetch_item_sinonimos,
     svc.fetch_invoice_headers_reprocesso,
     lambda c: svc.fetch_invoice_headers_for_reconciliation(c, None, None),
     lambda c: svc.fetch_invoice_items_by_headers(c, [1]),
@@ -107,13 +107,13 @@ def test_fill_receiving_so_com_numero_e_data(monkeypatch, numero, data, chamou):
     chamadas = []
     po = _po(1, "Chicken Breast", supplier_unit_id="X1", ordered="5")
     monkeypatch.setattr(flow, "open_worksheets", lambda *a: None)
-    monkeypatch.setattr(flow, "search_purchase_orders_by_supplier", lambda *a: [{"href": "h"}])
+    monkeypatch.setattr(flow, "search_purchase_orders_by_supplier", lambda *a, **k: [{"href": "h"}])
     monkeypatch.setattr(flow, "open_purchase_order", lambda *a: None)
     monkeypatch.setattr(flow, "scrape_po_items", lambda *a: [])
     monkeypatch.setattr(flow, "to_po_lines", lambda *a: [po])
     monkeypatch.setattr(flow, "escolher_po_por_itens", lambda *a: 0)
     monkeypatch.setattr(flow, "fill_receiving_invoice_info", lambda *a: chamadas.append(a))
     header = {"id": 1, "invoice_number": numero, "invoice_date": data, "supplier_name": "Acme"}
-    assert flow._buscar_po(None, "u", header, [], {}, {}) == [po]
+    assert flow._buscar_po(None, "u", header, [], {}, lambda nome: None) == [po]
     assert bool(chamadas) is chamou
     assert all(c[1] != "None" for c in chamadas)

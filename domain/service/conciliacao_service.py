@@ -34,6 +34,7 @@ from psycopg2.extras import RealDictCursor
 
 from commons.db import reverter
 from commons.exception import DataAccessException
+from commons.matcher import match_supplier, norm_supplier
 from domain.conciliacao_codes import MARCAS_REVISAO, IssueCode
 from domain.enums import StatusConciliacao as Veredito, StatusExecucao
 from domain.service.processo_service import SCHEMA
@@ -114,31 +115,106 @@ def fetch_supplier_aliases(conn, source: str = "invoice") -> dict[str, dict]:
     return {r["alias_norm"]: r for r in rows}
 
 
-def fetch_erp_search_terms(conn) -> dict[str, str]:
-    """Mapa `alias_norm` (lado invoice) → texto do nome no Catapult
-    (`dim_fornecedor_alias.origem='erp'` do MESMO `id_fornecedor`).
+_PISO_RESOLVER_FORNECEDOR = 90.0
+_PISO_APRENDER_NOME_CATAPULT = 95.0
 
-    Povoado por `manutencao/coletar_e_gravar_nomes_erp.py` (coluna `Name`
-    da tela Worksheets, cortada no primeiro `'-'`) +
-    `manutencao/seed_erp_supplier_alias.py` (de-para invoice→Catapult,
-    revisado à mão). Usado por `crawler/flow/reconcile_erp_flow.py::
-    _buscar_po` para buscar no Catapult pelo nome que ELE conhece, não o
-    nome cru lido da invoice — que frequentemente diverge (o Catapult
-    trunca/abrevia). Fornecedor sem alias 'erp' cadastrado simplesmente não
-    aparece no mapa; quem chama cai pro nome cru da invoice (comportamento
-    de antes desta função existir)."""
-    rows = _ler(
+
+def fetch_fornecedores(conn) -> list[dict]:
+    """Todos os fornecedores: `{id, nome, nome_catapult}`.
+
+    `nome_catapult` e o nome como o Catapult conhece o fornecedor (prefixo do
+    Name do PO): o alias `origem='erp'` ativo dele em `dim_fornecedor_alias`,
+    ou `None` se ainda nao cadastrado."""
+    return _ler(
         conn,
         f"""
-        SELECT inv.alias_norm, erp.alias AS erp_search_term
-          FROM {SCHEMA}.dim_fornecedor_alias inv
-          JOIN {SCHEMA}.dim_fornecedor_alias erp
-            ON erp.id_fornecedor = inv.id_fornecedor AND erp.origem = 'erp' AND erp.ativo
-         WHERE inv.origem = 'invoice' AND inv.ativo
+        SELECT f.id, f.nome,
+               (SELECT a.alias FROM {SCHEMA}.dim_fornecedor_alias a
+                 WHERE a.id_fornecedor = f.id AND a.origem = 'erp' AND a.ativo
+                 ORDER BY a.id LIMIT 1) AS nome_catapult
+          FROM {SCHEMA}.dim_fornecedor f
         """,
-        None, "termos de busca do ERP",
+        None, "fornecedores",
     )
-    return {r["alias_norm"]: r["erp_search_term"] for r in rows}
+
+
+def montar_resolvedor_fornecedor(fornecedores: list[dict], aliases_invoice: dict[str, dict]):
+    """Devolve `resolver(nome_invoice) -> dict | None`: a linha de
+    `fornecedores` da invoice. Alias `invoice` exato primeiro; senao fuzzy
+    contra `dim_fornecedor.nome`; `None` quando nada casa."""
+    por_id = {f["id"]: f for f in fornecedores}
+    por_nome = {f["nome"]: f for f in fornecedores}
+
+    def resolver(nome_invoice: str) -> dict | None:
+        alias = aliases_invoice.get(norm_supplier(nome_invoice))
+        if alias and alias["canonical_id"] in por_id:
+            return por_id[alias["canonical_id"]]
+        achado, _score = match_supplier(
+            nome_invoice, list(por_nome), threshold=_PISO_RESOLVER_FORNECEDOR,
+        )
+        return por_nome.get(achado)
+
+    return resolver
+
+
+def confirmar_fornecedor_para_aprender(nome_invoice: str, fornecedor: dict) -> bool:
+    """True se o nome da invoice casa a >= 95% com `dim_fornecedor.nome` do
+    fornecedor resolvido. Trava o auto-aprendizado do alias 'erp': o
+    fornecedor resolvido pelo piso de 90 ou por alias pode ser outro."""
+    achado, _score = match_supplier(
+        nome_invoice, [fornecedor["nome"]], threshold=_PISO_APRENDER_NOME_CATAPULT,
+    )
+    return achado is not None
+
+
+def escolher_nome_catapult(nome_invoice: str, nomes_po: list[str]) -> str | None:
+    """Prefixo de PO do Catapult que casa com o nome da invoice a >= 95%
+    (`match_supplier`), ou `None`. E o criterio pra gravar o alias 'erp'
+    sozinho."""
+    achado, _score = match_supplier(
+        nome_invoice, nomes_po, threshold=_PISO_APRENDER_NOME_CATAPULT,
+    )
+    return achado
+
+
+def gravar_nome_catapult(conn, id_fornecedor: int, nome_catapult: str) -> bool:
+    """Adiciona ou atualiza o alias `origem='erp'` do fornecedor.
+
+    Atualiza o alias 'erp' que ele ja tem; senao insere. Devolve False (sem
+    gravar) quando esse nome ja e alias 'erp' de OUTRO fornecedor - nunca
+    reaponta cadastro alheio."""
+    alias_norm = norm_supplier(nome_catapult)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT id_fornecedor FROM {SCHEMA}.dim_fornecedor_alias
+                     WHERE alias_norm = %s AND origem = 'erp'""",
+                (alias_norm,),
+            )
+            dono = cur.fetchone()
+            if dono and dono[0] != id_fornecedor:
+                return False
+            cur.execute(
+                f"""UPDATE {SCHEMA}.dim_fornecedor_alias
+                       SET alias = %s, alias_norm = %s, ativo = true
+                     WHERE id = (SELECT id FROM {SCHEMA}.dim_fornecedor_alias
+                                  WHERE id_fornecedor = %s AND origem = 'erp' AND ativo
+                                  ORDER BY id LIMIT 1)""",
+                (nome_catapult, alias_norm, id_fornecedor),
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    f"""INSERT INTO {SCHEMA}.dim_fornecedor_alias
+                            (id_fornecedor, alias, alias_norm, origem)
+                        VALUES (%s, %s, %s, 'erp')
+                        ON CONFLICT (alias_norm, origem) DO UPDATE SET ativo = true""",
+                    (id_fornecedor, nome_catapult, alias_norm),
+                )
+        conn.commit()
+        return True
+    except psycopg2.Error as exc:
+        reverter(conn)
+        raise DataAccessException("falha ao gravar alias erp do fornecedor") from exc
 
 
 def save_supplier_alias(

@@ -28,6 +28,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from commons.catapult import (
+    extrair_prefixo_nome_po,
     fechar_browser,
     parar_playwright,
     fill_receiving_invoice_info,
@@ -60,7 +61,11 @@ from domain.enums import Etapa, StatusExecucao as Status
 from domain.service import processo_service as proc
 from domain.service import sistema_service
 from domain.service.conciliacao_service import (
-    fetch_erp_search_terms,
+    confirmar_fornecedor_para_aprender,
+    escolher_nome_catapult,
+    fetch_fornecedores,
+    gravar_nome_catapult,
+    montar_resolvedor_fornecedor,
     fetch_invoice_headers_for_reconciliation,
     fetch_invoice_headers_reprocesso,
     fetch_invoice_items_by_headers,
@@ -95,8 +100,10 @@ def reconcile_erp_flow(
         log.info("Conciliacao Invoice x Catapult (ERP) - %s a %s", date_from, date_to)
 
         sinonimos = fetch_item_sinonimos(conn)
-        termos_erp = fetch_erp_search_terms(conn)
         aliases_invoice = fetch_supplier_aliases(conn, source="invoice")
+        resolver_fornecedor = montar_resolvedor_fornecedor(
+            fetch_fornecedores(conn), aliases_invoice,
+        )
 
         # Semana anterior + atual em toda execucao, sem prender loja: a coleta
         # tambem varre as duas (spec-correcao-reconcile-erp R3). Nota ja
@@ -132,7 +139,7 @@ def reconcile_erp_flow(
         for id_loja, headers_loja in por_loja.items():
             log.info("-- loja %s: %s nota(s) --", id_loja, len(headers_loja))
             _conciliar_loja(conn, id_loja, headers_loja, items_by_header, sinonimos,
-                             termos_erp, aliases_invoice, config, sheet_id, totais)
+                             resolver_fornecedor, aliases_invoice, config, sheet_id, totais)
 
         if totais.get("sheets_tentativas"):
             sem_erro = not totais.get("sheets_erro")
@@ -185,7 +192,7 @@ def _selecionar_headers(
 
 def _conciliar_loja(
     conn, id_loja: int, headers: list[dict], items_by_header: dict[int, list[dict]],
-    sinonimos: dict, termos_erp: dict[str, str], aliases_invoice: dict[str, dict],
+    sinonimos: dict, resolver_fornecedor, aliases_invoice: dict[str, dict],
     config: Config, sheet_id: str | None, totais: dict,
 ) -> None:
     """Abre UMA sessão do Catapult para a loja e concilia todas as notas dela.
@@ -230,7 +237,7 @@ def _conciliar_loja(
         for header in headers:
             _conciliar_invoice(
                 page, url, conn, header, items_by_header.get(header["id"], []),
-                sinonimos, termos_erp, aliases_invoice, sheet_id, totais,
+                sinonimos, resolver_fornecedor, aliases_invoice, sheet_id, totais,
             )
     except IntegracaoException as exc:
         log.error("id_loja=%s: sessao do Catapult falhou - %s", id_loja, exc)
@@ -257,7 +264,7 @@ def _fechar_navegador(pw, browser) -> None:
 
 def _conciliar_invoice(
     page, url: str, conn, header: dict, items: list[dict], sinonimos: dict,
-    termos_erp: dict[str, str], aliases_invoice: dict[str, dict],
+    resolver_fornecedor, aliases_invoice: dict[str, dict],
     sheet_id: str | None, totais: dict,
 ) -> None:
     """Concilia UMA invoice contra o PO dela. Nunca propaga — falha desta nota
@@ -271,7 +278,7 @@ def _conciliar_invoice(
     try:
         _processar_invoice(
             page, url, conn, header, items, sinonimos,
-            termos_erp, aliases_invoice, sheet_id, totais,
+            resolver_fornecedor, aliases_invoice, sheet_id, totais,
         )
     except IntegracaoException as exc:
         log.error("nota %s: falha raspando o Catapult - %s", nota, exc)
@@ -307,7 +314,7 @@ def _marcar_erro_navegacao(conn, header: dict, mensagem: str) -> None:
 
 def _processar_invoice(
     page, url: str, conn, header: dict, items: list[dict], sinonimos: dict,
-    termos_erp: dict[str, str], aliases_invoice: dict[str, dict],
+    resolver_fornecedor, aliases_invoice: dict[str, dict],
     sheet_id: str | None, totais: dict,
 ) -> None:
     if not items:
@@ -324,7 +331,7 @@ def _processar_invoice(
         _gravar_skip_insumo(conn, header, totais)
         return
 
-    po_lines = _buscar_po(page, url, header, items, sinonimos, termos_erp)
+    po_lines = _buscar_po(page, url, header, items, sinonimos, resolver_fornecedor, conn=conn)
 
     # `None` (busca não achou PO nenhum pro fornecedor) e `[]` (achou
     # candidato(s), mas não deu pra desempatar) chegam iguais em
@@ -343,9 +350,34 @@ def _processar_invoice(
     _gravar_resultado(conn, header, resultado, sheet_id, totais)
 
 
+def _aprender_nome_catapult(
+    conn, fornecedor: dict | None, supplier_name: str, achados: list[dict],
+) -> None:
+    """Grava o alias 'erp' do fornecedor quando o fornecedor resolvido E um
+    prefixo de PO da grade casam a >= 95% com o nome da invoice. Nunca levanta: aprender e secundario."""
+    if conn is None or fornecedor is None:
+        return
+    if not confirmar_fornecedor_para_aprender(supplier_name, fornecedor):
+        return
+    try:
+        prefixos = sorted({extrair_prefixo_nome_po(a["name"]) for a in achados})
+        nome = escolher_nome_catapult(supplier_name, prefixos)
+        if nome and nome != fornecedor.get("nome_catapult"):
+            if gravar_nome_catapult(conn, fornecedor["id"], nome):
+                log.info("fornecedor %s: alias erp=%s", fornecedor["id"], nome)
+                fornecedor["nome_catapult"] = nome
+            else:
+                log.warning(
+                    "fornecedor %s: alias erp %r ja e de outro fornecedor",
+                    fornecedor["id"], nome,
+                )
+    except DataAccessException:
+        log.exception("fornecedor %s: falha gravando alias erp", fornecedor.get("id"))
+
+
 def _buscar_po(
     page, url: str, header: dict, items: list[dict], sinonimos: dict,
-    termos_erp: dict[str, str],
+    resolver_fornecedor, conn=None,
 ) -> list[POLine] | None:
     """Acha o PO desta invoice no Catapult e devolve os itens já convertidos.
 
@@ -373,16 +405,18 @@ def _buscar_po(
     supplier_name = header.get("supplier_name") or ""
     # O nome lido da invoice frequentemente diverge do nome que o Catapult
     # conhece (ele trunca/abrevia, ex. 'Freshpoint Central FL' -> 'Fresh
-    # Poin') — busca pelo termo resolvido via `fetch_erp_search_terms`
-    # (dim_fornecedor_alias, de-para revisado à mão por
-    # `manutencao/seed_erp_supplier_alias.py`) quando existe; sem alias
-    # cadastrado, cai pro nome cru da invoice (comportamento de antes desse
-    # de-para existir).
-    termo_busca = termos_erp.get(norm_supplier(supplier_name), supplier_name)
+    # Poin') — busca pelo alias 'erp' (`dim_fornecedor_alias`) do fornecedor
+    # resolvido (alias invoice ou fuzzy); sem cadastro, cai pro nome cru da
+    # invoice.
+    fornecedor = resolver_fornecedor(supplier_name)
+    termo_busca = (fornecedor or {}).get("nome_catapult") or supplier_name
     open_worksheets(page, url)
-    achados = search_purchase_orders_by_supplier(page, termo_busca)
+    achados = search_purchase_orders_by_supplier(
+        page, termo_busca, nomes_alternativos=(supplier_name,),
+    )
     if not achados:
         return None
+    _aprender_nome_catapult(conn, fornecedor, supplier_name, achados)
 
     if len(achados) > _MAX_CANDIDATOS_DESEMPATE:
         # Fornecedor de entrega frequente (ex. FreshPoint, 199+ PO 'Ordered'

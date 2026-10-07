@@ -176,6 +176,26 @@ RPA_ENV=prod
   de `CLOUDFLARE_ACCESS_EMAIL`. Erro *"That account does not have access"* é
   política do Cloudflare, não do código.
 - **Reprocesso:** casos com `cod_status` 50–59 caem sozinhos na fila.
+- **Cadastrar fornecedor no Catapult** (`dim_fornecedor_alias`, único lugar de
+  cadastro). O nome do fornecedor no Catapult é o texto do `Name` do PO antes
+  do primeiro `-` (`Perdomo-036998-HQ-RS2` -> `Perdomo`). Basta **uma linha**
+  `origem='erp'` apontando para o fornecedor:
+
+  ```sql
+  INSERT INTO dwschiavon2.dim_fornecedor_alias (id_fornecedor, alias, alias_norm, origem)
+  VALUES (42, 'Perdomo', 'PERDOMO', 'erp');
+  ```
+
+  `alias_norm` = nome em maiúsculas, sem pontuação nem sufixo societário
+  (INC, LLC...), igual a `norm_supplier`. O robô acha o fornecedor pelo nome
+  lido da invoice (fuzzy ≥ 90 contra `dim_fornecedor.nome`) e busca no Catapult
+  pelo alias `erp` dele; sem cadastro, busca pelo nome cru. Linha
+  `origem='invoice'` só é necessária quando o nome lido na nota é muito
+  diferente do nome do fornecedor (aponta para o mesmo `id_fornecedor`; carne
+  também depende dela). O robô também **grava/atualiza o alias `erp` sozinho**
+  quando um PO do Catapult casa a ≥ 95% com o nome da invoice e o fornecedor
+  resolvido também casa a ≥ 95%. Conferir:
+  `SELECT * FROM dwschiavon2.dim_fornecedor_alias WHERE origem='erp' AND id_fornecedor=42;`
 
 ## 9. Status de Execução
 
