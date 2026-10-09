@@ -94,7 +94,7 @@ flowchart TD
     N1 -->|sim| N2[Encerra sem conciliar]
     N1 -->|nao| N3[Login no Catapult<br/>e busca do PO]
     N3 --> N4{PO encontrado?}
-    N4 -->|nao| N5[Fecha com alerta<br/>PO_NAO_ENCONTRADA]
+    N4 -->|nao| N5[Status 13 PO_NAO_ENCONTRADA<br/>pesquisa de novo na proxima execucao,<br/>ate 3 vezes; depois fecha sem PO]
     N4 -->|sim| N6[Compara quantidade e valor<br/>item a item]
     N6 --> N7{Algum item diverge?}
     N7 -->|sim| R1[.docx de divergencia]
@@ -118,14 +118,17 @@ flowchart TD
   de "insumo" não vai ao Catapult.
 
 **Conciliação contra o PO**
-- O PO é buscado pela Invoice Reference (`Contains`, nunca `Begins with`).
+- O PO é buscado pela Invoice Reference (`Equals`, nunca `Begins with`).
   Havendo vários, vale o de maior fração de itens casados com a nota.
 - O item da invoice casa com o do PO por código; se falhar, por nome
   aproximado; senão fica sem par.
 - Compara quantidade (invoice × Ordered × Received) e valor (× Invoiced Total
   Cost), dentro de tolerância. Linhas da invoice que caem no mesmo item do PO
   são somadas.
-- Sem PO encontrado: a nota fecha com alerta (`PO_NAO_ENCONTRADA`).
+- Pack impresso em coluna própria ("12/12 oz", "6/2LB"): a Vision multiplica a quantidade pelo N e guarda a impressa em `cases`; a unidade do size não é convertida, a quantidade compara por contagem com o `Ordered` do PO.
+- Insumo e carne por fornecedor: `dim_fornecedor.categoria = 'insumo'` pula a nota (sem relatório); `'carne'` liga a regra de carne. Nota com "insumo" lido pela Vision classifica o fornecedor sozinha (só se ainda sem categoria). Classificar os conhecidos: `python -m manutencao.classificar_fornecedores` (simula) e `--aplicar` (grava).
+- Busca da PO: primeiro por `Invoice Reference` (Equals) com o número da nota; sem resultado, por nome do fornecedor (com fuzzy matching).
+- Sem PO `Ordered`: a nota fica no status 13 (`PO_NAO_ENCONTRADA`) e é pesquisada de novo nas próximas execuções, até 3 vezes; esgotado, fecha com o relatório "nenhum PO Ordered".
 
 **Relatórios e e-mail**
 - Cada nota gera **um** `.docx`: divergência se algum item diverge, sucesso se
@@ -210,6 +213,7 @@ técnico (reprocessável).
 | 10 | `PENDENTE` | Criado, nenhuma etapa rodou |
 | 11 | `EM_ANDAMENTO` | Alguma etapa concluída, faltam outras |
 | 12 | `AGUARDANDO_RESPOSTA` | Parado à espera do fornecedor |
+| 13 | `PO_NAO_ENCONTRADA` | PO sem status `Ordered` no Catapult; pesquisada de novo a cada execução (`processo.tentativas_po`, até 3 novas execuções) |
 | 21 | `ENCERRADO_SEM_ARQUIVO` | Pasta da semana existe, mas vazia |
 | 50 | `ERRO_LOGIN` | Falha de autenticação na origem |
 | 51 | `ERRO_NAVEGACAO` | Pasta/arquivo não encontrado na origem |

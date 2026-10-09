@@ -36,7 +36,7 @@ from playwright.sync_api import TimeoutError as PwTimeout
 from commons.exception import IntegracaoException
 from commons.gmail import GmailOtpTimeout, fetch_otp_code
 from commons.logging_config import get_logger
-from commons.matcher import POLine, match_supplier
+from commons.matcher import POLine, aceitar_prefixos_catapult
 
 log = get_logger(__name__)
 
@@ -460,7 +460,7 @@ def _buscar_worksheets_por_fornecedor(
     nomes_alternativos: tuple[str, ...] = (),
 ) -> list[dict]:
     """Seleciona 'Supplier'/`match_type`, digita e lê a grade de resultados."""
-    _aplicar_filtro_fornecedor(page, supplier_name, match_type)
+    _aplicar_filtro_busca(page, "Supplier", supplier_name, match_type)
 
     try:
         page.wait_for_selector(_SEL_RESULT_LINKS, timeout=timeout)
@@ -478,12 +478,37 @@ def _buscar_worksheets_por_fornecedor(
         ) from exc
 
     resultado = _ler_resultados(page)
-    _conferir_filtro_aplicado(page, resultado, supplier_name, match_type, nomes_alternativos)
-    return resultado
+    return _conferir_filtro_aplicado(page, resultado, supplier_name, match_type, nomes_alternativos)
 
 
-def _aplicar_filtro_fornecedor(page, supplier_name: str, match_type: str) -> None:
-    """Escolhe o campo 'Supplier'/`match_type` e digita o nome do fornecedor."""
+def search_purchase_orders_by_invoice(
+    page, invoice_number: str, match_type: str = "Equals", timeout: int = 20_000,
+) -> list[dict]:
+    """Busca PO pelo número da invoice (campo 'Invoice Reference', operador
+    `match_type`), com os mesmos filtros da busca por fornecedor (categoria
+    Purchase Order, Status='Ordered', histórico desmarcado). É a busca
+    PRIORITÁRIA; a por nome (`search_purchase_orders_by_supplier`) é fallback.
+
+    Lista vazia é resultado normal (nenhuma PO com essa referência), não erro.
+    Com 'Equals' só vem PO cuja referência é exatamente este número; quem chama
+    ainda confere os itens (`escolher_po_por_itens`) antes de gravar no PO.
+    """
+    _preparar_filtros_po(page, timeout)
+    _aplicar_filtro_busca(page, "Invoice Reference", invoice_number, match_type)
+    try:
+        page.wait_for_selector(_SEL_RESULT_LINKS, timeout=timeout)
+    except PwTimeout:
+        return []
+    except PwError as exc:
+        _debug_dump(page, "catapult_grade_busca_invoice")
+        raise IntegracaoException(
+            f"grade de resultados da busca por invoice {invoice_number!r} não respondeu: {exc}"
+        ) from exc
+    return _ler_resultados(page)
+
+
+def _aplicar_filtro_busca(page, campo: str, termo: str, match_type: str) -> None:
+    """Escolhe o campo de busca (`campo`)/`match_type` e digita `termo`."""
     # A tela redesenha os controles de busca quando o campo (Name / Supplier
     # / Invoice Reference / ...) muda — confirmado contra o ambiente real que
     # agir rápido demais entre as trocas faz a busca sair IGNORADA em
@@ -495,7 +520,7 @@ def _aplicar_filtro_fornecedor(page, supplier_name: str, match_type: str) -> Non
     # no botão — foi o que funcionou contra o ambiente real; `.fill()` seguido
     # de clique imediato no botão corre risco da mesma race condition acima.
     try:
-        page.select_option(_SEL_SEARCH_FIELD, label="Supplier")
+        page.select_option(_SEL_SEARCH_FIELD, label=campo)
         page.wait_for_timeout(600)
         page.select_option(_SEL_SEARCH_MATCH_TYPE, label=match_type)
         page.wait_for_timeout(300)
@@ -503,13 +528,13 @@ def _aplicar_filtro_fornecedor(page, supplier_name: str, match_type: str) -> Non
         box = page.locator(_SEL_SEARCH_BOX)
         box.click()
         box.fill("")
-        box.type(supplier_name, delay=40)
+        box.type(termo, delay=40)
         page.keyboard.press("Enter")
         page.wait_for_timeout(1500)  # a grade repopula de forma assincrona
     except PwError as exc:
-        _debug_dump(page, "catapult_filtro_fornecedor")
+        _debug_dump(page, "catapult_filtro_busca")
         raise IntegracaoException(
-            f"campo de busca por Supplier não aceitou {supplier_name!r}: {exc}"
+            f"campo de busca por {campo} não aceitou {termo!r}: {exc}"
         ) from exc
 
 
@@ -535,22 +560,13 @@ def extrair_prefixo_nome_po(name: str) -> str:
     return name.split("-", 1)[0].strip()
 
 
-def casar_fornecedor_por_aproximacao(nome: str, prefixos: list[str]) -> bool:
-    """True se `nome` casa por aproximação (`match_supplier`) com algum prefixo."""
-    achado, _score = match_supplier(nome, prefixos)
-    return achado is not None
-
-
-def casar_fornecedor_por_nomes_alternativos(nomes_alternativos: tuple[str, ...], prefixos: list[str]) -> bool:
-    """True se algum nome alternativo casa com algum prefixo."""
-    return any(casar_fornecedor_por_aproximacao(n, prefixos) for n in nomes_alternativos)
-
-
 def _conferir_filtro_aplicado(
     page, resultado: list[dict], supplier_name: str, match_type: str,
     nomes_alternativos: tuple[str, ...] = (),
-) -> None:
-    """Levanta se a grade devolveu a listagem padrão em vez do resultado
+) -> list[dict]:
+    """Devolve só os POs cujo prefixo do Name é confiavelmente o fornecedor
+    buscado (fuzzy: `commons.matcher.aceitar_prefixos_catapult`). Levanta se
+    nenhum for — a grade devolveu a listagem padrão em vez do resultado
     filtrado. Não toca no navegador — só confere o que já foi lido."""
     # Sanidade: se o filtro não pegou de verdade, a grade volta pra listagem
     # padrão (com Status=Ordered ainda aplicado, mas de TODOS os fornecedores
@@ -563,13 +579,16 @@ def _conferir_filtro_aplicado(
     # Distributor'; 'Fresh Poin-008668-RS2' para 'Freshpoint Central FL'). Por
     # isso compara o PREFIXO do Name (antes do '-') por aproximação com o nome
     # buscado e, não achando, cai nos nomes alternativos (de-para `dim_fornecedor_alias`).
-    prefixos = [extrair_prefixo_nome_po(r["name"]) for r in resultado]
     if not resultado or not supplier_name.strip():
-        return
-    if casar_fornecedor_por_aproximacao(supplier_name, prefixos):
-        return
-    if casar_fornecedor_por_nomes_alternativos(nomes_alternativos, prefixos):
-        return
+        return resultado
+    prefixos = [extrair_prefixo_nome_po(r["name"]) for r in resultado]
+    aceitos, scores = aceitar_prefixos_catapult((supplier_name, *nomes_alternativos), prefixos)
+    if aceitos:
+        return [r for r in resultado if extrair_prefixo_nome_po(r["name"]) in aceitos]
+    log.warning(
+        "busca por nome %r (alternativos: %s): nenhum prefixo confiavel entre %s PO(s); scores=%s",
+        supplier_name, list(nomes_alternativos), len(resultado), scores,
+    )
     _debug_dump(page, "catapult_filtro_ignorado")
     raise IntegracaoException(
         f"busca por Supplier {match_type!r}='{supplier_name}' devolveu "

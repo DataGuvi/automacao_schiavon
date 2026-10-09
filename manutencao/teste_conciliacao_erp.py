@@ -36,7 +36,6 @@ aqui, o motor de leitura ja e testado em outro lugar; arquivo ainda em
 
 from __future__ import annotations
 
-import time
 from datetime import date
 from decimal import Decimal
 
@@ -87,18 +86,6 @@ INVOICE_ITEMS = [
         "upc": None, "handwritten_notes": False,
     },
 ]
-
-def _dump(page, tag: str) -> None:
-    """Mesmo padrao de `_debug_dump` em commons/catapult — nunca levanta."""
-    ts = int(time.time())
-    try:
-        page.screenshot(path=f"debug_{tag}_{ts}.png", full_page=True)
-        with open(f"debug_{tag}_{ts}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        print(f"  [debug] salvo debug_{tag}_{ts}.png / .html")
-    except Exception as e:  # noqa: BLE001
-        print(f"  [debug] falhou ao salvar dump: {e}")
-
 
 def _achar_po(page) -> tuple[dict, list[dict]] | None:
     """Busca PO(s) 'Ordered' do fornecedor de teste. Sem nenhum, devolve
@@ -208,7 +195,6 @@ def main() -> None:
 
     except Exception as exc:  # noqa: BLE001 — teste, quero ver o que quebrou
         print(f"\nFALHOU raspando o PO: {exc}")
-        _dump(page, "conciliacao_erp_teste")
         return
     finally:
         browser.close()

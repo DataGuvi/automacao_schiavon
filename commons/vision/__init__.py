@@ -82,9 +82,12 @@ Pay special attention to:
    from a weight column (labeled "WEIGHT", "EXT WEIGHT", "LBS", "N.W", ...),
    with the unit price applied per pound (variable-weight/catch-weight items — pack/size
    often shows "AVG", or the case size is itself a weight like "65# CS").
-   When BOTH a case-count and a weight column exist on the same line: put
-   the WEIGHT in `quantity` (so `quantity x unit_price = total_price` still
-   holds) and put the case count in `cases`. When the invoice has only ONE
+   When BOTH a case-count and a weight column exist on the same line AND the
+   unit price is applied per unit of weight (weight x unit_price = total_price):
+   put the WEIGHT in `quantity` (so `quantity x unit_price = total_price` still
+   holds) and put the case count in `cases`. If instead the unit price is per
+   case/each (printed qty x unit_price = total_price), the weight column is
+   informational only: never put it in `quantity`. When the invoice has only ONE
    quantity column (no separate weight, e.g. dry goods sold by the case),
    leave `cases` null — `quantity` already IS the case count — UNLESS rule 8
    below applies.
@@ -114,8 +117,19 @@ Pay special attention to:
    1 → N=20 → `quantity`=20, `cases`=1 (`total_price` untouched).
    Example: description "Requeijao Cremoso Copo TRADICIONAL Tirolez
    12x200g" with a printed Qty of 7 → N=12 → `quantity`=84, `cases`=7.
-   Don't apply this when the description has no "<N>X<size>" pattern, or
-   when rule 7's weight column already fills `quantity` and `cases`.
+   The pack size can also be printed in its OWN column ("Pack Size", "Pack",
+   "Size") with a slash instead of an "x", as "<N>/<size> <UNIT>" — e.g.
+   "12/12 oz", "6/2LB", "6/12 oz". Same rule: N is the first number, the
+   real quantity is Qty(printed) x N, `cases` is the printed Qty, and the
+   unit of the size (oz, lb, g...) is NOT converted — only N matters. Copy
+   that column's text exactly into `pack_size`; leave `pack_size` null when
+   the invoice has no such column.
+   Example: printed Qty 1, Pack Size "12/12 oz", Weight 5.40, unit price
+   53.90, extended 53.90 → `quantity`=12, `cases`=1, `pack_size`="12/12 oz"
+   (the Weight column is NOT used: the price is per case, not per weight).
+   Don't apply this when the description has no "<N>X<size>" pattern and
+   there is no pack column, or when rule 7's weight column already fills
+   `quantity` and `cases`.
    Why both numbers matter and neither is "the" answer: the same
    "<N>X<size>" description shows up on invoices whose purchase order
    tracks the item in individual units (where only the multiplied
@@ -153,6 +167,7 @@ Return this exact JSON structure (use null for unknown fields):
       "description": null,
       "item_code": null,
       "upc": null,
+      "pack_size": null,
       "quantity": null,
       "unit": null,
       "unit_price": null,

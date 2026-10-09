@@ -25,7 +25,6 @@ verdade e grava no banco.
 from __future__ import annotations
 
 import sys
-import time
 
 import openpyxl
 
@@ -53,18 +52,6 @@ _ID_LOJA = {
 
 _TOTAL_PAGINAS_CATALOGO = 13  # ceil(5012 / 400), confirmado contra o ambiente real
 _SAIDA = REPORTS_DIR / "catapult_inventory_scrape.xlsx"
-
-
-def _dump(page, tag: str) -> None:
-    """Mesmo padrao de `_debug_dump` em commons/catapult — nunca levanta."""
-    ts = int(time.time())
-    try:
-        page.screenshot(path=f"debug_{tag}_{ts}.png", full_page=True)
-        with open(f"debug_{tag}_{ts}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        print(f"  [debug] salvo debug_{tag}_{ts}.png / .html")
-    except Exception as e:  # noqa: BLE001
-        print(f"  [debug] falhou ao salvar dump: {e}")
 
 
 def _abrir_inventory(page) -> None:
@@ -163,13 +150,12 @@ def main() -> None:
             captura_completa = True
     except Exception as exc:  # noqa: BLE001 — teste, quero ver o que quebrou
         print(f"\nFALHOU lendo a grade: {exc}")
-        _dump(page, "inventory")
     finally:
         browser.close()
         pw.stop()
 
     if not linhas:
-        print("\nNenhuma linha capturada — ver debug_inventory_*.png/.html gerado.")
+        print("\nNenhuma linha capturada.")
         return
 
     # td's da linha: [checkbox(0), ReceiptAlias(1), icone-camera(2, vazio),

@@ -61,7 +61,7 @@ def main() -> None:
         )
     except CatapultLoginError as exc:
         print(f"\nFALHOU: {exc}")
-        print("Veja os debug_cloudflare_*/debug_catapult_*.png/.html salvos na raiz.")
+        print("Veja os logs acima")
         return
 
     # Fragmento (#...) não sobrevive ao redirect do Cloudflare Access — some

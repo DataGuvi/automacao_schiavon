@@ -36,6 +36,7 @@ from commons.catapult import (
     open_purchase_order,
     open_worksheets,
     scrape_po_items,
+    search_purchase_orders_by_invoice,
     search_purchase_orders_by_supplier,
     to_po_lines,
 )
@@ -56,16 +57,19 @@ from conciliacao.reconcile_erp import (
 from conciliacao.relatorio_divergencia import NOME_LOJA, gerar_relatorio_divergencia_erp
 from conciliacao.relatorio_sucesso import gerar_relatorio_sucesso_erp
 from domain.service import notificacao_service
+from domain.categorias import CategoriaFornecedor
 from domain.config import Config
 from domain.enums import Etapa, StatusExecucao as Status
 from domain.service import processo_service as proc
 from domain.service import sistema_service
 from domain.service.conciliacao_service import (
+    classificar_fornecedor,
     confirmar_fornecedor_para_aprender,
     escolher_nome_catapult,
     fetch_fornecedores,
     gravar_nome_catapult,
     montar_resolvedor_fornecedor,
+    fetch_invoice_headers_aguardando_po,
     fetch_invoice_headers_for_reconciliation,
     fetch_invoice_headers_reprocesso,
     fetch_invoice_items_by_headers,
@@ -113,7 +117,8 @@ def reconcile_erp_flow(
         pendentes_anterior = fetch_invoice_headers_for_reconciliation(conn, inicio_ant, fim_ant)
         headers_novos = fetch_invoice_headers_for_reconciliation(conn, date_from, date_to)
         reprocesso = fetch_invoice_headers_reprocesso(conn)
-        headers = _selecionar_headers(pendentes_anterior, headers_novos, reprocesso)
+        aguardando_po = fetch_invoice_headers_aguardando_po(conn)
+        headers = _selecionar_headers(pendentes_anterior, headers_novos, reprocesso, aguardando_po)
 
         if not headers:
             log.info("Nenhuma invoice no periodo.")
@@ -129,7 +134,7 @@ def reconcile_erp_flow(
         totais = {
             "headers_total": 0, "headers_issue": 0,
             "items_total": 0, "items_issue": 0,
-            "sem_po": 0, "lojas_puladas": 0, "puladas_insumo": 0,
+            "sem_po": 0, "aguardando_po": 0, "lojas_puladas": 0, "puladas_insumo": 0,
             "relatorios_gerados": 0, "relatorios_erro": 0, "notas_erro": 0,
             "sucessos_gerados": 0, "sucessos_erro": 0,
             "relatorios_cliente": [],
@@ -154,6 +159,7 @@ def reconcile_erp_flow(
         log.info("Itens comparados : %s", totais['items_total'])
         log.info("com pendencia : %s", totais['items_issue'])
         log.info("Sem PO no Catapult : %s", totais['sem_po'])
+        log.info("Aguardando PO Ordered : %s", totais['aguardando_po'])
         log.info("Nao enviadas (insumo) : %s", totais['puladas_insumo'])
         log.info(
             "Relatorios divergencia : %s (%s falha(s))",
@@ -177,13 +183,14 @@ def reconcile_erp_flow(
 
 def _selecionar_headers(
     pendentes_anterior: list[dict], headers_novos: list[dict], reprocesso: list[dict],
+    aguardando_po: list[dict] | None = None,
 ) -> list[dict]:
-    """Une as tres listas de notas a conciliar (semana anterior, atual e
-    reprocesso explicito, status 56), sem duplicar por `id`. Nenhuma loja fica
-    presa: as duas semanas entram sempre."""
+    """Une as listas de notas a conciliar (semana anterior, atual, reprocesso
+    explicito, status 56, e aguardando PO Ordered, status 13), sem duplicar por
+    `id`. Nenhuma loja fica presa: as duas semanas entram sempre."""
     vistos: set[int] = set()
     headers = []
-    for h in pendentes_anterior + headers_novos + reprocesso:
+    for h in pendentes_anterior + headers_novos + reprocesso + (aguardando_po or []):
         if h["id"] not in vistos:
             vistos.add(h["id"])
             headers.append(h)
@@ -327,7 +334,16 @@ def _processar_invoice(
         )
         return
 
+    supplier_name = header.get("supplier_name")
+    fornecedor = resolver_fornecedor(supplier_name or "")
+    categoria_fornecedor = _categoria_do_fornecedor(supplier_name, aliases_invoice, fornecedor)
+
+    if categoria_fornecedor == CategoriaFornecedor.INSUMO:
+        _gravar_skip_insumo(conn, header, totais)
+        return
+
     if tem_anotacao_insumo(items, header.get("general_handwritten_notes")):
+        _aprender_insumo(conn, fornecedor, supplier_name, aliases_invoice)
         _gravar_skip_insumo(conn, header, totais)
         return
 
@@ -337,17 +353,59 @@ def _processar_invoice(
     # candidato(s), mas não deu pra desempatar) chegam iguais em
     # `reconcile_items_against_po`: nota inteira sem PO pra comparar —
     # `PO_NAO_ENCONTRADA` no header e em cada item.
+    if po_lines is None and proc.aguardar_po_ordered(conn, header["id_processo"], Etapa.CONCILIAR_ERP):
+        # Nenhuma PO 'Ordered' agora: fica em PO_NAO_ENCONTRADA e so volta a
+        # pesquisar na PROXIMA execucao do robo (spec-retentativa-po-ordered).
+        log.info("nota %s: sem PO Ordered, nova consulta na proxima execucao", header.get("invoice_number"))
+        totais["aguardando_po"] += 1
+        return
+
     if not po_lines:
         po_lines = []
         totais["sem_po"] += 1
 
-    supplier_name = header.get("supplier_name")
-    categoria_fornecedor = aliases_invoice.get(norm_supplier(supplier_name), {}).get("categoria")
     resultado = reconcile_items_against_po(
         items, po_lines, sinonimos=sinonimos,
         supplier_name=supplier_name, categoria_fornecedor=categoria_fornecedor,
     )
     _gravar_resultado(conn, header, resultado, sheet_id, totais)
+
+
+def _categoria_do_fornecedor(
+    supplier_name: str | None, aliases_invoice: dict[str, dict], fornecedor: dict | None,
+) -> str | None:
+    """Categoria da nota: a do alias `invoice` exato; sem alias, a do fornecedor
+    resolvido por aproximacao (spec-categoria-insumo-carne R2). `insumo` pula a
+    nota em silencio, entao por aproximacao so vale com nome confirmado (R7)."""
+    alias = aliases_invoice.get(norm_supplier(supplier_name), {})
+    if alias.get("categoria"):
+        return alias["categoria"]
+    categoria = (fornecedor or {}).get("categoria")
+    if categoria == CategoriaFornecedor.INSUMO and not confirmar_fornecedor_para_aprender(
+        supplier_name or "", fornecedor,
+    ):
+        return None
+    return categoria
+
+
+def _aprender_insumo(
+    conn, fornecedor: dict | None, supplier_name: str | None, aliases_invoice: dict[str, dict],
+) -> None:
+    """A Vision viu 'insumo' na nota: grava `categoria='insumo'` no fornecedor, so se
+    foi resolvido com confianca e ainda nao tem categoria (R3). Nunca levanta."""
+    if conn is None or fornecedor is None:
+        return
+    por_alias = norm_supplier(supplier_name) in aliases_invoice
+    if not (por_alias or confirmar_fornecedor_para_aprender(supplier_name or "", fornecedor)):
+        return
+    try:
+        if classificar_fornecedor(
+            conn, fornecedor["id"], CategoriaFornecedor.INSUMO, somente_sem_categoria=True,
+        ):
+            fornecedor["categoria"] = CategoriaFornecedor.INSUMO
+            log.info("fornecedor %s: categoria=insumo (nota com anotacao de insumo)", fornecedor["id"])
+    except DataAccessException:
+        log.exception("fornecedor %s: falha gravando categoria insumo", fornecedor.get("id"))
 
 
 def _aprender_nome_catapult(
@@ -403,6 +461,22 @@ def _buscar_po(
     não depende do resultado da conciliação de itens.
     """
     supplier_name = header.get("supplier_name") or ""
+    invoice_number = str(header.get("invoice_number") or "").strip()
+    open_worksheets(page, url)
+
+    # Busca prioritaria: 'Invoice Reference' + 'Equals' com o numero da nota.
+    # So se nao achar PO que case pelos itens cai na busca por nome (abaixo).
+    if invoice_number:
+        achados = search_purchase_orders_by_invoice(page, invoice_number)
+        escolha = _desempatar_por_itens(
+            page, achados, items, sinonimos, f"invoice {invoice_number!r}",
+        )
+        if escolha is not None:
+            return _abrir_po_escolhido(page, header, achados, *escolha)
+        if 0 < len(achados) <= _MAX_CANDIDATOS_DESEMPATE:
+            open_worksheets(page, url)  # os POs abertos tiraram a tela da busca
+        log.info("nota %s: sem PO pela Invoice Reference, buscando pelo nome", invoice_number)
+
     # O nome lido da invoice frequentemente diverge do nome que o Catapult
     # conhece (ele trunca/abrevia, ex. 'Freshpoint Central FL' -> 'Fresh
     # Poin') — busca pelo alias 'erp' (`dim_fornecedor_alias`) do fornecedor
@@ -410,7 +484,6 @@ def _buscar_po(
     # invoice.
     fornecedor = resolver_fornecedor(supplier_name)
     termo_busca = (fornecedor or {}).get("nome_catapult") or supplier_name
-    open_worksheets(page, url)
     achados = search_purchase_orders_by_supplier(
         page, termo_busca, nomes_alternativos=(supplier_name,),
     )
@@ -418,6 +491,27 @@ def _buscar_po(
         return None
     _aprender_nome_catapult(conn, fornecedor, supplier_name, achados)
 
+    escolha = _desempatar_por_itens(
+        page, achados, items, sinonimos, f"{termo_busca!r} (fornecedor lido: {supplier_name!r})",
+    )
+    if escolha is None:
+        return []
+    return _abrir_po_escolhido(page, header, achados, *escolha)
+
+
+def _desempatar_por_itens(
+    page, achados: list[dict], items: list[dict], sinonimos: dict, busca: str,
+) -> tuple[int, list[list[POLine]]] | None:
+    """Abre cada PO candidato, raspa os itens e escolhe o que casa com a nota.
+
+    `None` = sem candidato, candidatos demais ou nenhum casou pelos itens.
+    Vale também para um PO só: um 'Ordered' aberto do fornecedor não é
+    necessariamente o desta nota, e `fill_receiving_invoice_info` escreve
+    número/data da nota no Catapult de produção — só depois de conferir
+    que os itens casam.
+    """
+    if not achados:
+        return None
     if len(achados) > _MAX_CANDIDATOS_DESEMPATE:
         # Fornecedor de entrega frequente (ex. FreshPoint, 199+ PO 'Ordered'
         # num store só) — abrir e raspar cada candidato pra desempatar por
@@ -426,15 +520,11 @@ def _buscar_po(
         # sem abrir o PO), trata como ambíguo demais em vez de travar a
         # loja inteira nessa nota.
         log.warning(
-            "%s PO(s) 'Ordered' para %r (fornecedor lido: %r) - mais que %s, nao da pra desempatar abrindo um por um - tratando como sem PO",
-            len(achados), termo_busca, supplier_name, _MAX_CANDIDATOS_DESEMPATE,
+            "%s PO(s) 'Ordered' para %s - mais que %s, nao da pra desempatar abrindo um por um - tratando como sem PO",
+            len(achados), busca, _MAX_CANDIDATOS_DESEMPATE,
         )
-        return []
+        return None
 
-    # Vale também para um PO só: um 'Ordered' aberto do fornecedor não é
-    # necessariamente o desta nota, e `fill_receiving_invoice_info` escreve
-    # número/data da nota no Catapult de produção — só depois de conferir
-    # que os itens casam.
     candidatos: list[list[POLine]] = []
     for achado in achados:
         open_purchase_order(page, achado["href"])
@@ -442,11 +532,17 @@ def _buscar_po(
     indice = escolher_po_por_itens(items, candidatos, sinonimos)
     if indice is None:
         log.warning(
-            "%s PO(s) 'Ordered' para %r (fornecedor lido: %r), nenhum casou com os itens desta nota - tratando como sem PO",
-            len(achados), termo_busca, supplier_name,
+            "%s PO(s) 'Ordered' para %s, nenhum casou com os itens desta nota - tratando como sem PO",
+            len(achados), busca,
         )
-        return []
+        return None
+    return indice, candidatos
 
+
+def _abrir_po_escolhido(
+    page, header: dict, achados: list[dict], indice: int, candidatos: list[list[POLine]],
+) -> list[POLine]:
+    """Abre o PO escolhido, grava número/data da nota nele e devolve os itens."""
     open_purchase_order(page, achados[indice]["href"])
     invoice_number = str(header.get("invoice_number") or "").strip()
     if invoice_number and header.get("invoice_date"):

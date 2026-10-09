@@ -120,7 +120,7 @@ _PISO_APRENDER_NOME_CATAPULT = 95.0
 
 
 def fetch_fornecedores(conn) -> list[dict]:
-    """Todos os fornecedores: `{id, nome, nome_catapult}`.
+    """Todos os fornecedores: `{id, nome, categoria, nome_catapult}`.
 
     `nome_catapult` e o nome como o Catapult conhece o fornecedor (prefixo do
     Name do PO): o alias `origem='erp'` ativo dele em `dim_fornecedor_alias`,
@@ -128,7 +128,7 @@ def fetch_fornecedores(conn) -> list[dict]:
     return _ler(
         conn,
         f"""
-        SELECT f.id, f.nome,
+        SELECT f.id, f.nome, f.categoria,
                (SELECT a.alias FROM {SCHEMA}.dim_fornecedor_alias a
                  WHERE a.id_fornecedor = f.id AND a.origem = 'erp' AND a.ativo
                  ORDER BY a.id LIMIT 1) AS nome_catapult
@@ -136,6 +136,29 @@ def fetch_fornecedores(conn) -> list[dict]:
         """,
         None, "fornecedores",
     )
+
+
+def classificar_fornecedor(
+    conn, id_fornecedor: int, categoria: str, somente_sem_categoria: bool = False,
+) -> bool:
+    """Grava `dim_fornecedor.categoria`. Devolve False quando nada mudou.
+
+    `somente_sem_categoria`: so grava se a categoria atual e vazia ou 'outros' —
+    o aprendizado automatico nunca sobrescreve uma classificacao feita a mao.
+    Nao mexe em `cotado` (spec-categoria-insumo-carne)."""
+    filtro = " AND (categoria IS NULL OR categoria = 'outros')" if somente_sem_categoria else ""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {SCHEMA}.dim_fornecedor SET categoria = %s WHERE id = %s{filtro}",
+                (str(categoria), id_fornecedor),
+            )
+            alterou = cur.rowcount > 0
+        conn.commit()
+        return alterou
+    except psycopg2.Error as exc:
+        reverter(conn)
+        raise DataAccessException("falha ao gravar a categoria do fornecedor") from exc
 
 
 def montar_resolvedor_fornecedor(fornecedores: list[dict], aliases_invoice: dict[str, dict]):
@@ -377,6 +400,27 @@ def fetch_invoice_headers_reprocesso(conn) -> list[dict]:
          ORDER BY i.dt_emissao, i.id
         """,
         (int(_REPROC),), "invoices marcadas para reprocesso",
+    )
+
+
+def fetch_invoice_headers_aguardando_po(conn) -> list[dict]:
+    """Notas em `PO_NAO_ENCONTRADA` (processo.cod_status = 13), a pesquisar de novo.
+
+    Vêm fora da janela de data: a retentativa de PO dura até 3 execuções e a
+    nota não pode perder a contagem por sair das duas semanas varridas.
+    """
+    return _ler(
+        conn,
+        f"""
+        SELECT {_HEADER_COLS}
+          FROM {SCHEMA}.fat_invoice i
+         WHERE i.id_processo IN (
+                   SELECT id FROM {SCHEMA}.processo
+                    WHERE cod_tipo = 'invoice' AND cod_status = %s
+               )
+         ORDER BY i.dt_emissao, i.id
+        """,
+        (int(StatusExecucao.PO_NAO_ENCONTRADA),), "invoices aguardando PO Ordered",
     )
 
 

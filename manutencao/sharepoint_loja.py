@@ -80,12 +80,9 @@ def main() -> None:
 
     cred = config.sharepoint
     pw, browser, context, page = sp.open_sharepoint_session(
-        cred.usuario, cred.senha, registro["url"], headless=not args.janela)
-    try:
-        _usar_sessao(registro, args.janela, context, page)
-    finally:
-        fechar_browser(browser)
-        parar_playwright(pw)
+        cred.usuario, cred.senha, registro["url"], headless=False)
+
+    _usar_sessao(registro, args.janela, context, page)
 
 
 if __name__ == "__main__":

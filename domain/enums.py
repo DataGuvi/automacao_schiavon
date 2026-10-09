@@ -99,6 +99,12 @@ _TOTAL_DE_ETAPAS_POR_FLUXO: dict[Fluxo, int] = {
     for fluxo in Fluxo
 }
 
+# Execuções NOVAS (além da inicial) que o robô espera a PO virar 'Ordered'
+# antes de reportar "nenhum PO Ordered". `processo.tentativas_po` conta a
+# partir de 1 na execução inicial; ver `processo_service.aguardar_po_ordered`.
+MAX_TENTATIVAS_PO = 3
+
+
 class StatusExecucao(IntEnum):
     """Onde o caso está. Gravado em `processo.cod_status` (número) e
     `processo.status_exec` (nome).
@@ -125,6 +131,7 @@ class StatusExecucao(IntEnum):
     PENDENTE = 10, "Criado, nenhuma etapa executada ainda."
     EM_ANDAMENTO = 11, "Alguma etapa concluída, faltam outras."
     AGUARDANDO_RESPOSTA = 12, "Planilha enviada, fornecedor não preencheu."
+    PO_NAO_ENCONTRADA = 13, "PO sem status Ordered no Catapult; pesquisar de novo na próxima execução."
     ENCERRADO_SEM_ARQUIVO = 21, "Pasta da semana encontrada, mas vazia."
     ERRO_LOGIN = 50, "Falha de autenticação na origem."
     ERRO_NAVEGACAO = 51, "Pasta ou arquivo não encontrado na origem."

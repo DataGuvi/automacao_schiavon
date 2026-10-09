@@ -20,7 +20,7 @@ from psycopg2.extras import RealDictCursor
 
 from commons.db import reverter
 from commons.exception import DataAccessException
-from domain.enums import Etapa, StatusExecucao, status_apos_concluir
+from domain.enums import MAX_TENTATIVAS_PO, Etapa, StatusExecucao, status_apos_concluir
 
 # Qualificado de propósito: a migração é por fluxo, e o resto do sistema ainda
 # roda no dwschiavon via search_path. Um lugar só para mudar quando terminar.
@@ -31,6 +31,7 @@ __all__ = [
     "abrir",
     "concluir_etapa",
     "aguardar_etapa",
+    "aguardar_po_ordered",
     "falhar_etapa",
     "registrar_contagem",
     "status_atual",
@@ -48,19 +49,19 @@ def abrir(
     """Abre o caso, ou recupera o que já existe. Retorna o id.
 
     Idempotente pelo identificador do processo: rodar de novo o mesmo arquivo (ou a mesma
-    semana) não cria um caso duplicado — incrementa `tentativas`. É o que
-    permite reprocessar sem sujar o banco.
+    semana) não cria um caso duplicado. É o que permite reprocessar sem sujar o
+    banco. Não mexe em `tentativas_po`: ela é só da retentativa de PO
+    (`aguardar_po_ordered`).
     """
     with conn.cursor() as cur:
         cur.execute(
             f"""
             INSERT INTO {SCHEMA}.processo
                 (cod_tipo, identificador_processo, id_loja, dt_origem,
-                 cod_status, status_exec, percent_exec, tentativas)
-            VALUES (%s, %s, %s, %s, %s, %s, 0, 1)
+                 cod_status, status_exec, percent_exec, tentativas_po)
+            VALUES (%s, %s, %s, %s, %s, %s, 0, 0)
             ON CONFLICT (cod_tipo, identificador_processo) DO UPDATE
-               SET tentativas    = {SCHEMA}.processo.tentativas + 1,
-                   atualizado_em = now() AT TIME ZONE 'America/Sao_Paulo'
+               SET atualizado_em = now() AT TIME ZONE 'America/Sao_Paulo'
             RETURNING id
             """,
             (cod_tipo, identificador_processo, id_loja, dt_origem,
@@ -142,6 +143,56 @@ def falhar_etapa(
             (mensagem or "")[:2000] or None, None)
 
 
+def aguardar_po_ordered(
+    conn,
+    id_processo: int,
+    etapa: Etapa,
+    max_tentativas: int = MAX_TENTATIVAS_PO,
+) -> bool:
+    """Marca o caso como `PO_NAO_ENCONTRADA` e controla `tentativas_po`.
+
+    `True` = segue aguardando (nova consulta na próxima execução do robô);
+    `False` = esgotou `max_tentativas` e o caso não foi alterado — quem chama
+    segue o fluxo de "nenhuma PO Ordered".
+
+    Primeira vez (caso fora do status 13): grava 13 e `tentativas_po = 1`, mesmo
+    que a coluna tenha outro valor. Já em 13 e abaixo do teto: +1. Uma única
+    UPDATE condicional, então a contagem não se perde nem dobra.
+    """
+    status = StatusExecucao.PO_NAO_ENCONTRADA
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {SCHEMA}.processo
+                   SET tentativas_po = CASE WHEN cod_status = %s
+                                            THEN COALESCE(tentativas_po, 0) + 1
+                                            ELSE 1 END,
+                       cod_etapa     = %s,
+                       etapa_exec    = %s,
+                       cod_status    = %s,
+                       status_exec   = %s,
+                       percent_exec  = %s,
+                       mensagem      = NULL,
+                       atualizado_em = now() AT TIME ZONE 'America/Sao_Paulo'
+                 WHERE id = %s
+                   AND (cod_status IS DISTINCT FROM %s
+                        OR COALESCE(tentativas_po, 0) < %s)
+                RETURNING tentativas_po
+                """,
+                (int(status), int(etapa), etapa.name, int(status), status.name,
+                 etapa.percentual_anterior, id_processo, int(status), max_tentativas),
+            )
+            atualizou = cur.fetchone() is not None
+        conn.commit()
+        return atualizou
+    except psycopg2.Error as exc:
+        reverter(conn)
+        raise DataAccessException(
+            f"falha ao gravar tentativa de PO do processo id={id_processo}"
+        ) from exc
+
+
 def registrar_contagem(
     conn,
     id_processo: int,
@@ -190,7 +241,7 @@ def buscar(conn, cod_tipo: str, identificador_processo: str) -> dict | None:
             f"""
             SELECT id, cod_tipo, identificador_processo, id_loja, dt_origem,
                    cod_etapa, etapa_exec, cod_status, status_exec,
-                   percent_exec, tentativas, mensagem, "custo_total_IA"
+                   percent_exec, tentativas_po, mensagem, "custo_total_IA"
               FROM {SCHEMA}.processo
              WHERE cod_tipo = %s AND identificador_processo = %s
             """,

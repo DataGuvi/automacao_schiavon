@@ -413,6 +413,59 @@ def match_supplier(
     return (best, best_score) if best_score >= threshold else (None, best_score)
 
 
+# Piso para aceitar variacao de escrita (typo/abreviacao) sem subconjunto de tokens.
+_PISO_NOME_CATAPULT = 85.0
+
+# Palavras que nao identificam o fornecedor: sozinhas nao bastam para o subconjunto de tokens.
+_TOKENS_GENERICOS = frozenset({
+    "food", "foods", "distribution", "distributor", "distributors", "distributing",
+    "supply", "supplies", "wholesale", "imports", "import", "usa", "us", "trading",
+    "group", "company", "co", "international", "products", "produce",
+})
+
+
+def pontuar_nome_catapult(nome: str | None, prefixo: str | None) -> float:
+    """Similaridade 0-100 entre o nome buscado e um prefixo de Name de PO.
+
+    100 quando um e igual ao outro ou os tokens de um estao contidos nos do outro
+    ('Leblon foods' x 'Leblon'): palavra a mais ou a menos nao e diferenca, desde
+    que o menor tenha um token que identifique (nao 'foods' sozinho). Senao
+    o melhor entre `token_sort_ratio` e a razao dos textos sem espaco (cobre
+    'Fresh Poin' x 'Freshpoint'). Um token em comum entre dois nomes com tokens
+    distintos ('Prime Meats' x 'Prime Distribution') NAO chega ao piso.
+    """
+    a, b = norm_supplier(nome), norm_supplier(prefixo)
+    if not a or not b:
+        return 0.0
+    ta, tb = set(a.lower().split()), set(b.lower().split())
+    if (ta <= tb or tb <= ta) and (ta if len(ta) <= len(tb) else tb) - _TOKENS_GENERICOS:
+        return 100.0
+    return max(
+        fuzz.token_sort_ratio(a, b),
+        fuzz.ratio(a.replace(" ", ""), b.replace(" ", "")),
+    )
+
+
+def aceitar_prefixos_catapult(
+    nomes: Sequence[str | None], prefixos: Sequence[str], piso: float = _PISO_NOME_CATAPULT,
+) -> tuple[list[str], dict[str, float]]:
+    """Prefixos de PO que sao confiavelmente o mesmo fornecedor de `nomes`.
+
+    Devolve `(aceitos, scores)`; `scores` = melhor pontuacao de cada prefixo
+    distinto (para diagnostico em log). Se algum prefixo e IGUAL (normalizado) a
+    um dos nomes, so os iguais valem ('Prime' nao disputa com 'Prime Meats').
+    Mais de um aceito sem igualdade = ambiguo: quem chama desempata por itens e
+    valor, nunca pelo score. Lista vazia = sem correspondencia confiavel.
+    """
+    distintos = list(dict.fromkeys(p for p in prefixos if p))
+    scores = {p: max((pontuar_nome_catapult(n, p) for n in nomes), default=0.0) for p in distintos}
+    alvos = {norm_supplier(n) for n in nomes if norm_supplier(n)}
+    exatos = [p for p in distintos if norm_supplier(p) in alvos]
+    if exatos:
+        return exatos, scores
+    return [p for p in distintos if scores[p] >= piso], scores
+
+
 def match_items(
     invoice_lines: Sequence[InvoiceLine],
     quote_lines: Sequence[QuoteLine],
@@ -754,6 +807,23 @@ def match_items_po(
                 ambiguous=score < CONFIDENT_SCORE,
             )
             claimed.add(disponiveis[j].key)
+
+    # --- Etapa 2b: codigo contra linha ZERADA, ultimo recurso ----------------
+    # O codigo bate, mas a linha nao foi recebida/faturada neste PO: o item da
+    # invoice existe e a divergencia (valor/quantidade contra $0) e o que se
+    # quer mostrar — spec-po-zerado-ultimo-recurso.
+    for line in invoice_lines:
+        if line.key in matches:
+            continue
+        po = next(
+            (code_index[c] for c in (norm_code(line.item_code), norm_code(line.upc),
+                                      norm_code(line.handwritten_code))
+             if c and c in code_index and code_index[c].key not in claimed),
+            None,
+        )
+        if po is not None:
+            matches[line.key] = POMatch(line.key, po.key, "codigo", None)
+            claimed.add(po.key)
 
     # --- Etapa 3: o que sobrou --------------------------------------------
     return [

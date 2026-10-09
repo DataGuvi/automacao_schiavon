@@ -36,6 +36,18 @@ _PACK_SIZE_RE = re.compile(
     r"(\d+)\s*x\s*\d+(?:[.,]\d+)?\s*(?:kg|gr|ml|lb|oz|g|l)\b", re.IGNORECASE
 )
 
+# Pack impresso em coluna propria, com barra: "12/12 oz", "6/2LB", "6/12 oz"
+# (spec-pack-size-coluna). So o N conta; a unidade do size nao e convertida.
+_PACK_COLUNA_RE = re.compile(
+    r"^\s*(\d+)\s*/\s*\d+(?:[.,]\d+)?\s*(?:kg|gr|ml|lbs|lb|oz|g|l)\b", re.IGNORECASE
+)
+
+
+def _n_do_pack(pack_size: str | None, description: str | None) -> int:
+    """N do pack ('12/12 oz' -> 12; descricao '12x500 GR' -> 12), ou 0 sem padrao."""
+    m = _PACK_COLUNA_RE.match(pack_size or "") or _PACK_SIZE_RE.search(description or "")
+    return int(m.group(1)) if m else 0
+
 # Data impressa: tres numeros separados por '/', '-' ou '.'. A Vision converte
 # a data para ISO "de cabeca" e ja trocou dia/mes/ano em nota americana
 # (mes/dia/ano) — a nota saiu da janela da conciliacao e ficou presa.
@@ -86,6 +98,14 @@ class InvoiceItem(BaseModel):
             "própria (ex.: 'UPC Item') ou junto da descrição. Só os dígitos."
         ),
     )
+    pack_size: str | None = Field(
+        None,
+        description=(
+            "Texto EXATO da coluna de pack/size da linha, quando a nota imprime uma "
+            "coluna propria para isso (ex.: '12/12 oz', '6/2LB', '24/16 oz'). Null "
+            "quando nao ha essa coluna."
+        ),
+    )
     quantity: float | None = None
     unit: str | None = None
     unit_price: float | None = None
@@ -128,16 +148,15 @@ class InvoiceItem(BaseModel):
         (`commons/vision/__init__.py`): se a Vision não preencheu `cases`
         (não aplicou o multiplicador — ou porque não achou o padrão, ou
         porque simplesmente esqueceu nessa linha, o caso comum em notas com
-        muitos itens) mas a descrição carrega "<N>X<size>", aplica aqui do
-        mesmo jeito: `cases` = quantidade impressa original, `quantity` =
+        muitos itens) mas a descrição carrega "<N>X<size>" (ou a coluna de
+        pack, `pack_size`, traz "<N>/<size>"), aplica aqui do mesmo jeito: `cases` = quantidade impressa original, `quantity` =
         impressa x N. Não mexe quando `cases` já veio preenchido (regra 7 ou
         regra 8 já aplicadas pela Vision) nem quando não há esse padrão."""
-        if self.cases is not None or not self.description or self.quantity is None:
+        if self.cases is not None or self.quantity is None:
             return self
-        m = _PACK_SIZE_RE.search(self.description)
-        if not m:
-            return self
-        n = int(m.group(1))
+        if self.quantity % 1:
+            return self  # quantidade fracionada e peso, nao contagem de caixas
+        n = _n_do_pack(self.pack_size, self.description)
         if n <= 1:
             return self
         self.cases = self.quantity

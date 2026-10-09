@@ -64,6 +64,7 @@ class CategoriaFornecedor(StrEnum):
     PAPEL = "papel"
     HORTIFRUTI = "hortifruti"
     MERCEARIA = "mercearia"
+    INSUMO = "insumo"
     OUTROS = "outros"
 
     @property
@@ -77,6 +78,7 @@ _DESCRICAO: dict[CategoriaFornecedor, str] = {
     CategoriaFornecedor.PAPEL: "Descartáveis e material de limpeza — só ERP.",
     CategoriaFornecedor.HORTIFRUTI: "Hortifrúti e perecíveis — só ERP.",
     CategoriaFornecedor.MERCEARIA: "Mercearia seca e distribuição geral — só ERP.",
+    CategoriaFornecedor.INSUMO: "Insumo — a nota não é conciliada (não há pedido no Catapult).",
     CategoriaFornecedor.OUTROS: "Não classificado — só ERP, até alguém classificar.",
 }
 
