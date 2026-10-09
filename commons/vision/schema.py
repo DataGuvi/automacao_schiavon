@@ -52,6 +52,7 @@ def _n_do_pack(pack_size: str | None, description: str | None) -> int:
 # a data para ISO "de cabeca" e ja trocou dia/mes/ano em nota americana
 # (mes/dia/ano) — a nota saiu da janela da conciliacao e ficou presa.
 # A conversao sai da mao do modelo e e feita aqui (spec-data-invoice-mdy).
+_PREFIXO_INV_RE = re.compile(r"^INV[-_:\s]+(?=\S)", re.IGNORECASE)
 _DATA_IMPRESSA_RE = re.compile(r"^\s*(\d{1,4})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})\s*$")
 
 
@@ -237,6 +238,13 @@ class InvoiceData(BaseModel):
         0.0,
         description="Custo em USD da chamada à API (input + output tokens)",
     )
+
+    @model_validator(mode="after")
+    def _tirar_prefixo_inv(self) -> "InvoiceData":
+        """'INV-12345' -> '12345' (spec-invoice-number-prefixo)."""
+        if self.invoice_number:
+            self.invoice_number = _PREFIXO_INV_RE.sub("", self.invoice_number.strip())
+        return self
 
     @model_validator(mode="after")
     def _converter_datas_impressas(self) -> "InvoiceData":

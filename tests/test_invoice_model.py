@@ -151,3 +151,10 @@ def test_pack_com_quantidade_fracionada_e_peso_e_nao_multiplica():
     # spec-pack-size-coluna R7
     item = InvoiceItem(description="QUEIJO", pack_size="6/2LB", quantity=12.5, unit_price=5.0)
     assert item.quantity == 12.5 and item.cases is None
+
+
+def test_invoice_number_perde_prefixo_inv():
+    # spec-invoice-number-prefixo
+    for bruto, esperado in [("INV-12345", "12345"), ("inv 12345", "12345"), ("12345", "12345"),
+                            ("INV", "INV"), (None, None)]:
+        assert InvoiceData(reading_confidence=95, invoice_number=bruto).invoice_number == esperado, bruto
