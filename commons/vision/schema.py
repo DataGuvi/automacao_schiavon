@@ -53,7 +53,7 @@ def _n_do_pack(pack_size: str | None, description: str | None) -> int:
 # (mes/dia/ano) — a nota saiu da janela da conciliacao e ficou presa.
 # A conversao sai da mao do modelo e e feita aqui (spec-data-invoice-mdy).
 _PREFIXO_INV_RE = re.compile(r"^INV[-_:\s]+(?=\S)", re.IGNORECASE)
-_NUMERO_MR_GOURMET_RE = re.compile(r"^MG-\d{4}-(\d+)$", re.IGNORECASE)
+_NUMERO_MR_GOURMET_RE = re.compile(r"^MG-(\d{4}-\d+)$", re.IGNORECASE)
 _DATA_IMPRESSA_RE = re.compile(r"^\s*(\d{1,4})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})\s*$")
 
 
@@ -242,7 +242,7 @@ class InvoiceData(BaseModel):
 
     @model_validator(mode="after")
     def _tirar_prefixo_inv(self) -> "InvoiceData":
-        """'INV-12345' -> '12345'; 'MG-2026-067' -> '067' (spec-invoice-number-prefixo)."""
+        """'INV-12345' -> '12345'; 'MG-2026-067' -> '2026-067' (spec-invoice-number-prefixo)."""
         if self.invoice_number:
             numero = _PREFIXO_INV_RE.sub("", self.invoice_number.strip())
             self.invoice_number = _NUMERO_MR_GOURMET_RE.sub(lambda m: m.group(1), numero)
