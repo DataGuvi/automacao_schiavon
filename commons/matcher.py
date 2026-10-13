@@ -388,6 +388,9 @@ class ItemMatch(NamedTuple):
     ambiguous: bool = False        # empate no desempate -> conferencia humana
 
 
+_MIN_CHARS_CANDIDATO_SUPPLIER = 3
+
+
 def match_supplier(
     name: str | None,
     candidates: Sequence[str],
@@ -407,7 +410,13 @@ def match_supplier(
         return None, 0.0
     best, best_score = None, 0.0
     for candidate in candidates:
-        score = fuzz.token_set_ratio(target, norm_supplier(candidate))
+        norm_candidate = norm_supplier(candidate)
+        # Nome de 1-2 letras ('FL') e subconjunto de qualquer razao social longa
+        # ('FRESHPOINT CENTRAL FL') e pontuaria 100 em token_set_ratio.
+        # Nome curto so vale se for IGUAL ao da nota (o proprio fornecedor 'FL').
+        if len(norm_candidate) < _MIN_CHARS_CANDIDATO_SUPPLIER and norm_candidate != target:
+            continue
+        score = fuzz.token_set_ratio(target, norm_candidate)
         if score > best_score:
             best, best_score = candidate, score
     return (best, best_score) if best_score >= threshold else (None, best_score)
