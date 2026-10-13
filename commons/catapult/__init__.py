@@ -44,6 +44,7 @@ __all__ = [
     "CatapultLoginError", "handle_cloudflare_access", "login", "open_catapult_session",
     "open_worksheets", "search_purchase_orders_by_supplier", "open_purchase_order",
     "extrair_prefixo_nome_po", "fill_receiving_invoice_info", "scrape_po_items", "to_po_lines",
+    "atualizar_invoiced_total_cost",
     "fechar_browser", "parar_playwright",
 ]
 
@@ -764,6 +765,121 @@ def scrape_po_items(page, timeout: int = 20_000) -> list[dict]:
     _esperar_grade(page, timeout)
     _esperar_corpo_da_grade(page, timeout)
     return _extrair_grade_itens(page)
+
+
+# Indice da coluna "Invoiced Total Cost" no cabecalho (as colunas do corpo seguem
+# a mesma ordem; "Received" e "Ordered / Invoiced Difference" repetem nome, esta nao).
+_JS_COLUNA_INVOICED_TOTAL_COST = """
+(grid) => Array.from(grid.querySelectorAll('.smart-grid-header .sortable-column-spacing'))
+  .findIndex(w => w.textContent.trim() === 'Invoiced Total Cost')
+"""
+
+
+_SEL_CANCEL_BUTTON = "button.icon-action-button:has-text('Cancel')"
+
+
+def _localizar_linhas(grade: list[dict], ajustes: list[dict]) -> list[int] | None:
+    """Indice, na grade lida AGORA, da linha de cada ajuste; `None` se qualquer uma nao
+    for achada de forma unica. A linha e identificada por Supplier Unit ID + Scancode +
+    Receipt Alias + Item Name e pelo Invoiced Total Cost atual (== `valor_catapult`), nao
+    pela posicao da raspagem (`po_key`), que pode ter mudado. Duas linhas iguais em tudo
+    sao ambiguas: nada e editado."""
+    indices = []
+    for a in ajustes:
+        alvo = (a.get("supplier_unit_id") or None, a.get("scancode") or None,
+                a.get("receipt_alias") or None, a.get("item_name") or None)
+        achadas = [
+            i for i, linha in enumerate(grade)
+            if (linha.get("Supplier Unit ID") or None, linha.get("Scancode") or None,
+                linha.get("Receipt Alias") or None, linha.get("Item Name") or None) == alvo
+            and _parse_money(linha.get("Invoiced Total Cost")) == a["valor_catapult"]
+        ]
+        if len(achadas) != 1:
+            return None
+        indices.append(achadas[0])
+    return indices if len(set(indices)) == len(indices) else None
+
+
+def _esperar_rede(page, timeout: int) -> None:
+    """Espera a rede acalmar apos um clique. Nunca levanta: timeout so loga."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PwError:
+        log.warning("catapult: a pagina nao ficou ociosa em %s ms apos o clique", timeout)
+
+
+def _descartar_edicoes(page) -> None:
+    """Cancel do PO: descarta edicoes nao salvas da grade. Nunca levanta (limpeza).
+    Confirmado no Catapult real (2026-10-13): sem confirmacao, a grade recarrega com os
+    valores originais (Invoiced Total Cost e Unit Cost) e Save/Cancel voltam a desabilitar."""
+    try:
+        cancelar = page.locator(_SEL_CANCEL_BUTTON)
+        if not cancelar.is_disabled(timeout=3_000):
+            cancelar.click(timeout=3_000)
+            log.warning("catapult: edicao do Invoiced Total Cost descartada (Cancel)")
+    except PwError:
+        log.exception("catapult: nao foi possivel descartar a edicao (Cancel)")
+        return
+    # O Cancel recarrega a grade ("Loading"): espera antes de a sessao seguir.
+    _esperar_rede(page, 10_000)
+
+
+def atualizar_invoiced_total_cost(page, ajustes: list[dict], timeout: int = 20_000) -> int:
+    """Grava o `Invoiced Total Cost` ajustado na grade Items do PO aberto e clica Save.
+
+    `ajustes` = `resultado["ajustes_po"]`. As linhas sao achadas pela grade lida agora
+    (`_localizar_linhas`); linha nao achada de forma unica, celula desabilitada (PO
+    Committed) ou Save desabilitado = nada salvo, retorna 0. Cada celula e relida depois
+    do Tab e deve mostrar o valor gravado. Edicao que nao termina em Save (falha, releitura
+    diferente, Save desabilitado) e descartada pelo Cancel; falha do Playwright levanta
+    `IntegracaoException`. Retorna quantas celulas foram gravadas.
+    """
+    if not ajustes:
+        return 0
+    editou = salvou = False
+    try:
+        grade = page.locator(_SEL_ITEMS_GRID)
+        coluna = grade.evaluate(_JS_COLUNA_INVOICED_TOTAL_COST)
+        if coluna < 0:
+            raise IntegracaoException("coluna Invoiced Total Cost nao achada na grade Items")
+        indices = _localizar_linhas(_extrair_grade_itens(page), ajustes)
+        if indices is None:
+            log.warning("catapult: linha do PO nao achada de forma unica na grade, "
+                        "Invoiced Total Cost nao editado")
+            return 0
+        linhas = grade.locator("table.smart-grid-body tbody > tr")
+        campos = [linhas.nth(i).locator("td").nth(coluna).locator("input") for i in indices]
+        if any(c.is_disabled(timeout=timeout) for c in campos):
+            log.info("catapult: PO ja Committed - Invoiced Total Cost nao editavel, pulando")
+            return 0
+        for campo, a in zip(campos, ajustes):
+            log.info("catapult: Invoiced Total Cost %s -> %.2f (%s)",
+                     a["valor_catapult"], a["valor_invoice"], a.get("item_name"))
+            editou = True
+            campo.fill(f"{a['valor_invoice']:.2f}", timeout=timeout)
+            page.keyboard.press("Tab")
+            lido = _parse_money(campo.input_value(timeout=timeout))
+            if lido != a["valor_invoice"]:
+                raise IntegracaoException(
+                    f"celula do item {a.get('item_name')} mostra {lido} apos a edicao, "
+                    f"esperado {a['valor_invoice']}"
+                )
+        save_btn = page.locator(_SEL_SAVE_BUTTON)
+        if save_btn.is_disabled(timeout=timeout):
+            log.info("catapult: Invoiced Total Cost ja estava com este valor, nada para salvar")
+            return 0
+        save_btn.click(timeout=timeout)
+        salvou = True
+        _esperar_rede(page, timeout)
+        return len(ajustes)
+    except PwError as exc:
+        _debug_dump(page, "catapult_invoiced_total_cost")
+        raise IntegracaoException(
+            f"gravar Invoiced Total Cost do PO falhou: {exc}"
+        ) from exc
+    finally:
+        if editou and not salvou:
+            _descartar_edicoes(page)
 
 
 def _esperar_grade(page, timeout: int) -> None:

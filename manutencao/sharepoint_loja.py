@@ -68,7 +68,7 @@ def _usar_sessao(registro: dict, janela: bool, context, page) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--loja", type=int, default=2, help="id da loja (1 Windermere, 2 Dr. Phillips)")
+    parser.add_argument("--loja", type=int, default=1, help="id da loja (1 Windermere, 2 Dr. Phillips)")
     parser.add_argument("--janela", action="store_true", help="abre o navegador visivel e logado")
     args = parser.parse_args()
 

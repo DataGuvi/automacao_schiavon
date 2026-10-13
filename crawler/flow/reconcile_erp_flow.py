@@ -28,6 +28,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from commons.catapult import (
+    atualizar_invoiced_total_cost,
     extrair_prefixo_nome_po,
     fechar_browser,
     parar_playwright,
@@ -203,23 +204,6 @@ def _conciliar_loja(
     config: Config, sheet_id: str | None, totais: dict,
 ) -> None:
     """Abre UMA sessão do Catapult para a loja e concilia todas as notas dela.
-
-    Login ou tela Worksheets falhando são falha da SESSÃO — pula a loja
-    inteira nesta execução (as notas ficam pendentes, `fetch_invoice_headers_
-    for_reconciliation` devolve elas de novo no próximo run). Falha só numa
-    invoice específica (PO não abriu, busca não aplicou o filtro) não derruba
-    a sessão — ver `_conciliar_invoice`.
-
-    Roda headless por padrão, porque o pipeline roda sem ninguém olhando;
-    `ECRS_HEADLESS=false` no profile abre o navegador visível para depurar
-    seletor (era o valor fixo no código antes, o que travava a execução
-    agendada num host sem sessão gráfica).
-
-    Captura `IntegracaoException`, que é o que `commons/catapult` levanta em
-    QUALQUER falha técnica — `CatapultLoginError` inclusive, por herança.
-    Antes capturava `(CatapultLoginError, RuntimeError)`, e o
-    `playwright...TimeoutError`, que não é `RuntimeError`, escapava daqui e
-    derrubava o fluxo inteiro com as lojas seguintes sem conciliar.
     """
     ecrs = config.ecrs
     url = ecrs.url_da_loja(id_loja)
@@ -368,6 +352,17 @@ def _processar_invoice(
         items, po_lines, sinonimos=sinonimos,
         supplier_name=supplier_name, categoria_fornecedor=categoria_fornecedor,
     )
+    # Tolerancia de 1.00 (spec-catapult-editar-invoiced-cost): grava no PO o valor
+    # ajustado e salva. So com PO achado; falha vira IntegracaoException (ERRO_NAVEGACAO).
+    if po_lines and resultado["ajustes_po"]:
+        n = atualizar_invoiced_total_cost(page, resultado["ajustes_po"])
+        log.info("nota %s: %s Invoiced Total Cost ajustado(s) no Catapult", header.get("invoice_number"), n)
+        if not n:
+            # PO Committed / nada salvo: o Catapult nao mudou, compara com o valor original.
+            resultado = reconcile_items_against_po(
+                items, po_lines, sinonimos=sinonimos, supplier_name=supplier_name,
+                categoria_fornecedor=categoria_fornecedor, aplicar_ajustes=False,
+            )
     _gravar_resultado(conn, header, resultado, sheet_id, totais)
 
 

@@ -32,7 +32,7 @@ Testável sem Postgres — fixtures em memória, como `tests/test_matcher.py` e
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Sequence
 
 from commons.matcher import (
@@ -46,11 +46,15 @@ from commons.matcher import (
     match_items_po,
     mesmo_item_estado_diferente,
     norm_supplier,
+    norm_text,
     po_items_sem_invoice,
     qty_matches_po,
     qty_matches_po_cases,
 )
+from commons.logging_config import get_logger
 from domain.conciliacao_codes import IssueCode
+
+log = get_logger(__name__)
 
 NO_PO_FOR_ITEM = IssueCode.NO_PO_FOR_ITEM
 QTY_MISMATCH_PO = IssueCode.QTY_MISMATCH_PO
@@ -85,6 +89,74 @@ _TOLERANCIA_POR_FORNECEDOR: dict[str, tuple[Decimal, Decimal]] = {
     "JULINA": _TOLERANCIA_SUBCENTAVO,
     "FRESHPOINT": _TOLERANCIA_ZERO,
 }
+
+
+# --- Tolerancia de 1.00 no valor da linha (spec-tolerancia-preco-1) ----------
+#
+# Diferenca abaixo disso entre o valor do Catapult e o da invoice: o Invoiced
+# Total Cost e editado no Catapult para o valor da invoice (so a edicao usa isto).
+# Ficam sem edicao: os produtos abaixo e os fornecedores com tolerancia propria
+# (carne, `_TOLERANCIA_POR_FORNECEDOR`).
+_TOLERANCIA_VALOR = Decimal("1.00")
+
+# Chave = trecho do nome do fornecedor (`norm_supplier`); valor = produtos
+# isentos dele, normalizados por `norm_text`, casados por palavras inteiras.
+_ISENTOS_POR_FORNECEDOR: dict[str, tuple[str, ...]] = {
+    "PANEBRAS": (
+        "PAO", "PAES", "CREME DE LEITE", "LEITE CONDENSADO",
+        "BREAD", "BREADS", "HEAVY CREAM", "HEAVY WHIPPING CREAM", "CONDENSED MILK",
+    ),
+}
+
+# Frios: isento em qualquer fornecedor, por palavra da descricao do produto.
+_PALAVRAS_FRIOS: tuple[str, ...] = (
+    "PRESUNTO", "QUEIJO", "QUEIJOS", "SALAME", "PEITO DE PERU",
+    "MORTADELA", "SALSICHA", "SALSICHAS", "BACON",
+    "HAM", "MOZZARELLA", "CHEDDAR", "PARMESAN", "PROVOLONE", "GOUDA",
+    "SWISS CHEESE", "SLICED CHEESE", "SHREDDED CHEESE", "SALAMI", "TURKEY BREAST", "BOLOGNA",
+    "SAUSAGE", "SAUSAGES", "HOT DOG", "HOT DOGS",
+)
+
+
+def _descricao_tem(descricao: str | None, termos: tuple[str, ...]) -> bool:
+    """True se algum termo aparece na descricao como palavras inteiras
+    (caixa/acento/pontuacao ignorados): 'PAO' nao casa 'PAOLA'."""
+    texto = f" {norm_text(descricao)} "
+    return any(f" {norm_text(t)} " in texto for t in termos)
+
+
+def _grupo_isento(
+    grupo: list[dict], supplier_name: str | None, categoria_fornecedor: str | None,
+) -> bool:
+    """True quando o grupo nao tem o Invoiced Total Cost editado no Catapult (sem a
+    tolerancia de 1.00): fornecedor com tolerancia propria, produto isento do
+    fornecedor ou Frios. Basta UMA linha do grupo ser isenta."""
+    nome_norm = norm_supplier(supplier_name)
+    if categoria_fornecedor == "carne" or any(c in nome_norm for c in _TOLERANCIA_POR_FORNECEDOR):
+        return True
+    produtos = tuple(
+        p for chave, ps in _ISENTOS_POR_FORNECEDOR.items() if chave in nome_norm for p in ps
+    )
+    return any(
+        _descricao_tem(i.get("description"), _PALAVRAS_FRIOS + produtos) for i in grupo
+    )
+
+
+def _valor_a_gravar(
+    original: Decimal | None, valor_invoice: Decimal | None, descricao: str | None,
+) -> Decimal | None:
+    """Valor da invoice (2 casas, ROUND_HALF_UP) a gravar na celula Invoiced Total
+    Cost do Catapult, ou None quando nao se edita: diferenca de `_TOLERANCIA_VALOR`
+    ou mais, valor igual, ou Catapult zerado/vazio (linha ainda nao faturada).
+    A tolerancia so decide a EDICAO; a comparacao nao tem tolerancia propria."""
+    if original is None or valor_invoice is None or original == 0:
+        return None
+    if abs(original - valor_invoice) >= _TOLERANCIA_VALOR:
+        return None
+    novo = valor_invoice.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if novo == original:
+        return None
+    return novo
 
 
 def _resolver_tolerancia_preco(
@@ -268,8 +340,12 @@ def reconcile_items_against_po(
     sinonimos: dict | None = None,
     supplier_name: str | None = None,
     categoria_fornecedor: str | None = None,
+    aplicar_ajustes: bool = True,
 ) -> dict:
     """Concilia os itens de UMA invoice contra os itens do PO do Catapult.
+
+    `aplicar_ajustes=False`: nao ha ajuste de Invoiced Total Cost (a edicao no Catapult
+    nao aconteceu); compara com o valor original do PO.
 
     `items`: mesmo formato de
     `domain.service.conciliacao_service.fetch_invoice_items_by_headers()` —
@@ -299,7 +375,9 @@ def reconcile_items_against_po(
     divergiria sempre, por construção, mesmo quando a soma bate certinho.
 
     Retorna `{"items": [...], "issue_codes": [...], "has_issue": bool,
-    "needs_review": bool, "po_orphans": [...]}`. `items` está pronto pra
+    "needs_review": bool, "po_orphans": [...], "ajustes_po": [...]}`.
+    `ajustes_po`: celulas Invoiced Total Cost a gravar no Catapult
+    (spec-catapult-editar-invoiced-cost). `items` está pronto pra
     `conciliacao_service.save_reconciliation_items()` (mesmas chaves que
     `reconcile_one_invoice` produz para a cotação: `id_invoice_item`,
     `issue_codes`, `qty_invoice`, `price_invoice`, `price_diff`,
@@ -327,7 +405,10 @@ def reconcile_items_against_po(
             grupos.setdefault(po_key, []).append(item)
 
     veredito_por_po_key = {
-        po_key: _comparar_grupo(grupo, po_by_key[po_key], abs_tol, pct_tol, is_carne)
+        po_key: _comparar_grupo(
+            grupo, po_by_key[po_key], abs_tol, pct_tol, is_carne,
+            _grupo_isento(grupo, supplier_name, categoria_fornecedor) or not aplicar_ajustes,
+        )
         for po_key, grupo in grupos.items()
     }
 
@@ -386,14 +467,14 @@ def reconcile_items_against_po(
         row.update({
             "id_po_item": po.key,
             "item_name_po": po.item_name,
-            "price_other": po.invoiced_total_cost,
+            "price_other": veredito["total_po"],
             "price_diff": veredito["price_diff"],
             "price_diff_pct": veredito["price_diff_pct"],
             "qty_po": po.ordered,
             "qty_po_received": po.received,
             "qty_diff": veredito["qty_diff"],
             "total_invoice": veredito["total_invoice"],
-            "total_po": po.invoiced_total_cost,
+            "total_po": veredito["total_po"],
         })
 
         if not veredito["qty_ok"]:
@@ -418,6 +499,15 @@ def reconcile_items_against_po(
         "has_issue": any(r["has_issue"] for r in linhas) or sem_po_na_nota,
         "needs_review": any(r["needs_review"] for r in linhas),
         "po_orphans": po_items_sem_invoice(po_lines, matches),
+        "ajustes_po": [
+            {"po_key": po_key, "valor_catapult": po_by_key[po_key].invoiced_total_cost,
+             "valor_invoice": v["ajuste"],
+             "supplier_unit_id": po_by_key[po_key].supplier_unit_id,
+             "scancode": po_by_key[po_key].scancode,
+             "receipt_alias": po_by_key[po_key].receipt_alias,
+             "item_name": po_by_key[po_key].item_name}
+            for po_key, v in veredito_por_po_key.items() if v["ajuste"] is not None
+        ],
     }
 
 
@@ -491,7 +581,8 @@ def _po_unidade_individual(unit: str | None) -> bool | None:
 
 
 def _comparar_grupo(
-    grupo: list[dict], po: POLine, abs_tol: Decimal, pct_tol: Decimal, is_carne: bool = False,
+    grupo: list[dict], po: POLine, abs_tol: Decimal, pct_tol: Decimal, is_carne: bool,
+    isento: bool,
 ) -> dict:
     """Compara a SOMA de um grupo de linhas da invoice (todas casadas com o
     mesmo item do PO) contra `po.ordered`/`received`/`invoiced_total_cost`.
@@ -532,7 +623,11 @@ def _comparar_grupo(
         invoice_line_total(i.get("quantity"), i.get("unit_price"), i.get("total_price"))
         for i in grupo
     )
-    verdict = compare_price(valor_total, po.invoiced_total_cost, abs_tol=abs_tol, pct_tol=pct_tol)
+    # Celula a gravar no Catapult (spec-catapult-editar-invoiced-cost). Depois da edicao
+    # o Catapult passa a ter o valor da invoice, que e o que a comparacao enxerga.
+    ajuste = None if isento else _valor_a_gravar(po.invoiced_total_cost, valor_total, po.item_name)
+    total_po = po.invoiced_total_cost if ajuste is None else ajuste
+    verdict = compare_price(valor_total, total_po, abs_tol=abs_tol, pct_tol=pct_tol)
     if usar_caixa and cases_total is not None:
         qty_ok = qty_matches_po_cases(cases_total, po.ordered)
         qtd_comparada = cases_total
@@ -550,6 +645,8 @@ def _comparar_grupo(
         "price_diff_pct": verdict.diff_pct,
         "qty_diff": qty_diff,
         "total_invoice": valor_total,
+        "total_po": total_po,
+        "ajuste": ajuste,
         "usar_caixa": usar_caixa and cases_total is not None,
     }
 
