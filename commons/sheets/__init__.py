@@ -19,7 +19,7 @@ from googleapiclient.errors import HttpError
 
 from commons.paths import GOOGLE_SERVICE_ACCOUNT_PATH
 
-__all__ = ["read_values", "append_values", "SheetsError"]
+__all__ = ["read_values", "append_values", "update_values", "garantir_checkbox", "SheetsError"]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -40,23 +40,59 @@ def _service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-def read_values(spreadsheet_id: str, range_: str) -> list[list[str]]:
-    """Valores crus de um intervalo (`'De-Para!A:B'`), linha a linha.
+def read_values(
+    spreadsheet_id: str, range_: str, *, render: str = "FORMATTED_VALUE",
+) -> list[list]:
+    """Valores de um intervalo (`'De-Para!A:B'`), linha a linha.
 
     O Sheets omite células vazias no FIM da linha (uma linha só com a coluna A
     preenchida volta como `['foo']`, não `['foo', '']`) — quem consome isto
     precisa tratar linha curta, não assumir todas as colunas presentes.
+    `render='UNFORMATTED_VALUE'` devolve checkbox como bool, sem depender de locale.
     """
     try:
         resp = _service().spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=range_,
+            spreadsheetId=spreadsheet_id, range=range_, valueRenderOption=render,
         ).execute()
     except HttpError as exc:
         raise SheetsError(f"falha lendo '{range_}' de {spreadsheet_id}: {exc}") from exc
     return resp.get("values", [])
 
 
-def append_values(spreadsheet_id: str, range_: str, rows: list[list[str]]) -> None:
+def update_values(spreadsheet_id: str, range_: str, rows: list[list[str]]) -> None:
+    """Sobrescreve `range_` com `rows`. Uso pontual (cabecalho), nunca em dado do cliente."""
+    try:
+        _service().spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=range_,
+            valueInputOption="RAW", body={"values": rows},
+        ).execute()
+    except HttpError as exc:
+        raise SheetsError(f"falha atualizando '{range_}' de {spreadsheet_id}: {exc}") from exc
+
+
+def garantir_checkbox(spreadsheet_id: str, aba: str, coluna: int) -> None:
+    """Checkbox na coluna `coluna` (0 = A) da `aba`, da linha 2 em diante. Idempotente."""
+    try:
+        svc = _service().spreadsheets()
+        meta = svc.get(
+            spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)",
+        ).execute()
+        ids = [s["properties"]["sheetId"] for s in meta.get("sheets", [])
+               if s["properties"]["title"] == aba]
+        if not ids:
+            raise SheetsError(f"aba '{aba}' nao encontrada em {spreadsheet_id}")
+        svc.batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": [{
+            "setDataValidation": {
+                "range": {"sheetId": ids[0], "startRowIndex": 1,
+                          "startColumnIndex": coluna, "endColumnIndex": coluna + 1},
+                "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
+            },
+        }]}).execute()
+    except HttpError as exc:
+        raise SheetsError(f"falha criando checkbox em '{aba}' de {spreadsheet_id}: {exc}") from exc
+
+
+def append_values(spreadsheet_id: str, range_: str, rows: list[list[str | bool]]) -> None:
     """Acrescenta `rows` ao final da tabela em `range_`. Nunca sobrescreve."""
     if not rows:
         return

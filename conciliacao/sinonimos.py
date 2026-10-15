@@ -22,9 +22,10 @@ from __future__ import annotations
 
 from typing import Callable, NamedTuple, Sequence
 
-from commons.matcher import norm_text
+from commons.matcher import norm_item
 from commons.sheets import SheetsError, read_values
 from commons.logging_config import get_logger
+from conciliacao.pendentes_sinonimo import estado_pendentes
 
 log = get_logger(__name__)
 
@@ -37,8 +38,8 @@ class Sinonimo(NamedTuple):
     """Uma linha pronta para `dim_item_sinonimo`."""
 
     termo:      str          # como veio na planilha, limpo
-    termo_norm: str          # norm_text(termo): chave de busca, 1 token
-    canonico:   str          # norm_text(PARA): termo alvo, como a invoice escreve
+    termo_norm: str          # norm_item(termo): chave de busca (token ou frase inteira)
+    canonico:   str          # norm_item(PARA): termo alvo, como o Catapult escreve
 
 
 class Relatorio(NamedTuple):
@@ -49,6 +50,7 @@ class Relatorio(NamedTuple):
     invalidas:  int
     duplicadas: int
     descartes:  list[tuple[int, str]]   # (linha, motivo) — inválidas e duplicadas
+    retidas:    int = 0                 # DE de pendente ainda não marcada (rascunho)
 
 
 def _clean_cell(value) -> str:
@@ -78,8 +80,7 @@ def _sinonimos_de_linhas(linhas: Sequence[Sequence]) -> tuple[list[Sinonimo], Re
     Regras:
       * linha 1 = cabeçalho com `DE` e `PARA` (qualquer ordem);
       * linha totalmente vazia é ignorada em silêncio;
-      * só um lado preenchido, `DE` que normaliza para vazio, ou `termo_norm` com
-        mais de um token (nunca casaria no `.split()` de `norm_item`) → inválida;
+      * só um lado preenchido, ou `DE`/`PARA` que normaliza para vazio → inválida;
       * `termo_norm` repetido → a última linha vence.
 
     Fonte-agnóstico: recebe qualquer sequência de linhas já em memória (Sheets
@@ -109,8 +110,8 @@ def _sinonimos_de_linhas(linhas: Sequence[Sequence]) -> tuple[list[Sinonimo], Re
             descartes.append((n, "só um lado preenchido"))
             continue
 
-        termo_norm = norm_text(de_raw)
-        canonico = norm_text(para_raw)
+        termo_norm = norm_item(de_raw)
+        canonico = norm_item(para_raw)
         if not termo_norm:
             invalidas += 1
             descartes.append((n, f"DE sem conteúdo útil: {de_raw!r}"))
@@ -118,12 +119,6 @@ def _sinonimos_de_linhas(linhas: Sequence[Sequence]) -> tuple[list[Sinonimo], Re
         if not canonico:
             invalidas += 1
             descartes.append((n, f"PARA sem conteúdo útil: {para_raw!r}"))
-            continue
-        if " " in termo_norm:
-            invalidas += 1
-            descartes.append(
-                (n, f"DE com mais de um token nunca casaria: {termo_norm!r}")
-            )
             continue
 
         if termo_norm in por_termo:
@@ -151,17 +146,20 @@ def sincronizar(
     sheet_id: str | None,
     *,
     _leitor: Callable[[str], tuple[list[Sinonimo], Relatorio]] = sinonimos_do_sheet,
+    _estado: Callable[[str], tuple[set[str], set[str]]] = estado_pendentes,
     aplicar: bool = True,
 ) -> Relatorio | None:
-    """Lê a aba De-Para do Sheets e faz upsert dos sinônimos.
+    """Lê a aba De-Para do Sheets e faz upsert dos sinônimos liberados.
 
+    Liberado = DE sem pendente correspondente, ou de pendente com a coluna E
+    marcada; DE de pendente ainda aberta fica retido (rascunho do cliente).
     Retorna `None` quando não há planilha configurada (`sheet_id` ausente —
     feature desligada) ou quando a leitura falhou. Falha ao ler o Sheets (API
     fora do ar, credencial ausente, aba renomeada) é **pulada com aviso**,
     nunca propaga — o preâmbulo não pode derrubar o pipeline. Idempotente:
     rodar de novo com o mesmo conteúdo não muda nada.
 
-    `_leitor` é injetável só para teste. `aplicar=False` faz dry-run (não grava).
+    `_leitor`/`_estado` são injetáveis só para teste. `aplicar=False` faz dry-run.
     """
     from domain.service.conciliacao_service import (
         fetch_item_sinonimos,
@@ -174,12 +172,17 @@ def sincronizar(
 
     try:
         linhas, relatorio = _leitor(sheet_id)
+        marcados, abertos = _estado(sheet_id)
     except SheetsError as exc:
-        log.warning("planilha De-Para indisponivel (%s); pulando nesta execucao", exc)
+        log.warning("planilha De-Para/Pendentes indisponivel (%s); pulando nesta execucao", exc)
         return None
     except ValueError as exc:
         log.warning("planilha De-Para invalida (%s); pulando nesta execucao", exc)
         return None
+
+    retidas = {s.termo_norm for s in linhas if s.termo_norm in abertos and s.termo_norm not in marcados}
+    linhas = [s for s in linhas if s.termo_norm not in retidas]
+    relatorio = relatorio._replace(retidas=len(retidas))
 
     mudou = False
     if aplicar:
@@ -191,8 +194,8 @@ def sincronizar(
 
     verbo = "sincronizados" if aplicar else "lidos (dry-run)"
     log.info(
-        "%s sinonimo(s) %s (%s invalida(s), %s duplicada(s))",
-        len(linhas), verbo, relatorio.invalidas, relatorio.duplicadas,
+        "%s sinonimo(s) %s (%s invalida(s), %s duplicada(s), %s retida(s) na Pendentes)",
+        len(linhas), verbo, relatorio.invalidas, relatorio.duplicadas, relatorio.retidas,
     )
     for linha, motivo in relatorio.descartes:
         log.info("linha %s: %s", linha, motivo)

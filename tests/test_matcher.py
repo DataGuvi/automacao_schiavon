@@ -124,6 +124,34 @@ def test_norm_item_sem_de_para_nao_traduz_vocabulario():
     assert "CHICKEN" not in norm_item("CHKN HEARTS S/MTN FZN")
 
 
+def test_norm_item_traduz_a_frase_inteira_nos_dois_lados():
+    # DE = descricao da invoice, PARA = nome do Catapult; ambos viram o mesmo texto.
+    frase = {"FINI G OVO FRITO": "FINI FRIED EGGS"}
+    assert norm_item("Fini G Ovo Frito - FINI, Item #2914", frase) == "FINI FRIED EGGS"
+    assert norm_item("Fini Fried Eggs - 40622", frase) == "FINI FRIED EGGS"
+
+
+def test_norm_item_frase_traduzida_nao_encadeia_com_token():
+    mapa = {"CHIX TENDER": "CHICKEN TENDER", "CHICKEN": "FRANGO"}
+    assert norm_item("Chix Tender", mapa) == "CHICKEN TENDER"
+    assert norm_item("Chicken Wings", mapa) == "FRANGO WINGS"
+
+
+def test_norm_item_frase_vem_antes_do_token():
+    mapa = {"CHIX": "CHICKEN", "CHIX TENDER": "TENDER STRIPS"}
+    assert norm_item("Chix Tender", mapa) == "TENDER STRIPS"
+    assert norm_item("Chix Wings", mapa) == "CHICKEN WINGS"
+
+
+def test_frase_do_de_para_faz_a_invoice_casar_com_o_po_por_nome():
+    inv = [InvoiceCodeLine(1, "Fini G Ovo Frito", None, None)]
+    po = [POLine("p", None, None, "Fini Fried Eggs")]
+    antes = match_items_po(inv, po)
+    depois = match_items_po(inv, po, sinonimos={"FINI G OVO FRITO": "FINI FRIED EGGS"})
+    assert antes[0].match_level == "unmatched"
+    assert depois[0].match_level == "nome" and depois[0].match_score == 100.0
+
+
 def test_peito_ambiguo_fica_fora_do_de_para():
     """'Peito de Frango' e BREAST, 'Maca de Peito' e BRISKET.
 

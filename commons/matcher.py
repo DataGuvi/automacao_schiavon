@@ -151,8 +151,11 @@ def norm_item(value: str | None, sinonimos: Mapping[str, str] | None = None) -> 
     """
     de_para = sinonimos or {}
     texto = _CAUDA_INVOICE_RE.sub("", value or "")
-    texto = _CAUDA_COTACAO_RE.sub("", texto)
-    return " ".join(de_para.get(t, t) for t in norm_text(texto).split())
+    texto = norm_text(_CAUDA_COTACAO_RE.sub("", texto))
+    # Frase inteira antes do token, senao 'CHIX TENDER' vira 'CHICKEN TENDER' e nao casa.
+    if texto in de_para:
+        return de_para[texto]
+    return " ".join(de_para.get(t, t) for t in texto.split())
 
 
 def is_header_row(item_name: str | None) -> bool:

@@ -135,13 +135,19 @@ def test_linha_com_um_lado_so_e_invalida():
     assert all("um lado" in motivo for _, motivo in rel.descartes)
 
 
-def test_termo_multi_token_e_invalido():
-    # 'TRI TIP' tem espaco: nunca casaria no .split() de norm_item.
+def test_termo_multi_token_e_valido():
+    # DE pode ser a descricao inteira; norm_item traduz a frase toda.
     linhas = _linhas([("Tri Tip", "Maminha"), ("Chix", "Chicken")])
     rows, rel = _sinonimos_de_linhas(linhas)
-    assert [s.termo_norm for s in rows] == ["CHIX"]
-    assert rel.invalidas == 1
-    assert "mais de um token" in rel.descartes[0][1]
+    assert [s.termo_norm for s in rows] == ["TRI TIP", "CHIX"]
+    assert rel.invalidas == 0
+
+
+def test_cauda_de_catalogo_sai_do_de_e_do_para():
+    linhas = _linhas([("Fini G Ovo Frito - FINI, Item #2914", "Fini Fried Eggs - 40622")])
+    rows, _ = _sinonimos_de_linhas(linhas)
+    assert rows == [Sinonimo("Fini G Ovo Frito - FINI, Item #2914",
+                             "FINI G OVO FRITO", "FINI FRIED EGGS")]
 
 
 def test_duplicidade_no_arquivo_ultima_vence():
@@ -195,6 +201,10 @@ def test_upsert_vazio_nao_toca_o_banco():
 # Sincronizacao (preambulo do pipeline)
 # ---------------------------------------------------------------------------
 
+def _SEM_PENDENTES(_sheet_id):
+    return set(), set()
+
+
 def _leitor_fixo(linhas):
     """`_leitor` fake: ignora o sheet_id, devolve sempre as mesmas linhas."""
     def _ler(_sheet_id):
@@ -206,8 +216,8 @@ def test_sincronizar_grava_via_upsert_e_e_idempotente():
     leitor = _leitor_fixo(_linhas([("Chix", "Chicken"), ("Sassami", "Tender")]))
 
     fake = _FakeConn()
-    sincronizar(fake, _SHEET_ID, _leitor=leitor)
-    sincronizar(fake, _SHEET_ID, _leitor=leitor)
+    sincronizar(fake, _SHEET_ID, _leitor=leitor, _estado=_SEM_PENDENTES)
+    sincronizar(fake, _SHEET_ID, _leitor=leitor, _estado=_SEM_PENDENTES)
 
     assert len(fake.execs) == 2
     assert fake.execs[0][1] == fake.execs[1][1]          # mesmo payload nas duas
@@ -227,15 +237,43 @@ def test_sincronizar_so_reprocessa_quando_vocabulario_muda():
 
         # Banco já com o mesmo de-para: nada mudou -> não remarca.
         ja_igual = {"CHIX": "CHICKEN", "SASSAMI": "TENDER"}
-        sincronizar(_FakeConn(sinonimos_no_banco=ja_igual), _SHEET_ID, _leitor=leitor)
+        sincronizar(_FakeConn(sinonimos_no_banco=ja_igual), _SHEET_ID, _leitor=leitor, _estado=_SEM_PENDENTES)
         assert chamadas == []
 
         # Banco com destino diferente para SASSAMI: mudou -> remarca uma vez.
         difere = {"CHIX": "CHICKEN", "SASSAMI": "STRIP"}
-        sincronizar(_FakeConn(sinonimos_no_banco=difere), _SHEET_ID, _leitor=leitor)
+        sincronizar(_FakeConn(sinonimos_no_banco=difere), _SHEET_ID, _leitor=leitor, _estado=_SEM_PENDENTES)
         assert chamadas == [1]
     finally:
         cdb.marcar_reprocesso_por_vocabulario = original
+
+
+def test_sincronizar_retem_de_pendente_aberta_e_libera_a_marcada():
+    leitor = _leitor_fixo(_linhas([("Chix", "Chicken"), ("Sassami", "Tender"), ("Boi", "Beef")]))
+    # CHIX: pendente marcada (libera); SASSAMI: pendente aberta (retido); BOI: sem pendente (entra).
+    estado = lambda _id: ({"CHIX"}, {"SASSAMI"})  # noqa: E731
+    fake = _FakeConn()
+    rel = sincronizar(fake, _SHEET_ID, _leitor=leitor, _estado=estado)
+    assert sorted(fake.execs[0][1]) == [("Boi", "BOI", "BEEF"), ("Chix", "CHIX", "CHICKEN")]
+    assert rel.retidas == 1
+
+
+def test_sincronizar_item_com_varias_pendentes_basta_uma_marcada():
+    leitor = _leitor_fixo(_linhas([("Chix", "Chicken")]))
+    fake = _FakeConn()
+    rel = sincronizar(fake, _SHEET_ID, _leitor=leitor, _estado=lambda _id: ({"CHIX"}, {"CHIX"}))
+    assert fake.execs[0][1] == [("Chix", "CHIX", "CHICKEN")]
+    assert rel.retidas == 0
+
+
+def test_sincronizar_pula_quando_pendentes_indisponivel():
+    def _sem_pendentes(_sheet_id):
+        raise SheetsError("aba Pendentes renomeada")
+
+    fake = _FakeConn()
+    leitor = _leitor_fixo(_linhas([("Chix", "Chicken")]))
+    assert sincronizar(fake, _SHEET_ID, _leitor=leitor, _estado=_sem_pendentes) is None
+    assert fake.execs == []          # rascunho nao vaza
 
 
 def test_sincronizar_pula_quando_sheets_indisponivel():
@@ -243,7 +281,7 @@ def test_sincronizar_pula_quando_sheets_indisponivel():
         raise SheetsError("credencial ausente")
 
     fake = _FakeConn()
-    rel = sincronizar(fake, _SHEET_ID, _leitor=_indisponivel)
+    rel = sincronizar(fake, _SHEET_ID, _leitor=_indisponivel, _estado=_SEM_PENDENTES)
     assert rel is None
     assert fake.execs == []          # nada gravado, pipeline segue
 
@@ -253,7 +291,7 @@ def test_sincronizar_pula_quando_aba_invalida():
         return _sinonimos_de_linhas(_linhas([("Chix", "Chicken")], header=("DE", "OUTRA")))
 
     fake = _FakeConn()
-    rel = sincronizar(fake, _SHEET_ID, _leitor=_sem_coluna)
+    rel = sincronizar(fake, _SHEET_ID, _leitor=_sem_coluna, _estado=_SEM_PENDENTES)
     assert rel is None
     assert fake.execs == []
 
@@ -268,7 +306,7 @@ def test_sincronizar_sem_sheet_id_retorna_none():
 def test_sincronizar_dry_run_nao_grava():
     leitor = _leitor_fixo(_linhas([("Chix", "Chicken")]))
     fake = _FakeConn()
-    rel = sincronizar(fake, _SHEET_ID, _leitor=leitor, aplicar=False)
+    rel = sincronizar(fake, _SHEET_ID, _leitor=leitor, _estado=_SEM_PENDENTES, aplicar=False)
     assert rel is not None
     assert fake.execs == []
 

@@ -56,6 +56,7 @@ def _rodar(monkeypatch, banco, achou_po):
     monkeypatch.setattr(flow, "_buscar_po", lambda *a, **k: [po] if achou_po else None)
     monkeypatch.setattr(flow.proc, "aguardar_po_ordered", banco.aguardar)
     monkeypatch.setattr(flow, "_gravar_resultado", lambda *a, **k: gravou.append(a))
+    monkeypatch.setattr(flow, "ja_conciliada_erp", lambda *a, **k: False)
     totais = {"aguardando_po": 0, "sem_po": 0}
     header = {"id": 1, "id_processo": 9, "invoice_number": "N1", "supplier_name": "Acme"}
     items = [_item(1, "Chicken Breast", "20", "2.5", "50", item_code="X1")]

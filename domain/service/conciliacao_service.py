@@ -382,6 +382,75 @@ def ja_conciliada_erp(conn, id_invoice: int) -> bool:
     return bool(rows)
 
 
+def marcar_itens_po_fechado(conn, id_invoice: int) -> tuple[int, bool]:
+    """PO fechado a mão no Catapult: os itens `no_po_for_item` da nota viram identificados.
+
+    Troca o código por `PO_FECHADO_MANUAL`, regrava o veredito do item e do
+    cabeçalho pelos códigos restantes (spec-po-fechado-manual R3). Só vale se
+    algum item da nota já casou com o PO antes (R2). Devolve
+    `(itens trocados, sobrou_alerta)`; `(0, False)` se não havia o que trocar.
+    """
+    itens = _ler(
+        conn,
+        f"""
+        SELECT fci.id, fci.issue_codes, fci.revisar, fci.match_nivel
+          FROM {SCHEMA}.fat_conciliacao_item fci
+          JOIN {SCHEMA}.fat_conciliacao fc ON fc.id = fci.id_conciliacao
+         WHERE fc.id_invoice = %s AND fc.comparacao = 'erp'
+        """,
+        (id_invoice,), "itens da conciliacao ERP",
+    )
+    cabecalho = _ler(
+        conn,
+        f"SELECT id, issue_codes FROM {SCHEMA}.fat_conciliacao WHERE id_invoice = %s AND comparacao = 'erp'",
+        (id_invoice,), "cabecalho da conciliacao ERP",
+    )
+    sem_po, fechado = IssueCode.NO_PO_FOR_ITEM, IssueCode.PO_FECHADO_MANUAL
+
+    def trocar(codigos):
+        return [c for c in (codigos or []) if c != sem_po] + [fechado]
+
+    alvo = [i for i in itens if sem_po in (i["issue_codes"] or [])]
+    # Prova de que o PO existiu: algum item da nota ja casou com ele (spec R2).
+    achou_po_antes = any(i["match_nivel"] in ("codigo", "nome") for i in itens)
+    if not alvo or not cabecalho or not achou_po_antes:
+        return 0, False
+
+    novos = {i["id"]: trocar(i["issue_codes"]) for i in alvo}
+    restantes = [(novos.get(i["id"], i["issue_codes"]), i["revisar"]) for i in itens]
+    sobrou_alerta = any(_status_conciliacao(c) != Veredito.CONFERIDO or _revisar(c, r)
+                        for c, r in restantes)
+    cab_codes = trocar(cabecalho[0]["issue_codes"])
+    veredito_cab = _status_conciliacao(cab_codes)
+    try:
+        with conn.cursor() as cur:
+            for id_item, codigos in novos.items():
+                v = _status_conciliacao(codigos)
+                cur.execute(
+                    f"""
+                    UPDATE {SCHEMA}.fat_conciliacao_item
+                       SET issue_codes = %s, cod_status = %s, status_conc = %s
+                     WHERE id = %s
+                    """,
+                    (codigos, int(v), v.name, id_item),
+                )
+            cur.execute(
+                f"""
+                UPDATE {SCHEMA}.fat_conciliacao
+                   SET issue_codes = %s, cod_status = %s, status_conc = %s
+                 WHERE id = %s
+                """,
+                (cab_codes, int(veredito_cab), veredito_cab.name, cabecalho[0]["id"]),
+            )
+        conn.commit()
+    except psycopg2.Error as exc:
+        reverter(conn)
+        raise DataAccessException(
+            f"falha ao marcar PO fechado a mao da invoice id={id_invoice}"
+        ) from exc
+    return len(novos), sobrou_alerta
+
+
 def fetch_invoice_headers_reprocesso(conn) -> list[dict]:
     """Notas marcadas para reconciliar de novo (processo.cod_status = 56).
 

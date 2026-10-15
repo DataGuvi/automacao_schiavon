@@ -141,11 +141,24 @@ flowchart TD
 - Falhas viram **um** e-mail consolidado por execução, com traceback, para
   `ALERTA_EMAIL` (default `dataguvi@gmail.com`).
 
+**De-Para e Pendentes (Google Sheets)**
+- Item da invoice sem par no Catapult/cotação vira linha na aba `Pendentes`
+  (fornecedor, item, origem, data) com o checkbox da coluna E "Já resolvi?".
+- O cliente escreve na aba `De-Para`: **DE** = descrição completa da invoice,
+  **PARA** = nome completo do Catapult; depois marca a E. A marcação libera o
+  sinônimo: DE de pendente ainda aberta fica retido e não entra no banco; DE sem
+  pendente correspondente entra sempre. Item já listado não é reanexado.
+- DE e PARA podem ter várias palavras; a frase inteira é traduzida antes do token.
+- `python -m manutencao.preparar_pendentes --aplicar` refaz o checkbox da coluna E.
+
 **Falhas e reprocesso**
 - Falha esperada de negócio (`BusinessException`) não derruba o monitoramento;
   falha técnica sim. Status nunca é escolhido à mão: sai de `domain/enums.py`.
 - Sinônimo ou alias novo que pode destravar notas já finalizadas as devolve à
   fila (limite de 200 por vez, acima disso exige rodada manual).
+- Nota já conciliada cujo PO não aparece mais no Catapult após 3 execuções (PO
+  fechado à mão): os itens sem PO viram identificados (`po_fechado_manual`) e a
+  nota é finalizada, sem relatório nem e-mail.
 - Monitor: abre alerta para sistema crítico com acesso falho ou fluxo parado há
   mais de 12 h; não repete e resolve sozinho quando a causa some.
 

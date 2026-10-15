@@ -77,6 +77,7 @@ from domain.service.conciliacao_service import (
     fetch_item_sinonimos,
     fetch_supplier_aliases,
     ja_conciliada_erp,
+    marcar_itens_po_fechado,
     save_reconciliation_header,
     save_reconciliation_items,
 )
@@ -135,7 +136,8 @@ def reconcile_erp_flow(
         totais = {
             "headers_total": 0, "headers_issue": 0,
             "items_total": 0, "items_issue": 0,
-            "sem_po": 0, "aguardando_po": 0, "lojas_puladas": 0, "puladas_insumo": 0,
+            "sem_po": 0, "aguardando_po": 0, "po_fechado_manual": 0,
+            "lojas_puladas": 0, "puladas_insumo": 0,
             "relatorios_gerados": 0, "relatorios_erro": 0, "notas_erro": 0,
             "sucessos_gerados": 0, "sucessos_erro": 0,
             "relatorios_cliente": [],
@@ -161,6 +163,7 @@ def reconcile_erp_flow(
         log.info("com pendencia : %s", totais['items_issue'])
         log.info("Sem PO no Catapult : %s", totais['sem_po'])
         log.info("Aguardando PO Ordered : %s", totais['aguardando_po'])
+        log.info("PO fechado a mao : %s", totais['po_fechado_manual'])
         log.info("Nao enviadas (insumo) : %s", totais['puladas_insumo'])
         log.info(
             "Relatorios divergencia : %s (%s falha(s))",
@@ -344,6 +347,11 @@ def _processar_invoice(
         totais["aguardando_po"] += 1
         return
 
+    if po_lines is None and ja_conciliada_erp(conn, header["id"]) and _finalizar_po_fechado_manual(
+        conn, header, totais,
+    ):
+        return
+
     if not po_lines:
         po_lines = []
         totais["sem_po"] += 1
@@ -364,6 +372,20 @@ def _processar_invoice(
                 categoria_fornecedor=categoria_fornecedor, aplicar_ajustes=False,
             )
     _gravar_resultado(conn, header, resultado, sheet_id, totais)
+
+
+def _finalizar_po_fechado_manual(conn, header: dict, totais: dict) -> bool:
+    """Nota ja conciliada cujo PO nao aparece mais (fechado a mao): identifica os
+    itens `no_po_for_item` e fecha o caso, sem .docx nem e-mail (spec-po-fechado-manual).
+    `False` quando nao havia item a identificar: segue o fluxo de "sem PO"."""
+    trocados, com_alerta = marcar_itens_po_fechado(conn, header["id"])
+    if not trocados:
+        return False
+    proc.concluir_etapa(conn, header["id_processo"], Etapa.CONCILIAR_ERP, com_alerta=com_alerta)
+    totais["po_fechado_manual"] += 1
+    log.info("nota %s: PO ja fechado a mao, %s item(ns) identificado(s)",
+             header.get("invoice_number"), trocados)
+    return True
 
 
 def _categoria_do_fornecedor(
