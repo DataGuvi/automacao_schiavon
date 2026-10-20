@@ -41,13 +41,37 @@ Pay special attention to:
    - Handwriting clearly next to/below ONE specific line — quantity/price
      corrections, return notes, approval stamps, checkmarks with initials.
      Capture as free text in `handwritten_notes` of that item.
-   - Handwriting NOT tied to any specific line — written in a margin, in the
-     blank space below the item table, or anywhere else on the page as a
-     note about the invoice as a whole (e.g. a word or short phrase noting
-     what the order is for). Capture the exact text, verbatim, in the
-     invoice-level `general_handwritten_notes` field — don't drop it just
-     because it has no single item to attach to, and don't paraphrase it
-     into `reading_notes` instead.
+     The word INSUMO written beside a line, or a brace/bracket with INSUMO
+     covering several lines, goes in `handwritten_notes` of EACH covered line
+     (copy it on all N lines). A brace/bracket "}" drawn in the right margin
+     covers EVERY item from the line where it starts (top tip) to the line where
+     it ends (bottom tip), even though the word is written only once, usually
+     at the middle of the brace: set "Insumo" on the first, the last and ALL
+     lines in between (ignore "Substitution" sub-rows, they are not items). A
+     page can have several braces; a brace can continue on the next page, and
+     the word may be repeated beside lines there. Work out the first and last
+     covered line from the brace tips, not from where the word sits. A lone diagonal slash or tick without the word
+     is NOT insumo: leave that line's `handwritten_notes` null.
+   - Handwriting NOT tied to any specific line, written in a margin, below the
+     item table, next to the signature or anywhere else on the page.
+     * (INSUMO tied to specific lines is NOT this case: see above.)
+     * Decide in THIS order, for handwritten WORD text near the signature, in a
+       margin or next to the Open Invoices list:
+       1. You can read the word INSUMO, even split or with a destination ("Insumo",
+          "IN SUMO", "Insumo Burger", "Insumo Confeitaria"): copy the text exactly
+          as read into `general_handwritten_notes`, with NO prefix and NO flag.
+       2. You cannot read INSUMO, but the handwriting looks like a near-miss of it,
+          or it is a word that is not a person's name (e.g. "INS BURGER",
+          "INV BURDER", "INSUM", "IN5UMO"): write
+          `INSUMO_INCERTO: <exactly what you see>` in `general_handwritten_notes`.
+          Do NOT leave it out because it is "not clearly INSUMO": doubt is reported.
+       3. Only a signature scribble, initials, numbers or a stamp: leave
+          `general_handwritten_notes` null.
+       The note may be one word ("Insumo") or two ("Insumo Burger"). NEVER guess,
+       complete or correct the word. Use the INSUMO_INCERTO flag ONLY in case 2;
+       a clearly readable INSUMO / IN SUMO is case 1 and never gets the flag.
+     * Anything else (signature, initials, "DONE", stamps, comments) does NOT go
+       in `general_handwritten_notes`: describe it briefly in `reading_notes`.
 
 2. DATES — ISO 8601 format: YYYY-MM-DD in `invoice_date` / `due_date`.
    These are US invoices: a printed date like "10/05/26" or "10/05/2026" is
@@ -245,6 +269,22 @@ def _media_type(suffix: str) -> tuple[str, str]:
     return result
 
 
+# Modelos que aceitam `thinking: disabled`; os mais novos (5.x) exigem thinking adaptativo.
+_MODELOS_SEM_THINKING = {"claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"}
+
+
+def _config_modelo(model: str) -> dict:
+    """`max_tokens` e thinking da chamada. Modelo novo pensa (adaptativo, esforco medio;
+    o pensamento conta nos tokens, entao o teto sobe) e a resposta vem apos o bloco de thinking."""
+    if model in _MODELOS_SEM_THINKING:
+        return {"max_tokens": 8192, "thinking": {"type": "disabled"}}
+    return {
+        "max_tokens": 16000,
+        "thinking": {"type": "adaptive", "display": "omitted"},
+        "output_config": {"effort": "medium"},
+    }
+
+
 def read_invoice(file_path: Path, api_key: str, model: str = "claude-sonnet-4-6") -> InvoiceData:
     """
     Lê um arquivo de invoice (PDF ou imagem) e retorna os dados estruturados
@@ -273,8 +313,7 @@ def read_invoice(file_path: Path, api_key: str, model: str = "claude-sonnet-4-6"
 
     response = client.messages.create(
         model=model,
-        max_tokens=8192,
-        thinking={"type": "disabled"},
+        **_config_modelo(model),
         messages=[
             {
                 "role": "user",
@@ -293,7 +332,7 @@ def read_invoice(file_path: Path, api_key: str, model: str = "claude-sonnet-4-6"
             response.usage.output_tokens,
         )
 
-    raw = response.content[0].text
+    raw = next((b.text for b in response.content if b.type == "text"), "")
 
     # Extrai o JSON da resposta (remove eventual texto ao redor)
     match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -423,8 +462,7 @@ def submit_batch(
             custom_id=custom_id,
             params=MessageCreateParamsNonStreaming(
                 model=model,
-                max_tokens=8192,
-                thinking={"type": "disabled"},
+                **_config_modelo(model),
                 messages=[{
                     "role": "user",
                     "content": [

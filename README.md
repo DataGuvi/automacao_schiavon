@@ -126,7 +126,7 @@ flowchart TD
   Cost), dentro de tolerância. Linhas da invoice que caem no mesmo item do PO
   são somadas.
 - Pack impresso em coluna própria ("12/12 oz", "6/2LB"): a Vision multiplica a quantidade pelo N e guarda a impressa em `cases`; a unidade do size não é convertida, a quantidade compara por contagem com o `Ordered` do PO.
-- Insumo e carne por fornecedor: `dim_fornecedor.categoria = 'insumo'` pula a nota (sem relatório); `'carne'` liga a regra de carne. Nota com "insumo" lido pela Vision classifica o fornecedor sozinha (só se ainda sem categoria). Classificar os conhecidos: `python -m manutencao.classificar_fornecedores` (simula) e `--aplicar` (grava).
+- Insumo e carne por fornecedor: `dim_fornecedor.categoria = 'insumo'` pula a nota (sem relatório); `'carne'` liga a regra de carne. Nota com "insumo" lido pela Vision pula só aquela nota (não classifica o fornecedor); `insumo` fixo só para All Florida Paper, Restaurant Depot e Sysco, os demais ficam `outros`. Classificar os conhecidos: `python -m manutencao.classificar_fornecedores` (simula) e `--aplicar` (grava).
 - Busca da PO: primeiro por `Invoice Reference` (Equals) com o número da nota; sem resultado, por nome do fornecedor (com fuzzy matching).
 - Sem PO `Ordered`: a nota fica no status 13 (`PO_NAO_ENCONTRADA`) e é pesquisada de novo nas próximas execuções, até 3 vezes; esgotado, fecha com o relatório "nenhum PO Ordered".
 

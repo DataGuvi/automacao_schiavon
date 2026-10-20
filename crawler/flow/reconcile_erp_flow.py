@@ -7,7 +7,8 @@ há mais de um, e compara item a item — quantidade (Ordered/Received) e valor
 Grava em `fat_conciliacao` / `fat_conciliacao_item` com `comparacao='erp'`.
 
 Nota com anotação à mão de "insumo" não é levada ao Catapult — ver
-`conciliacao/reconcile_erp.py::tem_anotacao_insumo`.
+`conciliacao/reconcile_erp.py::classificar_anotacao_insumo`. Na dúvida se é insumo
+a nota trava para revisão (`REVISAR_INSUMO`), nunca se chuta a palavra.
 
 Vale para TODA invoice, carne ou não: é a única comparação que sempre existe
 (ver `domain/categorias.py`). Substitui, como FLUXO 4, a antiga conciliação
@@ -53,18 +54,24 @@ from conciliacao.reconcile_erp import (
     SKIPPED_INSUMO_ANNOTATION,
     escolher_po_por_itens,
     reconcile_items_against_po,
-    tem_anotacao_insumo,
 )
 from conciliacao.relatorio_divergencia import NOME_LOJA, gerar_relatorio_divergencia_erp
 from conciliacao.relatorio_sucesso import gerar_relatorio_sucesso_erp
 from domain.service import notificacao_service
+from domain.service.insumo_service import (
+    INSUMO_INCERTO,
+    INSUMO_NAO,
+    INSUMO_SIM,
+    classificar_anotacao_insumo,
+    separar_itens_insumo,
+)
 from domain.categorias import CategoriaFornecedor
 from domain.config import Config
+from domain.conciliacao_codes import IssueCode
 from domain.enums import Etapa, StatusExecucao as Status
 from domain.service import processo_service as proc
 from domain.service import sistema_service
 from domain.service.conciliacao_service import (
-    classificar_fornecedor,
     confirmar_fornecedor_para_aprender,
     escolher_nome_catapult,
     fetch_fornecedores,
@@ -137,7 +144,7 @@ def reconcile_erp_flow(
             "headers_total": 0, "headers_issue": 0,
             "items_total": 0, "items_issue": 0,
             "sem_po": 0, "aguardando_po": 0, "po_fechado_manual": 0,
-            "lojas_puladas": 0, "puladas_insumo": 0,
+            "lojas_puladas": 0, "puladas_insumo": 0, "insumo_incerto": 0,
             "relatorios_gerados": 0, "relatorios_erro": 0, "notas_erro": 0,
             "sucessos_gerados": 0, "sucessos_erro": 0,
             "relatorios_cliente": [],
@@ -165,6 +172,7 @@ def reconcile_erp_flow(
         log.info("Aguardando PO Ordered : %s", totais['aguardando_po'])
         log.info("PO fechado a mao : %s", totais['po_fechado_manual'])
         log.info("Nao enviadas (insumo) : %s", totais['puladas_insumo'])
+        log.info("Insumo incerto (revisar) : %s", totais['insumo_incerto'])
         log.info(
             "Relatorios divergencia : %s (%s falha(s))",
             totais['relatorios_gerados'], totais['relatorios_erro'],
@@ -329,10 +337,22 @@ def _processar_invoice(
         _gravar_skip_insumo(conn, header, totais)
         return
 
-    if tem_anotacao_insumo(items, header.get("general_handwritten_notes")):
-        _aprender_insumo(conn, fornecedor, supplier_name, aliases_invoice)
+    anotacao = classificar_anotacao_insumo(header.get("general_handwritten_notes"))
+    items, insumo = separar_itens_insumo(items)
+    if not items:
+        # Todas as linhas sao insumo: vence mesmo o geral incerto (spec-insumo-por-linha R6).
         _gravar_skip_insumo(conn, header, totais)
         return
+    if anotacao == INSUMO_INCERTO:
+        _gravar_insumo_incerto(conn, header, totais)
+        return
+    if anotacao == INSUMO_SIM:
+        _gravar_skip_insumo(conn, header, totais)
+        return
+    if anotacao == INSUMO_NAO and header.get("general_handwritten_notes"):
+        log.info("nota %s: anotacao geral ignorada (%s)", header.get("invoice_number"), header["general_handwritten_notes"])
+    if insumo:
+        log.info("nota %s: %s linha(s) de insumo fora da conciliacao", header.get("invoice_number"), len(insumo))
 
     po_lines = _buscar_po(page, url, header, items, sinonimos, resolver_fornecedor, conn=conn)
 
@@ -403,26 +423,6 @@ def _categoria_do_fornecedor(
     ):
         return None
     return categoria
-
-
-def _aprender_insumo(
-    conn, fornecedor: dict | None, supplier_name: str | None, aliases_invoice: dict[str, dict],
-) -> None:
-    """A Vision viu 'insumo' na nota: grava `categoria='insumo'` no fornecedor, so se
-    foi resolvido com confianca e ainda nao tem categoria (R3). Nunca levanta."""
-    if conn is None or fornecedor is None:
-        return
-    por_alias = norm_supplier(supplier_name) in aliases_invoice
-    if not (por_alias or confirmar_fornecedor_para_aprender(supplier_name or "", fornecedor)):
-        return
-    try:
-        if classificar_fornecedor(
-            conn, fornecedor["id"], CategoriaFornecedor.INSUMO, somente_sem_categoria=True,
-        ):
-            fornecedor["categoria"] = CategoriaFornecedor.INSUMO
-            log.info("fornecedor %s: categoria=insumo (nota com anotacao de insumo)", fornecedor["id"])
-    except DataAccessException:
-        log.exception("fornecedor %s: falha gravando categoria insumo", fornecedor.get("id"))
 
 
 def _aprender_nome_catapult(
@@ -574,7 +574,7 @@ def _abrir_po_escolhido(
 
 def _gravar_skip_insumo(conn, header: dict, totais: dict) -> None:
     """Grava a nota como 'pulada' — anotação à mão de insumo, não vai para o
-    Catapult (ver `tem_anotacao_insumo`). Sem itens comparados (não houve
+    Catapult (ver `classificar_anotacao_insumo`). Sem itens comparados (não houve
     busca de PO nenhuma), `has_issue`/`needs_review` False — é uma exclusão
     intencional, não uma divergência a revisar."""
     header_row = {
@@ -592,6 +592,33 @@ def _gravar_skip_insumo(conn, header: dict, totais: dict) -> None:
     totais["headers_total"] += 1
     totais["puladas_insumo"] += 1
     log.info("nota %s: anotacao de insumo - nao enviada ao Catapult", header.get('invoice_number'))
+
+
+def _gravar_insumo_incerto(conn, header: dict, totais: dict) -> None:
+    """Anotação à mão que pode ser insumo, sem certeza: a nota não vai ao Catapult nem
+    é pulada como insumo — trava em `REVISAR_INSUMO` até a pessoa corrigir a anotação
+    (spec-anotacao-insumo R5/R6). Não aprende categoria. O header vai antes do status: se o
+    status falhar, a nota segue pendente e a retentativa regrava o header (upsert)."""
+    header_row = {
+        "id_invoice_header": header["id"],
+        "id_loja": header["id_loja"],
+        "id_processo": header["id_processo"],
+        "comparacao": "erp",
+        "issue_codes": [IssueCode.INSUMO_INCERTO],
+        "has_issue": True,
+        "needs_review": True,
+    }
+    save_reconciliation_header(conn, header_row)
+    proc.falhar_etapa(
+        conn, header["id_processo"], Etapa.CONCILIAR_ERP, Status.REVISAR_INSUMO,
+        "Anotacao manual pode ser insumo, sem certeza: %s" % (header.get("general_handwritten_notes") or "-"),
+    )
+    totais["headers_total"] += 1
+    totais["headers_issue"] += 1
+    totais["insumo_incerto"] += 1
+    log.warning(
+        "nota %s: anotacao de insumo incerta - travada para revisao", header.get("invoice_number"),
+    )
 
 
 def _gravar_resultado(

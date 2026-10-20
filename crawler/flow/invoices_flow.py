@@ -78,6 +78,7 @@ def _coletar(config: Config) -> None:
     password = config.sharepoint.senha
     api_key = config.vision.api_key
     ai_model = config.vision.modelo
+    modelo_forte = config.vision.modelo_forte
     today = date.today()
     # Semana anterior + atual em toda execucao: o cliente pode incluir nota na
     # pasta da semana anterior dias depois. Arquivo ja baixado e pulado pelo
@@ -160,10 +161,12 @@ def _coletar(config: Config) -> None:
         if api_key:
             if MODO_SINCRONO:
                 log.info("Modo: sincrono (MODO_SINCRONO = True)")
-                process_invoices_sync(conn, api_key, all_output, ai_model, DOWNLOAD_DIR, READ_DIR)
+                process_invoices_sync(
+                    conn, api_key, all_output, ai_model, DOWNLOAD_DIR, READ_DIR, modelo_forte)
             else:
                 log.info("Modo: Batch API (MODO_SINCRONO = False)")
-                process_invoices_batch(conn, api_key, all_output, ai_model, DOWNLOAD_DIR, READ_DIR)
+                process_invoices_batch(
+                    conn, api_key, all_output, ai_model, DOWNLOAD_DIR, READ_DIR, modelo_forte)
         else:
             log.warning("AVISO: 'schiavon_key_vision' nao configurado no profile - leitura de invoices ignorada.")
 

@@ -14,6 +14,8 @@ from commons.vision import (
     submit_batch,
     wait_for_batch,
 )
+from domain.service import notificacao_service
+from domain.service.insumo_service import INSUMO_INCERTO, classificar_anotacao_insumo
 
 log = get_logger(__name__)
 
@@ -63,6 +65,66 @@ def collect_items(conn, results: list[dict], download_dir: Path) -> list[BatchIt
     return items
 
 
+def _precisa_reler(invoice, model_forte: str, modelo_base: str) -> bool:
+    """Anotacao de insumo duvidosa e modelo forte distinto do base (spec-anotacao-insumo R9)."""
+    if not model_forte or model_forte == modelo_base:
+        return False
+    return classificar_anotacao_insumo(invoice.general_handwritten_notes) == INSUMO_INCERTO
+
+
+def _aplicar_releitura(item: BatchItem, invoice, forte):
+    """Troca so `general_handwritten_notes` pela do modelo forte (se ele leu algo) e soma o custo."""
+    notas = (forte.general_handwritten_notes or "").strip()
+    if not notas:
+        log.warning("%s: modelo forte nao leu anotacao, mantem a duvida original", item.file_path.name)
+    return invoice.model_copy(update={
+        "general_handwritten_notes": notas or invoice.general_handwritten_notes,
+        "cost_read": invoice.cost_read + forte.cost_read,
+    })
+
+
+def _reler_se_incerto(item: BatchItem, invoice, api_key: str, model_forte: str, modelo_base: str = ""):
+    """Caminho sincrono: antes de travar a nota, o modelo forte le de novo.
+
+    Falha na releitura mantem a leitura original (spec-anotacao-insumo R9)."""
+    if not _precisa_reler(invoice, model_forte, modelo_base):
+        return invoice
+    log.info("%s: insumo incerto, relendo com %s", item.file_path.name, model_forte)
+    try:
+        forte = read_invoice(item.file_path, api_key, model_forte)
+    except Exception as exc:  # noqa: BLE001 - laco de item: a leitura original segue valendo
+        log.exception("%s: falha na releitura com %s", item.file_path.name, model_forte)
+        notificacao_service.registrar_erro("releitura de insumo %s" % item.file_path.name, exc)
+        return invoice
+    return _aplicar_releitura(item, invoice, forte)
+
+
+def _reler_incertas_em_lote(lidas: list, api_key: str, model_forte: str, modelo_base: str) -> list:
+    """Caminho em lote: as notas incertas vao juntas num SEGUNDO lote com o modelo forte
+    (50% mais barato que uma chamada por nota). Falha do lote mantem as leituras originais."""
+    incertas = [it for it, inv in lidas if _precisa_reler(inv, model_forte, modelo_base)]
+    if not incertas:
+        return lidas
+    log.info("Batch API - %s nota(s) com insumo incerto, relendo com %s", len(incertas), model_forte)
+    try:
+        batch_id, id_map = submit_batch(incertas, api_key, model_forte)
+        wait_for_batch(batch_id, api_key, poll_interval=20, max_wait_seconds=ESPERA_MAXIMA_LOTE_S)
+        fortes = {
+            it.file_path: inv
+            for it, inv, erro in collect_batch_results(batch_id, api_key, id_map, model_forte)
+            if inv is not None and not erro
+        }
+    except Exception as exc:  # noqa: BLE001 - as leituras originais seguem valendo
+        log.exception("falha no lote de releitura com %s", model_forte)
+        notificacao_service.registrar_erro("lote de releitura de insumo", exc)
+        return lidas
+    return [
+        (it, _aplicar_releitura(it, inv, fortes[it.file_path]) if it.file_path in fortes else inv)
+        if it in incertas else (it, inv)
+        for it, inv in lidas
+    ]
+
+
 def _persist_and_move(conn, item: BatchItem, invoice_data, read_dir: Path) -> float:
     """Salva invoice no banco, move o arquivo para read_dir. Retorna custo.
 
@@ -92,6 +154,7 @@ def process_invoices_batch(
     model: str,
     download_dir: Path,
     read_dir: Path,
+    model_forte: str = "",
 ) -> None:
     """
     Envia todos os arquivos para o Batch API de uma vez (50% mais barato).
@@ -115,6 +178,7 @@ def process_invoices_batch(
     total_cost = 0.0
     read_dir.mkdir(parents=True, exist_ok=True)
 
+    lidas = []
     for item, invoice_data, error in batch_results:
         log.info("[%s] %s", item.config_name, item.file_path.name)
         if error or invoice_data is None:
@@ -126,6 +190,9 @@ def process_invoices_batch(
         )
         if invoice_data.reading_notes:
             log.info("notas IA : %s", invoice_data.reading_notes[:120])
+        lidas.append((item, invoice_data))
+
+    for item, invoice_data in _reler_incertas_em_lote(lidas, api_key, model_forte, model):
         try:
             total_cost += _persist_and_move(conn, item, invoice_data, read_dir)
         except Exception as exc:
@@ -142,6 +209,7 @@ def process_invoices_sync(
     model: str,
     download_dir: Path,
     read_dir: Path,
+    model_forte: str = "",
 ) -> None:
     """
     Processa cada arquivo imediatamente via chamada síncrona à API.
@@ -158,12 +226,14 @@ def process_invoices_sync(
     read_dir.mkdir(parents=True, exist_ok=True)
 
     for item in items:
-        total_cost += _ler_e_gravar_uma(conn, item, api_key, model, read_dir)
+        total_cost += _ler_e_gravar_uma(conn, item, api_key, model, read_dir, model_forte)
 
     log.info("invoices: custo total da leitura sincrona USD %.4f", total_cost)
 
 
-def _ler_e_gravar_uma(conn, item, api_key: str, model: str, read_dir: Path) -> float:
+def _ler_e_gravar_uma(
+    conn, item, api_key: str, model: str, read_dir: Path, model_forte: str = "",
+) -> float:
     """Lê UMA nota e grava. Devolve o custo; 0.0 se falhou.
 
     Laço de item: `except Exception` aqui é a rede de segurança que a
@@ -184,6 +254,7 @@ def _ler_e_gravar_uma(conn, item, api_key: str, model: str, read_dir: Path) -> f
         log.info("invoices: %s - notas da IA: %s", item.file_path.name,
                  invoice_data.reading_notes[:120])
 
+    invoice_data = _reler_se_incerto(item, invoice_data, api_key, model_forte, model)
     return _gravar_uma(conn, item, invoice_data, read_dir)
 
 

@@ -48,6 +48,7 @@ class IssueCode(StrEnum):
 
     # --- exclusão (nível da nota) — não é divergência, é decisão de não comparar
     SKIPPED_INSUMO_ANNOTATION = "skipped_insumo_annotation"  # anotação à mão com "insumo"
+    INSUMO_INCERTO = "insumo_incerto"  # anotação à mão que pode ser insumo, sem certeza
 
     # --- busca no Catapult (nível da nota) — a busca por fornecedor não achou nada
     PO_NAO_ENCONTRADA = "po_nao_encontrada"  # busca por fornecedor não devolveu PO nenhum
@@ -79,6 +80,7 @@ _DESCRICAO: dict[IssueCode, str] = {
     IssueCode.SUPPLIER_ERP_ONLY: "Fornecedor não-carne: a comparação dele é contra o ERP.",
     IssueCode.NO_QUOTE_FOR_SUPPLIER: "Fornecedor sem cotação no ciclo da nota.",
     IssueCode.SKIPPED_INSUMO_ANNOTATION: "Nota com anotação à mão de insumo — não enviada ao Catapult.",
+    IssueCode.INSUMO_INCERTO: "Anotação à mão pode ser insumo, sem certeza — revisar a invoice.",
     IssueCode.PO_NAO_ENCONTRADA: "Busca por fornecedor no Catapult não devolveu PO nenhum.",
     IssueCode.NO_QUOTE_FOR_ITEM: "Item da nota sem par no lado cotado.",
     IssueCode.UNIT_MISMATCH: "Preço por caixa não compara com preço por libra.",

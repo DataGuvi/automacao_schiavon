@@ -25,8 +25,10 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import psycopg2
 from psycopg2.extras import RealDictCursor
 
+from commons.exception import DataAccessException
 from commons.texto import truncar
 from domain.classificacao import tipo_linha
 from domain.enums import Etapa, StatusExecucao as Status
@@ -86,6 +88,28 @@ def fetch_configs_by_tool(conn, tool: str) -> list[dict]:
 def fetch_all_configs(conn) -> list[dict]:
     """Fontes de SharePoint, que é de onde as invoices vêm."""
     return fetch_configs_by_tool(conn, "sharepoint")
+
+
+def fetch_invoices_para_reprocesso(conn) -> list[dict]:
+    """Todas as notas gravadas, com o que o robo decidiu antes sobre insumo (so leitura).
+
+    `cod_status_conc` e o veredito da conciliacao ERP (21 = NAO_COMPARADO) ou None se a nota
+    ainda nao foi conciliada (spec-reprocesso-insumo R1/R6)."""
+    sql = f"""
+        SELECT i.id, i.arquivo, i.id_loja, i.dt_emissao, i.nome_fornecedor,
+               i.numero_invoice, i.anotacao_manual_geral, fc.cod_status AS cod_status_conc
+          FROM {SCHEMA}.fat_invoice i
+          LEFT JOIN {SCHEMA}.fat_conciliacao fc
+                 ON fc.id_invoice = i.id AND fc.comparacao = 'erp'
+         ORDER BY i.id
+    """
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql)
+            return [dict(r) for r in cur.fetchall()]
+    except psycopg2.Error as exc:
+        conn.rollback()
+        raise DataAccessException("falha ao ler as invoices para reprocesso") from exc
 
 
 # ---------------------------------------------------------------------------

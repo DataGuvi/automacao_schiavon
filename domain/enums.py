@@ -133,6 +133,7 @@ class StatusExecucao(IntEnum):
     AGUARDANDO_RESPOSTA = 12, "Planilha enviada, fornecedor não preencheu."
     PO_NAO_ENCONTRADA = 13, "PO sem status Ordered no Catapult; pesquisar de novo na próxima execução."
     ENCERRADO_SEM_ARQUIVO = 21, "Pasta da semana encontrada, mas vazia."
+    REVISAR_INSUMO = 22, "Anotação manual pode ser insumo, mas não dá para confirmar; revisar a invoice."
     ERRO_LOGIN = 50, "Falha de autenticação na origem."
     ERRO_NAVEGACAO = 51, "Pasta ou arquivo não encontrado na origem."
     ERRO_LEITURA = 52, "A IA não conseguiu extrair o documento."
@@ -187,6 +188,7 @@ class StatusConciliacao(IntEnum):
     DIVERGENCIA = 12, "Quantidade e/ou preço divergem do PO, além da tolerância."
     SEM_REFERENCIA_ITEM = 20, "Item da nota sem par no PO do Catapult."
     NAO_COMPARADO = 21, "Nota não comparada (exclusão intencional, ex.: insumo)."
+    INSUMO_INCERTO = 22, "Anotação manual ambígua; confirmar se é insumo."
 
 class EnvioCotacao(StrEnum):
     """O que aconteceu com o envio da planilha a um fornecedor.

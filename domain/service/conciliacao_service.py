@@ -36,7 +36,7 @@ from commons.db import reverter
 from commons.exception import DataAccessException
 from commons.matcher import match_supplier, norm_supplier
 from domain.conciliacao_codes import MARCAS_REVISAO, IssueCode
-from domain.enums import StatusConciliacao as Veredito, StatusExecucao
+from domain.enums import Etapa, StatusConciliacao as Veredito, StatusExecucao
 from domain.service.processo_service import SCHEMA
 
 # Marca de "reconciliar de novo" — o valor é do enum, não literal solto.
@@ -59,6 +59,8 @@ def _status_conciliacao(codes: list[str] | None) -> Veredito:
     caem no mesmo DIVERGENCIA genérico do PO, sem distinguir direção.
     """
     codes = codes or []
+    if IssueCode.INSUMO_INCERTO in codes:
+        return Veredito.INSUMO_INCERTO
     if IssueCode.SKIPPED_INSUMO_ANNOTATION in codes:
         return Veredito.NAO_COMPARADO
     if (IssueCode.NO_QUOTE_FOR_ITEM in codes or IssueCode.NO_PO_FOR_ITEM in codes
@@ -138,19 +140,13 @@ def fetch_fornecedores(conn) -> list[dict]:
     )
 
 
-def classificar_fornecedor(
-    conn, id_fornecedor: int, categoria: str, somente_sem_categoria: bool = False,
-) -> bool:
+def classificar_fornecedor(conn, id_fornecedor: int, categoria: str) -> bool:
     """Grava `dim_fornecedor.categoria`. Devolve False quando nada mudou.
-
-    `somente_sem_categoria`: so grava se a categoria atual e vazia ou 'outros' —
-    o aprendizado automatico nunca sobrescreve uma classificacao feita a mao.
     Nao mexe em `cotado` (spec-categoria-insumo-carne)."""
-    filtro = " AND (categoria IS NULL OR categoria = 'outros')" if somente_sem_categoria else ""
     try:
         with conn.cursor() as cur:
             cur.execute(
-                f"UPDATE {SCHEMA}.dim_fornecedor SET categoria = %s WHERE id = %s{filtro}",
+                f"UPDATE {SCHEMA}.dim_fornecedor SET categoria = %s WHERE id = %s",
                 (str(categoria), id_fornecedor),
             )
             alterou = cur.rowcount > 0
@@ -341,6 +337,7 @@ _NAO_RECONCILIA = (
     int(StatusExecucao.FINALIZADO),
     int(StatusExecucao.FINALIZADO_COM_ALERTA),
     int(StatusExecucao.ENCERRADO_SEM_ARQUIVO),
+    int(StatusExecucao.REVISAR_INSUMO),
 )
 
 
@@ -351,16 +348,17 @@ def fetch_invoice_headers_for_reconciliation(
 
     Só entra a nota que ainda não passou pela etapa ou que em algum momento
     errou (`processo.cod_status` fora de `_NAO_RECONCILIA`). Nota já conciliada
-    sem pendência não volta só por cair na janela de data.
+    sem pendência não volta só por cair na janela de data. Nota parada em LER
+    entra de qualquer data: data nula ou mal lida não pode prendê-la.
     """
     sql = f"""
         SELECT {_HEADER_COLS}, p.cod_status
           FROM {SCHEMA}.fat_invoice i
           JOIN {SCHEMA}.processo    p ON p.id = i.id_processo
-         WHERE i.dt_emissao BETWEEN %s AND %s
+         WHERE (i.dt_emissao BETWEEN %s AND %s OR p.cod_etapa = %s)
            AND p.cod_status NOT IN %s
     """
-    params: list = [date_from, date_to, _NAO_RECONCILIA]
+    params: list = [date_from, date_to, int(Etapa.LER), _NAO_RECONCILIA]
     if supplier:
         sql += " AND i.nome_fornecedor ILIKE %s"
         params.append(f"%{supplier}%")

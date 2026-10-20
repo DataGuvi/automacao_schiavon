@@ -14,7 +14,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest  # noqa: E402
+
 from commons.matcher import POLine  # noqa: E402
+from domain.service.insumo_service import (  # noqa: E402
+    INSUMO_INCERTO,
+    INSUMO_NAO,
+    INSUMO_SIM,
+    classificar_anotacao_insumo,
+    separar_itens_insumo,
+)
 from conciliacao.reconcile_erp import (  # noqa: E402
     NO_PO_FOR_ITEM,
     PO_NAO_ENCONTRADA,
@@ -22,7 +31,6 @@ from conciliacao.reconcile_erp import (  # noqa: E402
     QTY_MISMATCH_PO,
     escolher_po_por_itens,
     reconcile_items_against_po,
-    tem_anotacao_insumo,
 )
 
 
@@ -404,25 +412,24 @@ def test_linha_sem_po_nao_inventa_numero_do_lado_po():
         assert chave not in linha
 
 
-def test_tem_anotacao_insumo_true_quando_alguma_linha_tem_a_palavra():
+def test_separar_itens_insumo_tira_so_a_linha_marcada():
     items = [
         _item(100, "BEEF - Brisket / Maca de Peito", "10", "6.01", "60.10"),
-        _item(101, "LETTUCE ROMAINE", "1", "85.90", "85.90",
-              handwritten="Insumo p/produção - não faturar"),
+        _item(101, "LETTUCE ROMAINE", "1", "85.90", "85.90", handwritten="Insumo"),
+        _item(102, "TOMATO", "1", "5.00", "5.00", handwritten="Insuno"),
+        _item(103, "ONION", "1", "5.00", "5.00", handwritten="DONE"),
     ]
-    assert tem_anotacao_insumo(items) is True
+    restantes, insumo = separar_itens_insumo(items)
+    assert [i["id"] for i in restantes] == [100, 103]
+    assert [i["id"] for i in insumo] == [101, 102]
 
 
-def test_tem_anotacao_insumo_false_sem_anotacao_ou_com_outra_anotacao():
-    items = [
-        _item(100, "BEEF - Brisket / Maca de Peito", "10", "6.01", "60.10"),
-        _item(101, "LETTUCE ROMAINE", "1", "85.90", "85.90",
-              handwritten="preço corrigido a mão"),
-    ]
-    assert tem_anotacao_insumo(items) is False
+def test_separar_itens_insumo_todas_as_linhas():
+    items = [_item(100, "LETTUCE", "1", "85.90", "85.90", handwritten="Insumo")]
+    assert separar_itens_insumo(items)[0] == []
 
 
-def test_tem_anotacao_insumo_true_quando_anotacao_solta_na_pagina():
+def test_classificar_insumo_quando_anotacao_solta_na_pagina():
     """Caso real: Restaurant Depot/Beachline West, nota
     21146543173478892 -- 'Insumo Confeitaria' escrito na margem da pagina,
     nao preso a nenhuma linha (o Vision devolve isso em
@@ -431,13 +438,49 @@ def test_tem_anotacao_insumo_true_quando_anotacao_solta_na_pagina():
         _item(100, "Badia Spices - Garlic Powder - 4lb Jar", "1", "125.12", "125.12"),
         _item(101, "Badia - Lemon Pepper - 6 lbs", "1", "132.61", "132.61"),
     ]
-    assert tem_anotacao_insumo(items, general_handwritten_notes="Insumo Confeitaria") is True
+    assert classificar_anotacao_insumo("Insumo Confeitaria") == INSUMO_SIM
 
 
-def test_tem_anotacao_insumo_false_quando_anotacao_solta_nao_tem_a_palavra():
+def test_classificar_nao_quando_anotacao_solta_nao_tem_a_palavra():
     items = [_item(100, "Badia Spices - Garlic Powder - 4lb Jar", "1", "125.12", "125.12")]
-    assert tem_anotacao_insumo(items, general_handwritten_notes="Ver com o gerente") is False
-    assert tem_anotacao_insumo(items, general_handwritten_notes=None) is False
+    assert classificar_anotacao_insumo("Ver com o gerente") == INSUMO_NAO
+    assert classificar_anotacao_insumo(None) == INSUMO_NAO
+
+
+@pytest.mark.parametrize("texto", ["IN SUMO", "Insumo Burger", "INSUMOS", "insumo", "In-Sumo"])
+def test_classificar_insumo_tolera_espaco_caixa_e_complemento(texto):
+    assert classificar_anotacao_insumo(texto) == INSUMO_SIM
+
+
+@pytest.mark.parametrize("texto", ["INSUMO_INCERTO: FINAL WRAP", "INSUMO_INCERTO:"])
+def test_classificar_marca_da_vision_sem_match_e_incerto(texto):
+    assert classificar_anotacao_insumo(texto) == INSUMO_INCERTO
+
+
+@pytest.mark.parametrize("texto", ["DONE", "Inverno", "J. Silva"])
+def test_classificar_texto_geral_sem_marca_que_nao_bate_e_nao(texto):
+    assert classificar_anotacao_insumo(texto) == INSUMO_NAO
+
+
+@pytest.mark.parametrize("texto", ["insuno", "Sumo", "insmo", "Insu mo Burger",
+                                   "INSUMO_INCERTO: Insumo", "INSUMO_INCERTO: Insu wm Burder"])
+def test_classificar_segunda_barreira_fuzzy_acima_de_70_e_insumo(texto):
+    assert classificar_anotacao_insumo(texto) == INSUMO_SIM
+
+
+@pytest.mark.parametrize("texto", [None, ""])
+def test_classificar_sem_texto_e_nao(texto):
+    assert classificar_anotacao_insumo(texto) == INSUMO_NAO
+
+
+def test_classificar_nota_de_linha_que_nao_bate_nao_gera_incerto():
+    items = [_item(100, "LETTUCE ROMAINE", "1", "85.90", "85.90", handwritten="preco ok")]
+    assert classificar_anotacao_insumo(None) == INSUMO_NAO
+
+
+def test_classificar_insumo_vence_incerto_de_outra_linha():
+    items = [_item(100, "LETTUCE ROMAINE", "1", "85.90", "85.90", handwritten="insuno")]
+    assert classificar_anotacao_insumo("Insumo Burger") == INSUMO_SIM
 
 
 def test_escolher_po_por_itens_candidato_que_casa_mais_itens_vence():

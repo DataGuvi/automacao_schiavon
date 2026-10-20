@@ -141,7 +141,11 @@ class InvoiceItem(BaseModel):
     )
     handwritten_notes: str | None = Field(
         None,
-        description="Anotações manuais em caneta: devoluções, ajustes, correções de preço/quantidade"
+        description=(
+            "Anotações manuais em caneta: devoluções, ajustes, correções de preço/quantidade. "
+            "'Insumo' ao lado da linha, ou chave cobrindo várias linhas, entra aqui em cada "
+            "linha coberta."
+        ),
     )
 
     @model_validator(mode="after")
@@ -201,13 +205,15 @@ class InvoiceData(BaseModel):
     general_handwritten_notes: str | None = Field(
         None,
         description=(
-            "Texto EXATO de qualquer anotação manuscrita na página que não está "
-            "presa a nenhuma linha de item específica — ex.: escrita na margem/"
-            "espaço em branco abaixo da tabela, um carimbo/nota sobre a nota "
-            "inteira. Verbatim, sem comentário nem tradução. Diferente de "
-            "'handwritten_notes' de cada item (aquele é só quando a anotação "
-            "está claramente ao lado/embaixo de UMA linha). Null quando não há "
-            "esse tipo de anotação."
+            "SÓ a anotação manuscrita com a palavra INSUMO (em qualquer lugar da "
+            "página, não presa a uma linha), copiada exatamente como lida — "
+            "'IN SUMO', 'Insumo Burger', sem prefixo nem marca. Se NÃO dá para ler "
+            "INSUMO mas o manuscrito é uma quase-leitura da palavra ou uma palavra "
+            "que não é nome de pessoa (ex.: 'INS BURGER', 'INV BURDER'): "
+            "'INSUMO_INCERTO: <o que enxergou>'. A marca só vale nesse caso, nunca "
+            "para um INSUMO legível. NUNCA adivinhe, complete ou corrija a palavra. "
+            "Assinatura, rubrica, números, 'DONE' e comentários NÃO vão aqui: vão em "
+            "'reading_notes'. Null quando não há anotação de insumo."
         ),
     )
 
@@ -227,9 +233,10 @@ class InvoiceData(BaseModel):
         None,
         description=(
             "Observações em prosa sobre a QUALIDADE da leitura — dificuldades de "
-            "OCR, valores incertos, campos não encontrados. NÃO é onde anotação "
-            "manuscrita vai — isso é 'handwritten_notes' (por item) ou "
-            "'general_handwritten_notes' (solta na página)."
+            "OCR, valores incertos, campos não encontrados — e todo manuscrito solto "
+            "na página que NÃO seja INSUMO (assinatura, rubrica, 'DONE', comentário). "
+            "Anotação de INSUMO vai em 'general_handwritten_notes'; manuscrito preso "
+            "a uma linha vai em 'handwritten_notes' do item."
         ),
     )
 

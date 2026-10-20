@@ -32,6 +32,32 @@ def test_insumo_nao_e_conferido():
     assert svc._status_conciliacao([IssueCode.SKIPPED_INSUMO_ANNOTATION]) == StatusConciliacao.NAO_COMPARADO
 
 
+# spec-anotacao-insumo R5/R6
+def test_insumo_incerto_tem_veredito_proprio_e_nao_volta_sozinho():
+    assert svc._status_conciliacao([IssueCode.INSUMO_INCERTO]) == StatusConciliacao.INSUMO_INCERTO
+    assert int(StatusExecucao.REVISAR_INSUMO) in svc._NAO_RECONCILIA
+
+
+def test_insumo_incerto_trava_a_nota_sem_aprender_nem_ir_ao_catapult(monkeypatch):
+    chamadas = {}
+    monkeypatch.setattr(flow, "save_reconciliation_header", lambda conn, row: chamadas.update(header=row))
+    monkeypatch.setattr(
+        flow.proc, "falhar_etapa",
+        lambda conn, id_proc, etapa, status, msg=None: chamadas.update(status=status, msg=msg),
+    )
+    totais = {"headers_total": 0, "headers_issue": 0, "insumo_incerto": 0}
+    header = {"id": 1, "id_loja": 10, "id_processo": 5, "invoice_number": "11705",
+              "general_handwritten_notes": "INSUMO_INCERTO: in5umo"}
+
+    flow._gravar_insumo_incerto(None, header, totais)
+
+    assert chamadas["status"] == StatusExecucao.REVISAR_INSUMO
+    assert chamadas["header"]["issue_codes"] == [IssueCode.INSUMO_INCERTO]
+    assert chamadas["header"]["needs_review"] is True
+    assert "in5umo" in chamadas["msg"]
+    assert totais["insumo_incerto"] == 1 and totais["headers_issue"] == 1
+
+
 # R3
 def test_nota_nao_tentada_da_semana_anterior_nao_prende_a_semana_atual():
     headers = flow._selecionar_headers([_h(1, 10, int(StatusExecucao.PENDENTE))], [_h(2, 10), _h(3, 20)], [])
@@ -193,19 +219,16 @@ def test_linha_ativa_por_nome_ganha_da_zerada():
 
 
 # spec-categoria-insumo-carne
-def _processar(monkeypatch, categoria=None, insumo_na_nota=False, aliases=None, conn=object(), alterou=True):
-    chamadas = {"busca": 0, "skip": 0, "classificou": []}
+def _processar(monkeypatch, categoria=None, insumo_na_nota=False, aliases=None, conn=object(), items=None, nota_geral=None):
+    chamadas = {"busca": 0, "skip": 0, "incerto": 0}
+    monkeypatch.setattr(flow, "_gravar_insumo_incerto", lambda *a: chamadas.__setitem__("incerto", chamadas["incerto"] + 1))
     monkeypatch.setattr(flow, "_buscar_po", lambda *a, **k: chamadas.__setitem__("busca", chamadas["busca"] + 1) or [])
     monkeypatch.setattr(flow, "_gravar_skip_insumo", lambda *a: chamadas.__setitem__("skip", chamadas["skip"] + 1))
     monkeypatch.setattr(flow, "_gravar_resultado", lambda *a, **k: None)
-    monkeypatch.setattr(
-        flow, "classificar_fornecedor",
-        lambda c, i, cat, somente_sem_categoria=False: chamadas["classificou"].append((i, str(cat), somente_sem_categoria)) or alterou,
-    )
     forn = {"id": 7, "nome": "IDO Imports", "categoria": categoria}
     header = {"id": 1, "id_processo": 9, "invoice_number": "N1", "supplier_name": "IDO Imports",
-              "general_handwritten_notes": "Insumo" if insumo_na_nota else None}
-    items = [_item(1, "Item", "1", "5.00", "5.00", item_code="X1")]
+              "general_handwritten_notes": "Insumo" if insumo_na_nota else nota_geral}
+    items = items or [_item(1, "Item", "1", "5.00", "5.00", item_code="X1")]
     totais = {"aguardando_po": 0, "sem_po": 0}
     flow._processar_invoice(None, "u", conn, header, items, {}, lambda n: forn, aliases or {}, None, totais)
     return chamadas, forn
@@ -213,39 +236,51 @@ def _processar(monkeypatch, categoria=None, insumo_na_nota=False, aliases=None, 
 
 def test_fornecedor_insumo_resolvido_por_aproximacao_pula_sem_buscar_po(monkeypatch):
     chamadas, _ = _processar(monkeypatch, categoria="insumo")
-    assert chamadas["skip"] == 1 and chamadas["busca"] == 0 and chamadas["classificou"] == []
+    assert chamadas["skip"] == 1 and chamadas["busca"] == 0
 
 
-def test_insumo_lido_pela_vision_classifica_fornecedor_sem_categoria(monkeypatch):
+def test_insumo_na_nota_pula_so_a_nota_e_nao_classifica_o_fornecedor(monkeypatch):
     chamadas, forn = _processar(monkeypatch, categoria=None, insumo_na_nota=True)
     assert chamadas["skip"] == 1 and chamadas["busca"] == 0
-    assert chamadas["classificou"] == [(7, "insumo", True)]
-    assert forn["categoria"] == "insumo"
+    assert forn["categoria"] is None
+    assert not hasattr(flow, "_aprender_insumo")
 
 
-def test_insumo_lido_pela_vision_com_nome_pouco_parecido_nao_classifica(monkeypatch):
-    # fornecedor resolvido pelo piso 90, mas o nome da nota nao chega a 95 e nao ha alias
-    monkeypatch.setattr(flow, "confirmar_fornecedor_para_aprender", lambda *a: False)
-    chamadas, _ = _processar(monkeypatch, categoria=None, insumo_na_nota=True)
-    assert chamadas["skip"] == 1 and chamadas["classificou"] == []
+# spec-insumo-por-linha
+def test_linha_insumo_sai_e_as_demais_vao_ao_catapult(monkeypatch):
+    itens = [_item(1, "A", "1", "5.00", "5.00", item_code="X1", handwritten="Insumo"),
+             _item(2, "B", "1", "5.00", "5.00", item_code="X2")]
+    chamadas, _ = _processar(monkeypatch, items=itens)
+    assert chamadas["busca"] == 1 and chamadas["skip"] == 0
 
 
-def test_insumo_lido_pela_vision_com_alias_exato_classifica(monkeypatch):
-    monkeypatch.setattr(flow, "confirmar_fornecedor_para_aprender", lambda *a: False)
-    aliases = {flow.norm_supplier("IDO Imports"): {"canonical_id": 7, "categoria": None}}
-    chamadas, _ = _processar(monkeypatch, categoria=None, insumo_na_nota=True, aliases=aliases)
-    assert chamadas["classificou"] == [(7, "insumo", True)]
+def test_texto_geral_que_nao_e_insumo_segue_ao_catapult(monkeypatch):
+    chamadas, _ = _processar(monkeypatch, nota_geral="DONE")
+    assert chamadas["busca"] == 1 and chamadas["skip"] == 0
 
 
-def test_aprendizado_de_insumo_nao_sobrescreve_e_nao_derruba(monkeypatch):
-    chamadas, forn = _processar(monkeypatch, categoria="mercearia", insumo_na_nota=True, alterou=False)
-    assert chamadas["skip"] == 1                      # a nota continua pulada
-    assert forn["categoria"] == "mercearia"           # categoria existente intocada (a trava e no SQL)
+def test_geral_incerto_com_todas_as_linhas_insumo_pula_a_nota(monkeypatch):
+    itens = [_item(1, "A", "1", "5.00", "5.00", item_code="X1", handwritten="Insumo")]
+    chamadas, _ = _processar(monkeypatch, items=itens, nota_geral="INSUMO_INCERTO: FINAL WRAP")
+    assert chamadas["skip"] == 1 and chamadas["incerto"] == 0 and chamadas["busca"] == 0
 
-    def _quebra(*a, **k):
-        raise DataAccessException("boom")
-    monkeypatch.setattr(flow, "classificar_fornecedor", _quebra)
-    flow._aprender_insumo(object(), {"id": 7, "nome": "IDO Imports"}, "IDO Imports", {flow.norm_supplier("IDO Imports"): {}})
+
+def test_geral_incerto_sobrando_linha_trava(monkeypatch):
+    itens = [_item(1, "A", "1", "5.00", "5.00", item_code="X1", handwritten="Insumo"),
+             _item(2, "B", "1", "5.00", "5.00", item_code="X2")]
+    chamadas, _ = _processar(monkeypatch, items=itens, nota_geral="INSUMO_INCERTO: FINAL WRAP")
+    assert chamadas["incerto"] == 1 and chamadas["skip"] == 0 and chamadas["busca"] == 0
+
+
+def test_geral_incerto_sem_linha_insumo_trava(monkeypatch):
+    chamadas, _ = _processar(monkeypatch, nota_geral="INSUMO_INCERTO: FINAL WRAP")
+    assert chamadas["incerto"] == 1 and chamadas["busca"] == 0
+
+
+def test_todas_as_linhas_insumo_pula_a_nota(monkeypatch):
+    itens = [_item(1, "A", "1", "5.00", "5.00", item_code="X1", handwritten="Insumo")]
+    chamadas, _ = _processar(monkeypatch, items=itens)
+    assert chamadas["skip"] == 1 and chamadas["busca"] == 0
 
 
 def test_categoria_do_fornecedor_alias_ou_resolvido():
@@ -261,7 +296,7 @@ def test_carne_resolvida_por_aproximacao_recebe_tolerancia_zero():
         "Black Bull Foods", {}, {"categoria": "carne"})) == (Decimal("0"), Decimal("0"))
 
 
-def test_classificar_fornecedor_so_sem_categoria_filtra_no_sql():
+def test_classificar_fornecedor_grava_a_categoria():
     class Cur:
         rowcount = 1
         def __enter__(self): return self
@@ -274,11 +309,8 @@ def test_classificar_fornecedor_so_sem_categoria_filtra_no_sql():
         def commit(self): self.commits += 1
 
     conn = Conn()
-    assert svc.classificar_fornecedor(conn, 7, "insumo", somente_sem_categoria=True) is True
-    assert "categoria IS NULL OR categoria = 'outros'" in conn.cur.sql
+    assert svc.classificar_fornecedor(conn, 7, "insumo") is True
     assert conn.cur.params == ("insumo", 7) and conn.commits == 1
-    svc.classificar_fornecedor(conn, 7, "carne")
-    assert "IS NULL" not in conn.cur.sql
 
 
 def test_classificar_fornecedor_erro_do_driver_vira_data_access():

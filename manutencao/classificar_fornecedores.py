@@ -4,6 +4,8 @@ Carne: a cliente lanca tudo a mao no Catapult (sem codigo de barras), e a regra 
 carne (caixa x Ordered, tolerancia zero) so vale com `categoria='carne'`.
 Insumo: nota desses fornecedores e pulada (nao ha pedido no Catapult), sem
 depender de a Vision transcrever a palavra "insumo" (spec-categoria-insumo-carne).
+Quem estava como `insumo` e nao e alvo volta para `outros`: o insumo dos demais e
+decidido pela anotacao da invoice.
 
 Simula por padrao: so lista o que mudaria. `--aplicar` grava, e so quando o nome
 casa com UM fornecedor; ambiguo ou nao achado fica na lista para decisao manual.
@@ -27,8 +29,14 @@ ALVOS: dict[str, tuple[str, ...]] = {
         "Black Bull", "Cheney Brothers", "Colorado", "DBA Meat",
         "Eastern", "Ernesto's Food", "Kelly's", "Prime Meats",
     ),
-    CategoriaFornecedor.INSUMO: ("IDO", "Brazil USA"),
+    CategoriaFornecedor.INSUMO: ("All Florida Paper", "Rest Depot", "Sysco"),
 }
+
+
+def sobrando_como_insumo(fornecedores: list[dict], mantidos: set[int]) -> list[dict]:
+    """Fornecedores hoje `insumo` que nao estao entre os alvos: voltam para `outros`."""
+    return [f for f in fornecedores
+            if f.get("categoria") == CategoriaFornecedor.INSUMO and f["id"] not in mantidos]
 
 
 def propor(alvos: tuple[str, ...], fornecedores: list[dict]) -> list[tuple[str, list[dict]]]:
@@ -52,9 +60,12 @@ def main() -> None:
     conn = connect_db(carregar_config().banco)
     try:
         fornecedores = fetch_fornecedores(conn)
+        insumo_ids: set[int] = set()
         for categoria, alvos in ALVOS.items():
             print(f"\n== {categoria} ==")
             for alvo, candidatos in propor(alvos, fornecedores):
+                if categoria == CategoriaFornecedor.INSUMO:
+                    insumo_ids.update(f["id"] for f in candidatos)
                 if len(candidatos) != 1:
                     nomes = ", ".join(f"{f['id']}:{f['nome']}" for f in candidatos) or "nenhum"
                     motivo = "AMBIGUO" if candidatos else "NAO ACHADO"
@@ -69,6 +80,11 @@ def main() -> None:
                       f"(id {f['id']}) {atual} -> {categoria}")
                 if args.aplicar:
                     classificar_fornecedor(conn, f["id"], categoria)
+        print("\n== insumo -> outros ==")
+        for f in sobrando_como_insumo(fornecedores, insumo_ids):
+            print(f"  {'APLICA' if args.aplicar else 'PROPOE':<10} {f['nome']} (id {f['id']}) insumo -> outros")
+            if args.aplicar:
+                classificar_fornecedor(conn, f["id"], CategoriaFornecedor.OUTROS)
     finally:
         fechar(conn)
     if not args.aplicar:

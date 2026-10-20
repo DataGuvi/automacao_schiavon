@@ -55,10 +55,14 @@ class Credencial:
     senha: str = field(repr=False)
 
 
+MODELO_FORTE_PADRAO = "claude-opus-5-5"
+
+
 @dataclass(frozen=True)
 class ConfigVision:
     api_key: str = field(repr=False)
     modelo: str
+    modelo_forte: str = MODELO_FORTE_PADRAO
 
 
 @dataclass(frozen=True)
@@ -164,6 +168,7 @@ class Config:
             vision=ConfigVision(
                 api_key=txt("schiavon_key_vision"),
                 modelo=txt("VISION_MODEL", "claude-sonnet-4-6"),
+                modelo_forte=txt("VISION_MODEL_FORTE", MODELO_FORTE_PADRAO),
             ),
             #Configuração do ERP
             ecrs=ConfigEcrs(

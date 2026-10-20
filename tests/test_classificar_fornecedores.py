@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from manutencao.classificar_fornecedores import ALVOS, propor  # noqa: E402
+from manutencao.classificar_fornecedores import ALVOS, propor, sobrando_como_insumo  # noqa: E402
 
 
 def _f(id_, nome, categoria=None):
@@ -42,4 +42,11 @@ def test_nao_achado_vem_vazio():
 
 
 def test_alvos_da_cliente():
-    assert len(ALVOS["carne"]) == 8 and set(ALVOS["insumo"]) == {"IDO", "Brazil USA"}
+    assert len(ALVOS["carne"]) == 8
+    assert set(ALVOS["insumo"]) == {"All Florida Paper", "Rest Depot", "Sysco"}
+
+
+def test_insumo_fora_dos_alvos_volta_para_outros():
+    fornecedores = [_f(1, "Sysco", "insumo"), _f(2, "IDO Imports", "insumo"),
+                    _f(3, "Black Bull", "carne"), _f(4, "Zap Foods", None)]
+    assert [f["id"] for f in sobrando_como_insumo(fornecedores, {1})] == [2]

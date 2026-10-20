@@ -59,8 +59,8 @@ from commons.catapult import (
     parar_playwright,
 )
 from crawler.flow import reconcile_erp_flow as flow
+from domain.service.insumo_service import INSUMO_NAO, classificar_anotacao_insumo
 from conciliacao.reconcile_erp import (
-    tem_anotacao_insumo,
     PRICE_MISMATCH_PO,
     QTY_MISMATCH_PO,
     reconcile_items_against_po,
@@ -274,9 +274,9 @@ def main() -> None:
     print(f"Modo             : {'APLICAR (grava no Catapult)' if args.aplicar else 'simulacao'}")
     print(f"{'=' * 70}\n")
 
-    if tem_anotacao_insumo(nota["itens"], nota.get("anotacao_geral")):
-        print("  AVISO: nota com anotacao de INSUMO. No robo ela e pulada (NAO_COMPARADO) e nao "
-              "vai ao Catapult; este teste ignora a regra e busca a PO mesmo assim.\n")
+    if classificar_anotacao_insumo(nota.get("anotacao_geral")) != INSUMO_NAO:
+        print("  AVISO: nota com anotacao de INSUMO (ou duvida). No robo ela nao vai ao Catapult "
+              "(NAO_COMPARADO ou revisar); este teste ignora a regra e busca a PO mesmo assim.\n")
 
     if not args.aplicar:
         _simular_gravacao_no_catapult()

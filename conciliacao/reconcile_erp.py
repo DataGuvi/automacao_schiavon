@@ -63,8 +63,6 @@ HANDWRITTEN_PRESENT = IssueCode.HANDWRITTEN_PRESENT
 SKIPPED_INSUMO_ANNOTATION = IssueCode.SKIPPED_INSUMO_ANNOTATION
 PO_NAO_ENCONTRADA = IssueCode.PO_NAO_ENCONTRADA
 
-_PALAVRA_INSUMO = "insumo"
-
 # --- Tolerância de preço por fornecedor -------------------------------------
 #
 # Sobrepõe ABS_TOL/PCT_TOL padrão do motor (commons/matcher.py) pra quem
@@ -178,27 +176,6 @@ def _resolver_tolerancia_preco(
         if chave in nome_norm:
             return tolerancia
     return (ABS_TOL, PCT_TOL)
-
-
-def tem_anotacao_insumo(items: list[dict], general_handwritten_notes: str | None = None) -> bool:
-    """True se alguma linha da nota tem 'insumo' na anotação à mão
-    (`handwritten_notes`) OU se há uma anotação solta na página (não presa a
-    nenhum item — `general_handwritten_notes`, ver `commons/vision/schema.py`)
-    com a palavra — regra de negócio: nota inteira não vai para o Catapult
-    nesse caso (ver `crawler/flow/reconcile_erp_flow.py::_conciliar_invoice`,
-    que checa isto ANTES de `_buscar_po`).
-
-    A anotação solta é o caso comum na prática — 'insumo' costuma ser escrito
-    embaixo da tabela de itens, sobre a nota inteira, não ao lado de uma
-    linha específica (caso real: Restaurant Depot/Beachline West, nota
-    21146543173478892 — 'Insumo Confeitaria' escrito na margem das duas
-    páginas, sem estar preso a nenhum item)."""
-    if _PALAVRA_INSUMO in (general_handwritten_notes or "").lower():
-        return True
-    return any(
-        _PALAVRA_INSUMO in (item.get("handwritten_notes") or "").lower()
-        for item in items
-    )
 
 
 # Desempate por valor quando mais de um candidato casa a MESMA fração de
