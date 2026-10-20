@@ -37,3 +37,5 @@ resultado.json
 # Dumps de diagnostico do login (screenshot + html), gerados na pasta de execucao.
 debug_*.png
 debug_*.html
+
+execution_report.json
