@@ -183,7 +183,9 @@ def reconcile_erp_flow(
         )
         if totais["lojas_puladas"]:
             log.info("Lojas puladas (sem credencial/login): %s", totais['lojas_puladas'])
-        notificacao_service.enviar_relatorios_cliente(config, totais["relatorios_cliente"])
+        # TEMPORARIO (reprocessamento manual 2026-10-28, reverter depois): sem
+        # e-mail ao cliente nesse teste -- as 18 notas ja foram reportadas antes.
+        # notificacao_service.enviar_relatorios_cliente(config, totais["relatorios_cliente"])
         return totais
 
     except BusinessException as exc:
@@ -484,7 +486,14 @@ def _buscar_po(
     # Busca prioritaria: 'Invoice Reference' + 'Equals' com o numero da nota.
     # So se nao achar PO que case pelos itens cai na busca por nome (abaixo).
     if invoice_number:
-        achados = search_purchase_orders_by_invoice(page, invoice_number)
+        # TEMPORARIO (reprocessamento manual 2026-10-28, reverter depois): historico
+        # marcado primeiro (PO ja Committed, invoice antiga); sem resultado, o PO
+        # pode ainda nao ter sido baixado/Committed - tenta de novo desmarcado
+        # (os dois modos sao mutuamente exclusivos no Catapult).
+        achados = search_purchase_orders_by_invoice(page, invoice_number, mostrar_historico=True)
+        if not achados:
+            log.info("nota %s: nada com historico marcado, tentando desmarcado", invoice_number)
+            achados = search_purchase_orders_by_invoice(page, invoice_number, mostrar_historico=False)
         escolha = _desempatar_por_itens(
             page, achados, items, sinonimos, f"invoice {invoice_number!r}",
         )
@@ -501,9 +510,16 @@ def _buscar_po(
     # invoice.
     fornecedor = resolver_fornecedor(supplier_name)
     termo_busca = (fornecedor or {}).get("nome_catapult") or supplier_name
+    # TEMPORARIO (reprocessamento manual 2026-10-28, reverter depois): mesmo
+    # fallback de historico da busca por invoice acima.
     achados = search_purchase_orders_by_supplier(
-        page, termo_busca, nomes_alternativos=(supplier_name,),
+        page, termo_busca, nomes_alternativos=(supplier_name,), mostrar_historico=True,
     )
+    if not achados:
+        log.info("%r: nada com historico marcado, tentando desmarcado", termo_busca)
+        achados = search_purchase_orders_by_supplier(
+            page, termo_busca, nomes_alternativos=(supplier_name,), mostrar_historico=False,
+        )
     if not achados:
         return None
     _aprender_nome_catapult(conn, fornecedor, supplier_name, achados)
@@ -636,7 +652,7 @@ def _gravar_resultado(
     # Antes de gravar: nota ja conciliada nao reenvia e-mail (spec RF-06).
     ja_reportada = ja_conciliada_erp(conn, header["id"])
     recon_header_id = save_reconciliation_header(conn, header_row)
-    save_reconciliation_items(conn, recon_header_id, resultado["items"])
+    save_reconciliation_items(conn, recon_header_id, resultado["items"], comparacao="erp")
     _sincronizar_pendentes(header, resultado["items"], sheet_id, totais)
     # Conclui a etapa ANTES dos relatorios: se `concluir_etapa` falhar, a nota
     # volta na proxima execucao sem ter gerado (e reenviado) .docx duplicado.

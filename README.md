@@ -81,27 +81,39 @@ Arquivos de credencial, também fora do git: `resources/google/service_account.j
 
 ```mermaid
 flowchart TD
-    A[cron a cada 30 min] --> B[main.py<br/>fuso + profile]
+    A[cron a cada 30 min, com flock] --> B[main.py<br/>fuso + profile]
     B --> F1[1. Sinonimos<br/>Google Sheets para banco]
     F1 --> F2[2. Invoices<br/>SharePoint + Claude Vision]
     F2 --> F3[3. Conciliacao ERP<br/>Invoice x PO do Catapult]
     F3 --> F4[4. Monitor<br/>acesso por sistema e alertas]
-    F4 --> Z[Heartbeat, e-mail de erro e resumo]
+    F4 --> H[Heartbeat do agendamento]
+    H --> Z[Resumo OK/ERRO<br/>exit 1 se algo falhou]
+    B -.-> ERR[(1 e-mail de erro<br/>consolidado, no finally)]
 
     F2 -.-> COT[Cotacao semanal<br/>desativada]
 
-    F3 --> N1{Nota sem itens ou<br/>com anotacao de insumo?}
-    N1 -->|sim| N2[Encerra sem conciliar]
-    N1 -->|nao| N3[Login no Catapult<br/>e busca do PO]
-    N3 --> N4{PO encontrado?}
-    N4 -->|nao| N5[Status 13 PO_NAO_ENCONTRADA<br/>pesquisa de novo na proxima execucao,<br/>ate 3 vezes; depois fecha sem PO]
-    N4 -->|sim| N6[Compara quantidade e valor<br/>item a item]
-    N6 --> N7{Algum item diverge?}
-    N7 -->|sim| R1[.docx de divergencia]
-    N7 -->|nao| R2[.docx de sucesso]
-    R1 --> M[1 e-mail por invoice<br/>uma unica vez]
+    F3 --> N0{Nota sem item<br/>de mercadoria?}
+    N0 -->|sim| N0A[Encerra sem conciliar<br/>ENCERRADO_SEM_ARQUIVO]
+    N0 -->|nao| N1{Fornecedor de<br/>categoria insumo?}
+    N1 -->|sim| NSKIP[Pula a nota<br/>NAO_COMPARADO, sem .docx]
+    N1 -->|nao| N2[Separa as linhas<br/>anotadas como insumo]
+    N2 --> N3{Sobrou item<br/>fora de insumo?}
+    N3 -->|nao, era tudo insumo| NSKIP
+    N3 -->|sim| N4{Anotacao geral<br/>de insumo?}
+    N4 -->|incerta| N4A[Trava para revisao<br/>REVISAR_INSUMO 22]
+    N4 -->|insumo confirmado| NSKIP
+    N4 -->|nao e insumo| N5[Login no Catapult<br/>e busca do PO Ordered]
+    N5 --> N6{PO Ordered<br/>encontrado?}
+    N6 -->|nao, tentativa 1-2| N6A[Status 13 PO_NAO_ENCONTRADA<br/>pesquisa de novo na proxima execucao]
+    N6 -->|nao, 3a tentativa,<br/>ja conciliada com item casado antes| N6B[PO fechado a mao:<br/>identifica os itens e finaliza, sem relatorio]
+    N6 -->|nao, 3a tentativa,<br/>sem conciliacao previa| N6C[Fecha sem PO<br/>relatorio "nenhum PO Ordered"]
+    N6 -->|sim| N7[Compara quantidade e valor<br/>item a item contra o PO]
+    N7 --> N8{Algum item diverge?}
+    N8 -->|sim| R1[.docx de divergencia]
+    N8 -->|nao| R2[.docx de sucesso]
+    R1 --> M[1 e-mail por invoice<br/>ao cliente, uma unica vez]
     R2 --> M
-    N5 --> M
+    N6C --> M
 ```
 
 ## 6. Regras de Negócio

@@ -144,7 +144,10 @@ def test_invoice_reference_achada_nao_busca_pelo_nome(monkeypatch):
 def test_invoice_nao_localizada_aciona_busca_pelo_nome(monkeypatch):
     chamadas, po = _preparar_buscas(monkeypatch, [], [{"href": "h"}])
     assert flow._buscar_po(None, "u", HEADER, [], {}, lambda n: None) == [po]
-    assert chamadas == ["invoice", "nome"]
+    # 2x "invoice": fallback TEMPORARIO de historico (spec-historico-po-catapult R6,
+    # reprocessamento manual 2026-10-28) tenta de novo sem o historico marcado
+    # antes de cair pro nome, quando a 1a tentativa nao acha nada.
+    assert chamadas == ["invoice", "invoice", "nome"]
 
 
 def test_invoice_sem_pos_que_casem_pelos_itens_cai_no_nome(monkeypatch):

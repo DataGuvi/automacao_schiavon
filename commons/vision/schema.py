@@ -22,6 +22,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from commons.matcher import norm_supplier
+
 # Achado do cliente: pedir pro modelo aplicar o multiplicador de pack embutido
 # na descricao ("<N>X<size>", ex. "12x200g", "90x30g") de forma confiavel em
 # TODA linha elegivel de uma nota com varias dezenas de itens nao funciona —
@@ -47,6 +49,76 @@ def _n_do_pack(pack_size: str | None, description: str | None) -> int:
     """N do pack ('12/12 oz' -> 12; descricao '12x500 GR' -> 12), ou 0 sem padrao."""
     m = _PACK_COLUNA_RE.match(pack_size or "") or _PACK_SIZE_RE.search(description or "")
     return int(m.group(1)) if m else 0
+
+
+# "B24"/"C24" = tamanho real da caixa, CONFIRMADO ao vivo contra o Catapult
+# real (spec-caixa-letra-florida-distributing) so pra Florida Distributing:
+# `Received` do PO = quantidade impressa da invoice x N em 7/7 linhas nao-zeradas
+# da invoice 200488064. Fora desse fornecedor a mesma letra+numero pode ser so
+# indicador de estoque ambiguo (`spec-qtd-caixa` R3) - por isso o escopo e por
+# fornecedor, nunca global. So "24" (unico valor confirmado) - nao um digito
+# generico: testado contra a mesma invoice real, "HEINEKEN C2 5L" (um barril,
+# "C2" so faz parte do nome do produto) bateria um falso positivo com
+# `[BC]\d+` generico. Outro tamanho de caixa deste fornecedor (ex. "B12")
+# precisa de confirmacao real antes de entrar aqui.
+_PACK_SIZE_LETRA_RE = re.compile(r"\b[BC](24)\b")
+_FORNECEDORES_PACK_LETRA = ("FLORIDA DISTRIBUT",)
+
+
+def _fornecedor_bate(supplier_name: str | None, fornecedores: tuple[str, ...]) -> bool:
+    nome = norm_supplier(supplier_name)
+    return any(f in nome for f in fornecedores)
+
+
+# qtd_caixa (spec-qtd-caixa): quantos itens tem em 1 caixa/pack/display, de QUALQUER
+# um dos formatos comerciais comuns — campo independente de `cases`, nunca participa
+# do multiplicador de `quantity`. So os padroes CLAROS da aba "Quantidades por caixa,
+# pack e a[ssemelhados]" da planilha de referencia do cliente; o resto fica `None`
+# (nunca adivinha). Tentados nesta ordem, primeiro que bater ganha.
+_QTD_SIZE_X_N_RE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:kg|gr|ml|lb|oz|g|l)\s*x\s*(\d+)\b", re.IGNORECASE
+)
+_QTD_N_SLASH_SIZE_RE = re.compile(
+    r"(\d+)\s*/\s*\d+(?:[.,]\d+)?\s*(?:kg|gr|ml|lbs|lb|oz|g|l|qt|lt|gal)\b", re.IGNORECASE
+)
+# "PK 100" -> 100; nao "PK 2/100" (composto, ambiguo — negative lookahead de '/').
+_QTD_PK_N_RE = re.compile(r"\bPK\s+(\d+)\b(?!\s*/)", re.IGNORECASE)
+# "10-Pk", "20PACK", "4 PACK" -> N.
+_QTD_N_PACK_RE = re.compile(r"\b(\d+)\s*-?\s*(?:pk|pack)\b", re.IGNORECASE)
+# "X12", "BOX X24" -> N. Nunca o 'x' de '12x400g' (lookbehind de digito/ponto) nem
+# dimensao tipo '18"x360\'' ou '6X9X3.5' (lookahead de aspas/polegada ou outro x-digito).
+_QTD_X_N_RE = re.compile(
+    r"(?<![0-9.])\bX\s?(\d+)\b(?!['\"]|\s*[xX]\s*\d)", re.IGNORECASE
+)
+_QTD_ROLL_PER_BOX_RE = re.compile(r"\b(\d+)\s*rolls?\s*per\s*box\b", re.IGNORECASE)
+# "6 pcs", "18 items" soltos no fim da descricao (formato mais comum na pratica:
+# fornecedor imprime "<descricao> | <peso> | <N> pcs/items"). N=1 fica de fora
+# (minimo 2) — "1 pc" e material de display (shelf talker/wobbler), nao uma
+# caixa real de produto, mesmo sendo o literal impresso.
+_QTD_N_PCS_ITEMS_RE = re.compile(r"\b(\d+)\s*(?:pcs?|items?)\b", re.IGNORECASE)
+
+_QTD_CAIXA_PATTERNS = (
+    (_PACK_SIZE_RE, 1),          # "<N>X<size><UNIT>" ("12x400g" -> 12)
+    (_QTD_SIZE_X_N_RE, 1),       # "<size><UNIT> X <N>" ("200GR X15" -> 15)
+    (_QTD_N_SLASH_SIZE_RE, 1),   # "<N>/<size><UNIT>" ("24/0.5L" -> 24)
+    (_QTD_PK_N_RE, 1),           # "PK <N>" ("PK 100" -> 100)
+    (_QTD_N_PACK_RE, 1),         # "<N>-Pk" / "<N>PACK" ("10-Pk", "20PACK" -> N)
+    (_QTD_X_N_RE, 1),            # "X<N>" / "BOX X<N>" ("X12", "BOX X24" -> N)
+    (_QTD_ROLL_PER_BOX_RE, 1),   # "<N> roll(s) per box" ("1 roll per box" -> 1)
+    (_QTD_N_PCS_ITEMS_RE, 2),    # "<N> pcs"/"<N> items" soltos ("18 items" -> 18)
+)
+
+
+def _n_qtd_caixa(pack_size: str | None, description: str | None) -> int:
+    """N de quantos itens tem em 1 caixa/pack (spec-qtd-caixa), ou 0 sem nenhum dos
+    padroes claros. Procura em `pack_size` e `description` juntos — os formatos
+    cobertos aparecem tanto numa coluna propria quanto embutidos na descricao."""
+    texto = f"{pack_size or ''} {description or ''}"
+    for padrao, minimo in _QTD_CAIXA_PATTERNS:
+        achado = padrao.search(texto)
+        if achado and int(achado.group(1)) >= minimo:
+            return int(achado.group(1))
+    return 0
 
 # Data impressa: tres numeros separados por '/', '-' ou '.'. A Vision converte
 # a data para ISO "de cabeca" e ja trocou dia/mes/ano em nota americana
@@ -126,6 +198,23 @@ class InvoiceItem(BaseModel):
             "variavel) — nesse caso 'quantity' ja É a caixa."
         ),
     )
+    qtd_caixa: float | None = Field(
+        None,
+        description=(
+            "Quantos itens/unidades individuais tem dentro de 1 caixa/pack/display "
+            "desta linha, quando a descrição (ou a coluna de pack) traz um formato "
+            "comercial claro de contagem — '<N>X<size>' ('12x400g'), '<size> X <N>' "
+            "('200GR X15'), '<N>/<size>' ('24/0.5L'), 'PK <N>' ('PK 100'), '<N>-Pk'/"
+            "'<N>PACK' ('10-Pk', '20PACK'), 'X<N>'/'BOX X<N>' ('X12', 'BOX X24'), "
+            "'<N> roll(s) per box', '<N> pcs'/'<N> items' soltos no fim da descrição "
+            "('... | 270 g | 6 pcs' -> 6; '1 pc' sozinho é material de display, não "
+            "entra). Captura SÓ o número da contagem, nunca o peso/volume/tamanho. "
+            "Campo independente de 'cases': nunca participa do multiplicador de "
+            "'quantity'. Deixe null em formato composto/ambíguo ('PK 2/100', 'B24', "
+            "'CS 0, PC 2' — indicador de estoque, não pack) ou quando não há nenhum "
+            "desses padrões — nunca adivinhe."
+        ),
+    )
     handwritten_code: str | None = Field(
         None,
         description=(
@@ -167,6 +256,42 @@ class InvoiceItem(BaseModel):
             return self
         self.cases = self.quantity
         self.quantity = self.quantity * n
+        return self
+
+    @model_validator(mode="after")
+    def _aplicar_qtd_caixa_faltante(self) -> "InvoiceItem":
+        """Rede de segurança determinística pra `qtd_caixa` (spec-qtd-caixa): se a
+        Vision deixou null mas a descrição/`pack_size` bate um dos formatos claros
+        de contagem (`_n_qtd_caixa`), preenche aqui do mesmo jeito que
+        `_aplicar_multiplicador_de_pack_faltante` faz pra `cases` — mesma lição: o
+        LLM é inconsistente aplicando regra mecânica em nota com muitas linhas.
+        Campo isolado: nunca toca `quantity`, `cases` ou `total_price`."""
+        if self.qtd_caixa is not None:
+            return self
+        n = _n_qtd_caixa(self.pack_size, self.description)
+        if n < 1:
+            return self
+        self.qtd_caixa = float(n)
+        return self
+
+    @model_validator(mode="after")
+    def _derivar_cases_de_qtd_caixa(self) -> "InvoiceItem":
+        """`cases` (spec-cases-derivado-qtd-caixa): quando a regra 8/açougue não
+        preencheu `cases` mas `quantity` e `qtd_caixa` vieram preenchidos e a
+        divisão é EXATA (`quantity / qtd_caixa`), deriva `cases` daqui — é o
+        número de caixas, o mesmo dado que a conciliação ERP já sabe comparar
+        contra `Ordered` quando o PO está em "Case" (`_comparar_grupo`, guiado
+        por `po.unit`, nunca por este campo). Divisão não-exata nunca arredonda:
+        fica `None`, cai no fallback de hoje (`quantity` direto). `qtd_caixa<=1`
+        também fica de fora — mesmo caso degenerado que a regra 8 já trata como
+        "não é multiplicador de verdade" (ex. "1x500g" não é um pack real):
+        dividir por 1 só copiaria `quantity` para `cases` sem informação nova.
+        `quantity` nunca muda — diferente da regra 8, que multiplica."""
+        if self.cases is not None or self.quantity is None or self.qtd_caixa is None:
+            return self
+        if self.qtd_caixa <= 1 or self.quantity % self.qtd_caixa:
+            return self
+        self.cases = self.quantity / self.qtd_caixa
         return self
 
 
@@ -261,4 +386,28 @@ class InvoiceData(BaseModel):
         que a Vision converteu. Sem data impressa legivel, fica o ISO da Vision."""
         self.invoice_date = _converter_data_impressa(self.invoice_date_raw) or self.invoice_date
         self.due_date = _converter_data_impressa(self.due_date_raw) or self.due_date
+        return self
+
+    @model_validator(mode="after")
+    def _aplicar_multiplicador_pack_letra_fornecedor(self) -> "InvoiceData":
+        """"B24"/"C24" = tamanho real da caixa, SO pra Florida Distributing
+        (spec-caixa-letra-florida-distributing) - mesma formula da regra 8
+        (`_aplicar_multiplicador_de_pack_faltante`: `cases` = quantidade
+        impressa, `quantity` = impressa x N), so que o N vem de letra+numero
+        em vez de "NxSIZE". Escopado por fornecedor de proposito: a mesma
+        letra+numero noutro fornecedor pode ser so indicador de estoque
+        ambiguo (`spec-qtd-caixa` R3), entao nunca roda fora daqui."""
+        if not _fornecedor_bate(self.supplier_name, _FORNECEDORES_PACK_LETRA):
+            return self
+        for item in self.items:
+            if item.cases is not None or item.quantity is None or item.quantity % 1:
+                continue
+            achado = _PACK_SIZE_LETRA_RE.search(item.description or "")
+            if not achado:
+                continue
+            n = int(achado.group(1))
+            if n <= 1:
+                continue
+            item.cases = item.quantity
+            item.quantity = item.quantity * n
         return self

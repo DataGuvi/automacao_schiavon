@@ -1,8 +1,8 @@
 import pytest
 
 from commons.catapult import (
-    _aplicar_filtro_busca, _conferir_filtro_aplicado, extrair_prefixo_nome_po,
-    search_purchase_orders_by_invoice,
+    _aplicar_filtro_busca, _conferir_filtro_aplicado, _preparar_filtros_po,
+    extrair_prefixo_nome_po, search_purchase_orders_by_invoice,
 )
 from commons.exception import IntegracaoException
 from commons.matcher import aceitar_prefixos_catapult
@@ -137,6 +137,63 @@ def test_aplicar_filtro_busca_usa_campo_informado():
     page = _Page()
     _aplicar_filtro_busca(page, "Supplier", "Leblon", "Contains")
     assert page.selecionados == ["Supplier", "Contains"]
+
+
+# --- historico (spec-historico-po-catapult) ---------------------------------
+
+class _PageHistorico:
+    """Fake minimo de Playwright com estado do checkbox 'Show History For',
+    pra testar `_preparar_filtros_po` sem navegador de verdade."""
+
+    def __init__(self, historico_marcado: bool):
+        self.historico_marcado = historico_marcado
+        self.cliques_label = 0
+        self.selecionados: list[tuple[str, str]] = []
+
+    def wait_for_selector(self, *_a, **_k):
+        pass
+
+    def select_option(self, seletor, label=None):
+        self.selecionados.append((seletor, label))
+
+    def wait_for_timeout(self, _):
+        pass
+
+    def locator(self, _):
+        return self
+
+    def is_checked(self, **_):
+        return self.historico_marcado
+
+    def click(self, **_):
+        self.cliques_label += 1
+        self.historico_marcado = not self.historico_marcado
+
+
+def test_preparar_filtros_po_default_desmarca_historico_e_seleciona_ordered():
+    page = _PageHistorico(historico_marcado=True)
+    _preparar_filtros_po(page, 1000)
+    assert page.cliques_label == 1
+    assert page.historico_marcado is False
+    assert ("#gwt-debug-PreferenceListBox-worksheetStatuses", "Ordered") in page.selecionados
+
+
+def test_preparar_filtros_po_mostrar_historico_marca_e_nao_seleciona_status():
+    page = _PageHistorico(historico_marcado=False)
+    _preparar_filtros_po(page, 1000, mostrar_historico=True)
+    assert page.cliques_label == 1
+    assert page.historico_marcado is True
+    assert all(sel != "#gwt-debug-PreferenceListBox-worksheetStatuses" for sel, _ in page.selecionados)
+
+
+def test_preparar_filtros_po_nao_clica_se_ja_no_estado_certo():
+    sem_historico = _PageHistorico(historico_marcado=False)
+    _preparar_filtros_po(sem_historico, 1000, mostrar_historico=False)
+    assert sem_historico.cliques_label == 0
+
+    com_historico = _PageHistorico(historico_marcado=True)
+    _preparar_filtros_po(com_historico, 1000, mostrar_historico=True)
+    assert com_historico.cliques_label == 0
 
 
 def test_token_generico_sozinho_nao_casa_por_subconjunto():

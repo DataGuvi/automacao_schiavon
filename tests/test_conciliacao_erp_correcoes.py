@@ -38,6 +38,30 @@ def test_insumo_incerto_tem_veredito_proprio_e_nao_volta_sozinho():
     assert int(StatusExecucao.REVISAR_INSUMO) in svc._NAO_RECONCILIA
 
 
+# spec-dif-valor-erp-nao-multiplica
+def test_dif_valor_cotacao_multiplica_pela_quantidade():
+    """Frente cotacao: `price_diff` e por UNIDADE, multiplica pra fechar o
+    impacto total da linha (comportamento de sempre)."""
+    assert svc._calcular_dif_valor(Decimal("-2.50"), Decimal("10"), "cotacao") == Decimal("-25.00")
+
+
+def test_dif_valor_erp_nao_multiplica():
+    """Caso real (invoice Skyharvest 13019, item Milka Choco Cookie Sensation):
+    `price_diff` na frente ERP ja e diferenca de VALOR TOTAL da linha/grupo
+    (39.96 - 479.9952); multiplicar de novo pela quantidade (12) inflava
+    `dif_valor` pra -5280.42 em vez do impacto real, -440.0352."""
+    assert svc._calcular_dif_valor(Decimal("-440.0352"), Decimal("12"), "erp") == Decimal("-440.0352")
+
+
+def test_dif_valor_sem_price_diff_e_none_nas_duas_frentes():
+    assert svc._calcular_dif_valor(None, Decimal("10"), "cotacao") is None
+    assert svc._calcular_dif_valor(None, Decimal("10"), "erp") is None
+
+
+def test_dif_valor_cotacao_sem_quantidade_e_none():
+    assert svc._calcular_dif_valor(Decimal("-2.50"), None, "cotacao") is None
+
+
 def test_insumo_incerto_trava_a_nota_sem_aprender_nem_ir_ao_catapult(monkeypatch):
     chamadas = {}
     monkeypatch.setattr(flow, "save_reconciliation_header", lambda conn, row: chamadas.update(header=row))

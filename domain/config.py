@@ -174,7 +174,7 @@ class Config:
             ecrs=ConfigEcrs(
                 usuario=txt("ECRS_USER"), senha=txt("ECRS_PASSWORD"),
                 access_email=txt("CLOUDFLARE_ACCESS_EMAIL"),
-                headless=_booleano(valores, "ECRS_HEADLESS", True),
+                headless=_booleano(valores, "ECRS_HEADLESS", False),
                 url_hq=txt("ECRS_HQ"), url_windermere=txt("ECRS_WINDERMERE"),
                 url_drphilips=txt("ECRS_DRPHILIPS"),
             ),

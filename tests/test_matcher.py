@@ -32,6 +32,7 @@ from commons.matcher import (  # noqa: E402
     match_supplier,
     mesmo_item_estado_diferente,
     norm_code,
+    norm_code_so_digitos,
     norm_item,
     norm_supplier,
     norm_text,
@@ -39,6 +40,7 @@ from commons.matcher import (  # noqa: E402
     po_items_sem_invoice,
     qty_matches_po,
     qty_matches_po_cases,
+    qty_matches_po_received,
     within_tolerance,
 )
 
@@ -483,15 +485,58 @@ def test_match_supplier_separa_os_dois_prime():
 # Codigo (item_code/upc x Supplier Unit ID/scancode)
 # ---------------------------------------------------------------------------
 
-def test_norm_code_so_digitos_sem_zero_a_esquerda():
+def test_norm_code_numerico_sem_zero_a_esquerda():
     assert norm_code("0012345") == "12345"
-    assert norm_code("TEU-45") == "45"
     assert norm_code(" 123 ") == "123"
     assert norm_code(None) == ""
     assert norm_code("") == ""
-    assert norm_code("ABC") == ""
+    assert norm_code("ABC") == ""  # so letra, nenhum digito: nao e codigo
     # so zeros: nao sobra digito significativo, cai pra vazio (nunca casa)
     assert norm_code("0000") == ""
+
+
+def test_norm_code_alfanumerico_preserva_a_letra_do_prefixo():
+    """Achado real (fornecedor de salgadinhos): 'TOR-0003' (Salg. Cebola
+    Torcida) nao batia com o Supplier Unit ID igual no Catapult porque a
+    normalizacao antiga tirava a letra ('TOR') junto com o hifen, reduzindo
+    'TOR-0003', 'BIS-0003', '0003' e '3' pro MESMO '3' — colisao entre
+    codigos de produtos diferentes. So separador de formatacao sai; a letra
+    do prefixo fica, preservando a identidade do codigo."""
+    assert norm_code("TOR-0003") == "TOR0003"
+    assert norm_code("BIS-0003") == "BIS0003"
+    assert norm_code("TOR0003") == "TOR0003"
+    assert norm_code("teu-45") == "TEU45"
+
+
+def test_norm_code_na_nao_e_codigo():
+    """'N/A' (nao aplicavel) com separador e numero de linha colados nao e
+    codigo nenhum — sem o guard, sobraria '1' e colidiria com qualquer
+    Supplier Unit ID/Scancode igual de um item sem relacao (achado real,
+    invoice 1104: 'COPO NADIR AMERICANO' casou com 'FEIJAO CARIOCA GALANTE')."""
+    assert norm_code("NA-0001") == ""
+    assert norm_code("N/A") == ""
+
+
+def test_norm_code_so_digitos_tira_prefixo_de_marca():
+    """Caso real (invoice Skyharvest 13019, spec-codigo-na-nao-casa R7-R9):
+    'Elvan-1200711111' (prefixo de MARCA colado pela Vision, nao parte do
+    codigo) vira '1200711111' sem a letra — ao contrario de `norm_code`, que
+    preservaria 'ELVAN1200711111' e nunca bateria com o Supplier Unit ID real
+    '1200711111', sem prefixo nenhum."""
+    assert norm_code_so_digitos("Elvan-1200711111") == "1200711111"
+    assert norm_code_so_digitos("0012345") == "12345"
+    assert norm_code_so_digitos(None) == ""
+
+
+def test_norm_code_so_digitos_na_continua_vazio():
+    """A guarda de 'N/A' vale igual no fallback so digitos (R9) — nunca casa
+    por acaso com um Supplier Unit ID puramente numerico."""
+    assert norm_code_so_digitos("NA-0001") == ""
+    assert norm_code_so_digitos("N/A") == ""
+    assert norm_code("na") == ""
+    assert norm_code("N/A 0007") == ""
+    # codigo alfanumerico de verdade continua normal, mesmo comecando com N/A-like
+    assert norm_code("NAT12345") == "NAT12345"
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +624,117 @@ def test_sem_match_por_codigo_cai_pro_fuzzy_de_nome():
 
     (match,) = match_items_po(invoice, po_lines)
     assert match.match_level == "nome"
+    assert match.po_key == 1
+
+
+def test_m2_codigo_placeholder_casa_por_nome_abaixo_do_piso_normal():
+    """Caso real: invoice Florida Distributing 200488064, 'SMIRNOFF ICE
+    ORIGINAL B24 11.2OZ 6P' x PO 'SMIRNOFF ICE PACK 6 UND 11.2 oz' -- o par
+    mede 69.70 (token_set_ratio), por uma fracao abaixo do FUZZY_THRESHOLD
+    padrao (70). O codigo do PO e 'xxx' (placeholder, nunca cadastrado de
+    verdade) -- spec-codigo-placeholder-casa-por-nome libera o piso mais
+    baixo so pra esse candidato, nao pro resto do sistema."""
+    po_lines = [_po(1, "SMIRNOFF ICE PACK 6 UND 11.2 oz", supplier_unit_id="xxx",
+                     scancode="0820007238511", receipt_alias="SMIRNOFF ICE PACK 6 UND 11.2 oz")]
+    invoice = [_inv_code(10, "SMIRNOFF ICE ORIGINAL B24 11.2OZ 6P", item_code="10358")]
+
+    (match,) = match_items_po(invoice, po_lines)
+    assert match.match_level == "nome"
+    assert match.po_key == 1
+    assert match.ambiguous is True  # score < CONFIDENT_SCORE, vai pra conferencia
+
+
+def test_m2_mesmo_par_com_codigo_real_nao_placeholder_continua_unmatched():
+    """Mesmo par (mesmo score ~69.70), mas o PO tem um codigo REAL (nao
+    placeholder) -- o piso baixo NAO se aplica, continua abaixo do
+    FUZZY_THRESHOLD padrao e fica unmatched (comportamento de hoje)."""
+    po_lines = [_po(1, "SMIRNOFF ICE PACK 6 UND 11.2 oz", supplier_unit_id="99887766",
+                     receipt_alias="SMIRNOFF ICE PACK 6 UND 11.2 oz")]
+    invoice = [_inv_code(10, "SMIRNOFF ICE ORIGINAL B24 11.2OZ 6P", item_code="10358")]
+
+    (match,) = match_items_po(invoice, po_lines)
+    assert match.match_level == "unmatched"
+
+
+def test_m2_codigo_na_nao_colide_com_item_sem_relacao():
+    """Caso real invoice 1104: item_code 'NA-0001' (sem codigo de verdade)
+    normalizava pra '1' e colidia com o Supplier Unit ID de um item do PO
+    sem nenhuma relacao. Com o guard, a linha cai pro fuzzy de nome (ou
+    unmatched), nunca casa por codigo com o item errado."""
+    po_lines = [_po(1, "FEIJAO CARIOCA GALANTE 1KG", supplier_unit_id="1")]
+    invoice = [_inv_code(10, "COPO NADIR AMERICANO 24X190ML", item_code="NA-0001")]
+
+    (match,) = match_items_po(invoice, po_lines)
+    assert match.match_level == "unmatched"
+    assert match.po_key is None
+
+
+def test_m2_prefixo_alfanumerico_nao_colide_com_outro_prefixo():
+    """Achado real (fornecedor de salgadinhos): 'TOR-0003' (Salg. Cebola
+    Torcida) e 'BIS-0003' (outro produto, mesmo sequencial) sao codigos
+    DIFERENTES. Com a normalizacao antiga os dois colapsavam pro mesmo '3' e
+    o item certo ficava sem par pelo codigo. Preservando o prefixo, cada um
+    casa com a sua propria linha do PO."""
+    po_lines = [
+        _po(1, "SALG CEBOLA TORCIDA 60G", supplier_unit_id="TOR-0003"),
+        _po(2, "BISCOITO RECHEADO 60G", supplier_unit_id="BIS-0003"),
+    ]
+    invoice = [_inv_code(10, "Salgadinho Cebola", item_code="TOR-0003")]
+
+    (match,) = match_items_po(invoice, po_lines)
+    assert match.match_level == "codigo"
+    assert match.po_key == 1
+
+
+def test_m2_adrop_nao_colide_com_oil_mesmo_sequencial():
+    """Caso real (invoice Skyharvest USA LLC 13019, loja Dr. Phillips,
+    2026-10-27): item_code 'ADROP005' (American Drop Pineapple juice) e
+    Supplier Unit ID 'OIL005' (Azeite Olive Extra Virgem Selles 500ml) sao
+    produtos SEM NENHUMA RELACAO que colapsavam pro mesmo '5' na normalizacao
+    antiga (so digitos) e casavam por codigo errado — a invoice gravava
+    divergencia de preco/quantidade contra o azeite, e o item de azeite de
+    verdade ficava com o grupo poluido pela soma dos dois. Confirmado contra
+    o PO real `Skyharvest-037218-HQ-RS2`: com a letra preservada, cada codigo
+    casa com a sua propria linha."""
+    po_lines = [
+        _po(1, "Azeite Olive Extra Virgem Selles 500ml", supplier_unit_id="OIL005"),
+        _po(2, "Ad Juice Pinaple 490ml", supplier_unit_id="ADROP005"),
+    ]
+    invoice = [_inv_code(10, "American Drop 100% Pineapple juice with pulp",
+                          item_code="ADROP005")]
+
+    (match,) = match_items_po(invoice, po_lines)
+    assert match.match_level == "codigo"
+    assert match.po_key == 2
+
+
+def test_m2_prefixo_de_marca_na_invoice_cai_pro_fallback_so_digitos():
+    """Caso real (invoice Skyharvest USA LLC 13019, loja Dr. Phillips,
+    2026-10-27, spec-codigo-na-nao-casa R7-R9): item_code 'Elvan-1200711111'
+    (MAESTRO MASSIMO Savoilardy) nao bate com `norm_code` ('ELVAN1200711111')
+    contra o Supplier Unit ID real '1200711111' (sem o prefixo de marca que a
+    Vision colou). O fallback so digitos acha o par certo."""
+    po_lines = [_po(1, "Bolacha Champagne", supplier_unit_id="1200711111")]
+    invoice = [_inv_code(10, "MAESTRO MASSIMO Savoilardy (LADY FINGER)",
+                          item_code="Elvan-1200711111")]
+
+    (match,) = match_items_po(invoice, po_lines)
+    assert match.match_level == "codigo"
+    assert match.po_key == 1
+
+
+def test_m2_fallback_so_digitos_nao_reabre_colisao_tor_bis():
+    """O fallback nunca e tentado quando `norm_code` (com letra) ja bate —
+    'TOR-0003' continua casando com a linha certa, sem passar por 'BIS-0003'
+    no caminho (spec-codigo-na-nao-casa R8)."""
+    po_lines = [
+        _po(1, "SALG CEBOLA TORCIDA 60G", supplier_unit_id="TOR-0003"),
+        _po(2, "BISCOITO RECHEADO 60G", supplier_unit_id="BIS-0003"),
+    ]
+    invoice = [_inv_code(10, "Salgadinho Cebola", item_code="TOR-0003")]
+
+    (match,) = match_items_po(invoice, po_lines)
+    assert match.match_level == "codigo"
     assert match.po_key == 1
 
 
@@ -743,6 +899,22 @@ def test_qty_matches_po_cases_falta_de_dado_nao_bate():
     assert qty_matches_po_cases(Decimal("3"), None) is False
 
 
+def test_qty_matches_po_received_bate_ignorando_ordered():
+    """Caso real Florida Distributing: Ordered furado (24), quantity ja
+    multiplicado (144) bate exato com Received (144) -- Ordered nunca entra
+    na funcao (spec-caixa-letra-florida-distributing)."""
+    assert qty_matches_po_received(Decimal("144"), Decimal("144")) is True
+
+
+def test_qty_matches_po_received_diverge():
+    assert qty_matches_po_received(Decimal("6"), Decimal("144")) is False
+
+
+def test_qty_matches_po_received_falta_de_dado_nao_bate():
+    assert qty_matches_po_received(None, Decimal("144")) is False
+    assert qty_matches_po_received(Decimal("144"), None) is False
+
+
 def test_mesmo_item_estado_diferente_frango_fresco_e_congelado():
     """Caso real Prime Meats/1175605 (achado do cliente, Leandro Rocha): o
     lado congelado, sem UNSIZED/CVP, fica um subconjunto exato do lado
@@ -769,6 +941,82 @@ def test_mesmo_item_estado_diferente_bloqueia_grade_conflitante():
 
 def test_mesmo_item_estado_diferente_falta_de_descricao_nao_funde():
     assert mesmo_item_estado_diferente(None, "CHKN BREAST BL/SL FZN") is False
+
+
+def test_mesmo_item_estado_diferente_exige_estado_diferente_nos_dois_lados():
+    """Caso real Restaurant Depot/21460631281488440: as duas linhas de Red Bull
+    nao falam de estado nenhum, mas uma e subconjunto da outra -> davam 100 e
+    seriam SOMADAS contra uma unica linha de PO."""
+    assert mesmo_item_estado_diferente(
+        "Red Bull - Energy Drink, Sugar Free - 24/8.4 oz",
+        "Red Bull Energy Drink - 24/8.4 oz",
+    ) is False
+    # Mesmo estado dos dois lados tambem nao e variante de estado.
+    assert mesmo_item_estado_diferente(
+        "CHKN BREAST BL/SL DRY GEN FZN",
+        "CHKN BREAST BL/SL UNSIZED DRY GEN FZN CVP",
+    ) is False
+
+
+# ---------------------------------------------------------------------------
+# Desempate pelo score simetrico (subconjunto empata em 100)
+# ---------------------------------------------------------------------------
+
+# Caso real Restaurant Depot/21460631281488440 (nota sem divergencia nenhuma):
+# o nome do PO e mais curto, entao 'SUGAR FREE' sobrando na invoice nao custa
+# nada e tres dos quatro pares empatam em 100 no token_set_ratio.
+_RB_INV_SEM_ACUCAR = "Red Bull - Energy Drink, Sugar Free - 24/8.4 oz"
+_RB_INV_NORMAL = "Red Bull Energy Drink - 24/8.4 oz"
+_RB_PO_NORMAL = "Energy Drink Red Bull"
+_RB_PO_SEM_ACUCAR = "Energy Drink Red Bull Sugar free"
+
+
+def test_po_nome_mais_curto_nao_rouba_a_linha_da_variante():
+    invoice = [_inv_code(8, _RB_INV_SEM_ACUCAR, upc="61126912212"),
+               _inv_code(9, _RB_INV_NORMAL, upc="61126999124")]
+    po_lines = [_po(1, _RB_PO_NORMAL, ordered=1, received=1, invoiced_total_cost="44.0496"),
+                _po(2, _RB_PO_SEM_ACUCAR, ordered=1, received=1, invoiced_total_cost="45.6312")]
+
+    por_chave = {m.invoice_key: m for m in match_items_po(invoice, po_lines)}
+    assert por_chave[8].po_key == 2
+    assert por_chave[9].po_key == 1
+    assert por_chave[8].match_level == "nome"
+    assert por_chave[8].ambiguous is False
+
+
+def test_desempate_por_nome_nao_depende_da_ordem_das_linhas():
+    """O par vem da descricao, nao de quem aparece primeiro na nota ou no PO."""
+    invoice = [_inv_code(8, _RB_INV_SEM_ACUCAR), _inv_code(9, _RB_INV_NORMAL)]
+    po_lines = [_po(1, _RB_PO_NORMAL, ordered=1, received=1, invoiced_total_cost="44.05"),
+                _po(2, _RB_PO_SEM_ACUCAR, ordered=1, received=1, invoiced_total_cost="45.63")]
+
+    for inv, pos in ((invoice, po_lines), (invoice[::-1], po_lines),
+                     (invoice, po_lines[::-1]), (invoice[::-1], po_lines[::-1])):
+        por_chave = {m.invoice_key: m.po_key for m in match_items_po(inv, pos)}
+        assert por_chave == {8: 2, 9: 1}
+
+
+def test_empate_que_o_simetrico_nao_resolve_vai_para_revisao():
+    """Dois itens de PO com o mesmo nome: nada na descricao distingue, entao
+    casa (a nota tem o item) mas marcado para conferencia humana."""
+    invoice = [_inv_code(8, _RB_INV_NORMAL)]
+    po_lines = [_po(1, _RB_PO_NORMAL, ordered=1, received=1, invoiced_total_cost="44.05"),
+                _po(2, _RB_PO_NORMAL, ordered=1, received=1, invoiced_total_cost="44.05")]
+
+    (match,) = match_items_po(invoice, po_lines)
+    assert match.po_key == 1
+    assert match.ambiguous is True
+
+
+def test_desempate_por_nome_tambem_vale_na_frente_cotacao():
+    """Mesmo empate em 100 na Etapa 2 de `match_items` (preco nenhum bate)."""
+    quotes = [_quote(1, _RB_PO_NORMAL, "44.05"), _quote(2, _RB_PO_SEM_ACUCAR, "45.63")]
+    invoice = [_invoice(8, _RB_INV_SEM_ACUCAR, "99.99"), _invoice(9, _RB_INV_NORMAL, "88.88")]
+
+    por_chave = {m.invoice_key: m for m in _match(invoice, quotes)}
+    assert por_chave[8].quote_key == 2
+    assert por_chave[9].quote_key == 1
+    assert por_chave[8].match_level == "fuzzy"
 
 
 def test_invoice_line_total_usa_valor_linha_ou_cai_pro_fallback():

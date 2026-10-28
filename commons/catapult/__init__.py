@@ -187,7 +187,7 @@ def _confirmar_sessao_ativa_se_aparecer(page, timeout: int = 5_000) -> None:
 
 
 def open_catapult_session(
-    url: str, access_email: str, username: str, password: str, headless: bool = True,
+    url: str, access_email: str, username: str, password: str, headless: bool = False,
 ):
     """Abre uma sessão Playwright autenticada no Catapult: Access + login ECRS.
 
@@ -399,11 +399,11 @@ def open_worksheets(page, url: str, timeout: int = 30_000) -> None:
 
 def search_purchase_orders_by_supplier(
     page, supplier_name: str, match_type: str = "Contains", timeout: int = 20_000,
-    nomes_alternativos: tuple[str, ...] = (),
+    nomes_alternativos: tuple[str, ...] = (), mostrar_historico: bool = False,
 ) -> list[dict]:
     """Busca PO pelo nome do fornecedor (filtro 'Supplier' da tela
     Worksheets, categoria 'Purchase Order', Status='Ordered', 'Show History
-    For' sempre desmarcado — testado contra o ambiente real). Retorna uma
+    For' desmarcado por padrão — testado contra o ambiente real). Retorna uma
     linha por PO encontrado: `{'name': ..., 'href': ...}` — lista vazia é
     resultado normal (fornecedor sem PO 'Ordered' no momento), não erro.
 
@@ -418,37 +418,45 @@ def search_purchase_orders_by_supplier(
     `nomes_alternativos`: outros nomes do mesmo fornecedor (ex. o nome cru da
     invoice quando `supplier_name` já é o termo do de-para `dim_fornecedor_alias`)
     aceitos na conferência do filtro — ver `_conferir_filtro_aplicado`.
+
+    `mostrar_historico`: `True` busca PO já 'Committed' (fora do universo
+    'Ordered') — invoice antiga reprocessada, `spec-historico-po-catapult`.
     """
-    _preparar_filtros_po(page, timeout)
+    _preparar_filtros_po(page, timeout, mostrar_historico)
     return _buscar_worksheets_por_fornecedor(
         page, supplier_name, match_type, timeout, nomes_alternativos,
     )
 
 
-def _preparar_filtros_po(page, timeout: int) -> None:
-    """Põe a tela Worksheets em categoria 'Purchase Order' + Status 'Ordered'.
+def _preparar_filtros_po(page, timeout: int, mostrar_historico: bool = False) -> None:
+    """Põe a tela Worksheets em categoria 'Purchase Order' + Status 'Ordered'
+    (ou, com `mostrar_historico=True`, em 'Show History For' marcado — PO
+    antigas, já 'Committed', `spec-historico-po-catapult`).
 
     Separado de `search_purchase_orders_by_supplier` para o `try` caber numa
     função só (um `try` por função, sem aninhar) — aqui estão todas as
     interações que podem estourar timeout antes da busca em si.
     """
-    # Desmarca o histórico ANTES de mexer no Status: o dropdown de Status
-    # fica DESABILITADO enquanto 'Show History For' está marcado (confirmado
-    # contra o ambiente real — mesmo estilo visual/bloqueio do dropdown de
-    # ano ao lado). Fazer na ordem inversa trava em select_option esperando
-    # o elemento ficar habilitado (timeout de 30s, nunca acontece).
+    # Alterna o histórico ANTES de mexer no Status: o dropdown de Status fica
+    # DESABILITADO enquanto 'Show History For' está marcado (confirmado contra
+    # o ambiente real). Fazer na ordem inversa trava em select_option
+    # esperando o elemento ficar habilitado (timeout de 30s, nunca acontece).
+    # Com `mostrar_historico=True` o Status fica desabilitado de propósito —
+    # não seleciona nada nele; o dropdown de ano ao lado
+    # (`historyRangeFilter`) já vem no ano corrente por padrão.
     try:
         page.wait_for_selector(_SEL_WORKSHEET_CATEGORY, timeout=timeout)
         page.select_option(_SEL_WORKSHEET_CATEGORY, label="Purchase Order")
         page.wait_for_timeout(400)
 
         checkbox = page.locator(_SEL_SHOW_HISTORY_CHECKBOX)
-        if checkbox.is_checked():
+        if checkbox.is_checked() != mostrar_historico:
             page.locator(_SEL_SHOW_HISTORY_LABEL).click(timeout=timeout)
             page.wait_for_timeout(800)
 
-        page.select_option(_SEL_STATUS_FILTER, label="Ordered")
-        page.wait_for_timeout(400)
+        if not mostrar_historico:
+            page.select_option(_SEL_STATUS_FILTER, label="Ordered")
+            page.wait_for_timeout(400)
     except PwError as exc:
         _debug_dump(page, "catapult_filtros_po")
         raise IntegracaoException(
@@ -484,17 +492,24 @@ def _buscar_worksheets_por_fornecedor(
 
 def search_purchase_orders_by_invoice(
     page, invoice_number: str, match_type: str = "Equals", timeout: int = 20_000,
+    mostrar_historico: bool = False,
 ) -> list[dict]:
     """Busca PO pelo número da invoice (campo 'Invoice Reference', operador
     `match_type`), com os mesmos filtros da busca por fornecedor (categoria
-    Purchase Order, Status='Ordered', histórico desmarcado). É a busca
-    PRIORITÁRIA; a por nome (`search_purchase_orders_by_supplier`) é fallback.
+    Purchase Order, Status='Ordered', histórico desmarcado por padrão). É a
+    busca PRIORITÁRIA; a por nome (`search_purchase_orders_by_supplier`) é
+    fallback.
 
     Lista vazia é resultado normal (nenhuma PO com essa referência), não erro.
     Com 'Equals' só vem PO cuja referência é exatamente este número; quem chama
     ainda confere os itens (`escolher_po_por_itens`) antes de gravar no PO.
+
+    `mostrar_historico`: `True` busca PO já 'Committed' (fora do universo
+    'Ordered') — invoice antiga reprocessada, `spec-historico-po-catapult`.
+    Testado contra o Catapult real: a busca por Invoice Reference funciona
+    igual nos dois modos.
     """
-    _preparar_filtros_po(page, timeout)
+    _preparar_filtros_po(page, timeout, mostrar_historico)
     _aplicar_filtro_busca(page, "Invoice Reference", invoice_number, match_type)
     try:
         page.wait_for_selector(_SEL_RESULT_LINKS, timeout=timeout)

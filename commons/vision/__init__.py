@@ -165,6 +165,52 @@ Pay special attention to:
    here. Extract both numbers faithfully and let the downstream
    reconciliation — which does have the purchase order — pick the right
    one.
+   ONLY when the supplier on this invoice is Florida Distributing, and ONLY
+   for the EXACT literal codes "B24" or "C24" (capital B or C immediately
+   followed by exactly the digits "24", nothing else) written right before
+   the per-unit size — e.g. "HEINEKEN ... B24 12OZ 6P", "AMSTEL LIGHT C24
+   12OZ 12P": the same multiplier pattern above applies, with N=24 (the real
+   case size). Apply the exact same rule: `quantity` = Qty(printed) x 24,
+   `cases` = Qty(printed). Do NOT generalize this to any other
+   letter+number you see on a Florida Distributing invoice — e.g. "C2" in
+   "HEINEKEN C2 5L" is part of that product's own name (a keg/barrel size
+   code), not a case-size indicator, and must NOT be multiplied; only the
+   literal "B24"/"C24" triggers this rule. On any other supplier, a code
+   like "B24"/"C24" is NOT a pack-size multiplier either — leave it alone.
+
+9. QTD_CAIXA — how many individual items are packed into ONE box/case/pack/
+   display of this line, captured from any of these clear commercial
+   notations (capture ONLY the count number, never the weight/volume/size):
+   - "<N>X<size><UNIT>" in the description — same N as rule 8, e.g.
+     "12x400g" -> 12, "90x30g" -> 90.
+   - "<size><UNIT> X <N>" — the reverse order, size first then the count,
+     e.g. "200GR X15" -> 15, "60gr X12" -> 12.
+   - "<N>/<size><UNIT>" — pack column or in the description, e.g.
+     "24/0.5L" -> 24, "12/1 QT" -> 12, "20/1LB" -> 20.
+   - "PK <N>" with nothing after the number, e.g. "PK 100" -> 100,
+     "PK 50" -> 50. NOT "PK <N>/<something>" (e.g. "PK 2/100", "PK 1000/CS")
+     — that's a compound, ambiguous code, leave null.
+   - "<N>-Pk" / "<N>PACK" / "<N> PACK", e.g. "10-Pk" -> 10, "20PACK" -> 20,
+     "4 PACK" -> 4.
+   - "X<N>" on its own, or "BOX X<N>", e.g. "X12" -> 12, "BOX X24" -> 24.
+     Never the "x" that's already part of an "<N>X<size>" pattern above.
+   - "<N> roll(s) per box", e.g. "1 roll per box" -> 1.
+   - "<N> pcs" / "<N> items" standalone at the end of the description (the
+     most common form in practice: "<description> | <weight> | <N> pcs" or
+     "<description> | <N> items"), e.g. "WAFER MIX 270 g | 270 g | 6 pcs"
+     -> 6, "Quickbury Cookie selection in bag | 400 gr | 16 items" -> 16.
+     NOT "1 pc" alone — that is display material (shelf talker, wobbler),
+     not a real box of product; leave it null.
+   Leave `qtd_caixa` null — never guess a number — when none of these exact
+   patterns match, or the code is ambiguous/compound, or it's a stock
+   indicator rather than a pack size: e.g. "B24", "C24", "6P" (unclear
+   commercial code, not confirmed as a count), "CS 0, PC 2" / "CS 1, PC 0"
+   (inventory counters: cases-in-stock and pieces-in-stock, not a pack
+   size), "PK 2/100" and any other "PK <N>/<N>" compound, "4/125", "6X5
+   COSTA RICA (30)", "4/10H" (all ambiguous per the client's own reference
+   sheet — don't interpret them), or a pure weight like "20 Lbs Case" (a
+   total weight, not an item count). `qtd_caixa` is independent of `cases`:
+   never recompute `quantity`, `cases` or `total_price` from it.
 
 Return this exact JSON structure (use null for unknown fields):
 {
@@ -197,6 +243,7 @@ Return this exact JSON structure (use null for unknown fields):
       "unit_price": null,
       "total_price": null,
       "cases": null,
+      "qtd_caixa": null,
       "handwritten_code": null,
       "handwritten_notes": null
     }

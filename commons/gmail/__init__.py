@@ -80,10 +80,18 @@ def fetch_otp_code(
     Cloudflare Access disparar. `desde` evita pegar o código de uma tentativa
     de login anterior que ainda esteja na caixa.
 
+    A query do Gmail (`q=`) usa só `from:`, sem `after:` — testado ao vivo
+    contra a caixa real (spec-gmail-otp-precisao-minuto): o operador `after:`
+    com epoch do Gmail só tem precisão de MINUTO (trunca os segundos), o que
+    já fez o login travar esperando um código que tinha acabado de chegar. O
+    corte "é desta tentativa" é feito aqui, comparando o `internalDate` (epoch
+    em milissegundos, exato) de cada mensagem contra `desde`.
+
     Levanta `GmailOtpTimeout` se nada chegar dentro de `timeout` segundos.
     """
     service = _service()
-    query = f"from:{remetente} after:{int(desde.timestamp())}"
+    query = f"from:{remetente}"
+    desde_ms = int(desde.timestamp() * 1000)
     prazo = time.monotonic() + timeout
 
     while True:
@@ -95,6 +103,8 @@ def fetch_otp_code(
             msg = service.users().messages().get(
                 userId="me", id=ref["id"], format="full",
             ).execute()
+            if int(msg.get("internalDate", 0)) < desde_ms:
+                continue  # codigo de uma tentativa de login anterior
             codigo = _CODE_RE.search(_corpo_texto(msg))
             if codigo:
                 return codigo.group(1)

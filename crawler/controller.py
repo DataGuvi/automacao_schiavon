@@ -82,7 +82,7 @@ def _rodar_fluxos(config: Config, pipeline: Pipeline) -> None:
     # Baixa os PDFs da semana no SharePoint, manda o Claude Vision ler e
     # grava em fat_invoice / fat_invoice_item.
     # ------------------------------------------------------------------
-    pipeline.rodar(2, "Invoices", lambda: invoices_flow(config))
+    #pipeline.rodar(2, "Invoices", lambda: invoices_flow(config))
 
     # ------------------------------------------------------------------
     # FLUXO 3/6 -- Cotação semanal de carnes

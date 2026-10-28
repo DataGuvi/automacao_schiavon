@@ -618,7 +618,21 @@ def save_reconciliation_header(conn, data: dict) -> int:
     return id_conc
 
 
-def save_reconciliation_items(conn, id_recon_header: int, rows: list[dict]) -> int:
+def _calcular_dif_valor(dif, qtd, comparacao: str):
+    """`dif_valor` (`spec-dif-valor-erp-nao-multiplica`): na frente ERP `dif` já
+    é diferença de VALOR TOTAL da linha/grupo — não multiplica por `qtd`. Na
+    frente cotação `dif` é diferença de PREÇO UNITÁRIO — `dif x qtd` fecha o
+    impacto total da linha (comportamento de sempre)."""
+    if dif is None:
+        return None
+    if comparacao == "erp":
+        return dif
+    return (dif * qtd) if qtd is not None else None
+
+
+def save_reconciliation_items(
+    conn, id_recon_header: int, rows: list[dict], comparacao: str = "cotacao",
+) -> int:
     """Grava as linhas comparadas. Calcula `dif_valor`, que é o que o BI soma.
 
     `item_referencia` aceita `item_name_quote` (frente cotação) ou
@@ -633,6 +647,8 @@ def save_reconciliation_items(conn, id_recon_header: int, rows: list[dict]) -> i
     comparar. Linhas que casaram com o MESMO item do PO repetem esses valores:
     a comparação é feita pelo grupo somado, não linha a linha (ver
     `conciliacao/reconcile_erp.py::_comparar_grupo`).
+
+    `comparacao` decide a fórmula de `dif_valor` — ver `_calcular_dif_valor`.
     """
     if not rows:
         return 0
@@ -641,7 +657,7 @@ def save_reconciliation_items(conn, id_recon_header: int, rows: list[dict]) -> i
     for r in rows:
         veredito = _status_conciliacao(r.get("issue_codes"))
         dif, qtd = r.get("price_diff"), r.get("qty_invoice")
-        dif_valor = (dif * qtd) if (dif is not None and qtd is not None) else None
+        dif_valor = _calcular_dif_valor(dif, qtd, comparacao)
         item_referencia = r.get("item_name_quote") or r.get("item_name_po")
         dados.append((
             id_recon_header, r["id_invoice_item"],

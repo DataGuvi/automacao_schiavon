@@ -50,6 +50,7 @@ from commons.matcher import (
     po_items_sem_invoice,
     qty_matches_po,
     qty_matches_po_cases,
+    qty_matches_po_received,
 )
 from commons.logging_config import get_logger
 from domain.conciliacao_codes import IssueCode
@@ -87,6 +88,21 @@ _TOLERANCIA_POR_FORNECEDOR: dict[str, tuple[Decimal, Decimal]] = {
     "JULINA": _TOLERANCIA_SUBCENTAVO,
     "FRESHPOINT": _TOLERANCIA_ZERO,
 }
+
+
+# --- Quantidade: confiar so em Received (spec-caixa-letra-florida-distributing) ---
+#
+# `Ordered` furado em quase toda linha da PO real da Florida Distributing (nem
+# bate com a quantidade impressa nem com `Received`) - so `Received` e confiavel
+# pra esse fornecedor. Escopado por substring do nome lido, mesmo estilo de
+# `_TOLERANCIA_POR_FORNECEDOR` acima - nunca um comportamento novo pra quem nao
+# bate.
+_FORNECEDORES_CONFIAR_RECEIVED: tuple[str, ...] = ("FLORIDA DISTRIBUT",)
+
+
+def _confiar_so_received(supplier_name: str | None) -> bool:
+    nome_norm = norm_supplier(supplier_name)
+    return any(f in nome_norm for f in _FORNECEDORES_CONFIAR_RECEIVED)
 
 
 # --- Tolerancia de 1.00 no valor da linha (spec-tolerancia-preco-1) ----------
@@ -374,6 +390,7 @@ def reconcile_items_against_po(
 
     abs_tol, pct_tol = _resolver_tolerancia_preco(supplier_name, categoria_fornecedor)
     is_carne = categoria_fornecedor == "carne"
+    confiar_so_received = _confiar_so_received(supplier_name)
 
     grupos: dict[Any, list[dict]] = {}
     for item in items:
@@ -385,6 +402,7 @@ def reconcile_items_against_po(
         po_key: _comparar_grupo(
             grupo, po_by_key[po_key], abs_tol, pct_tol, is_carne,
             _grupo_isento(grupo, supplier_name, categoria_fornecedor) or not aplicar_ajustes,
+            confiar_so_received,
         )
         for po_key, grupo in grupos.items()
     }
@@ -559,7 +577,7 @@ def _po_unidade_individual(unit: str | None) -> bool | None:
 
 def _comparar_grupo(
     grupo: list[dict], po: POLine, abs_tol: Decimal, pct_tol: Decimal, is_carne: bool,
-    isento: bool,
+    isento: bool, confiar_so_received: bool = False,
 ) -> dict:
     """Compara a SOMA de um grupo de linhas da invoice (todas casadas com o
     mesmo item do PO) contra `po.ordered`/`received`/`invoiced_total_cost`.
@@ -591,7 +609,16 @@ def _comparar_grupo(
     que a Vision extrai em `total_price`, nunca recalculado pelo
     multiplicador de pack), porque é dinheiro — não muda com a unidade em
     que a quantidade é contada. Só a comparação de QUANTIDADE depende de
-    `po.unit`; o valor usa sempre `invoice_line_total`, como sempre foi."""
+    `po.unit`; o valor usa sempre `invoice_line_total`, como sempre foi.
+
+    `confiar_so_received` (spec-caixa-letra-florida-distributing, resolvido por
+    fornecedor por quem chama): `Ordered` pode estar furado pra esse fornecedor
+    (não bate nem com a invoice nem com `Received`) — nesse caso a comparação
+    usa só `Received` (`qty_matches_po_received`), nunca `Ordered`, nos DOIS
+    caminhos (caixa e quantidade): no caminho de caixa, `cases` entra contra
+    `Received` (confirmado: PO "Case" desse fornecedor tem `Received` na MESMA
+    unidade de `cases`, não de peças); fora dele, `quantity` entra contra
+    `Received`. Com `False` (todo o resto do sistema), nada muda."""
     single_unit = _po_unidade_individual(po.unit)
     usar_caixa = (not single_unit) if single_unit is not None else is_carne
     qtd_total = _soma_ou_none(i.get("quantity") for i in grupo)
@@ -606,15 +633,28 @@ def _comparar_grupo(
     total_po = po.invoiced_total_cost if ajuste is None else ajuste
     verdict = compare_price(valor_total, total_po, abs_tol=abs_tol, pct_tol=pct_tol)
     if usar_caixa and cases_total is not None:
-        qty_ok = qty_matches_po_cases(cases_total, po.ordered)
         qtd_comparada = cases_total
+        if confiar_so_received:
+            # Mesmo fornecedor, mesma razao: `Ordered` furado, `Received` esta
+            # na MESMA unidade de `cases` quando a PO e "Case" (confirmado:
+            # Lite Miller, Unit='Case', Ordered=0, Received=2 = cases da invoice).
+            qty_ok = qty_matches_po_received(cases_total, po.received)
+            po_lado = po.received
+        else:
+            qty_ok = qty_matches_po_cases(cases_total, po.ordered)
+            po_lado = po.ordered
+    elif confiar_so_received:
+        qty_ok = qty_matches_po_received(qtd_total, po.received)
+        qtd_comparada = qtd_total
+        po_lado = po.received
     else:
         qty_ok = qty_matches_po(qtd_total, po.ordered, po.received)
         qtd_comparada = qtd_total
-    # Contra `Ordered` nas duas pontas: é o único número do PO que está na
-    # mesma unidade do que se compara (caixa no açougue, quantidade no resto).
-    qty_diff = (qtd_comparada - po.ordered) \
-        if (qtd_comparada is not None and po.ordered is not None) else None
+        # Contra `Ordered` nas duas pontas: é o único número do PO que está na
+        # mesma unidade do que se compara (caixa no açougue, quantidade no resto).
+        po_lado = po.ordered
+    qty_diff = (qtd_comparada - po_lado) \
+        if (qtd_comparada is not None and po_lado is not None) else None
     return {
         "qty_ok": qty_ok,
         "price_ok": verdict.status == "ok",

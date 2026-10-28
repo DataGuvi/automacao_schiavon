@@ -397,6 +397,44 @@ def test_po_case_compara_cases_nao_quantity_multiplicada():
     assert linha["has_issue"] is False
 
 
+def test_po_case_ordered_1_com_cases_derivado_de_qtd_caixa_confere():
+    """Caso real (invoice Skyharvest 13019, replay 2026-10-28): 'Florbu WAFER MIX
+    270 g | 270 g | 6 pcs', quantity=6 (pecas faturadas), PO 'Case' com Ordered=1
+    (1 caixa). O schema da Vision (spec-cases-derivado-qtd-caixa) deriva
+    cases=quantity/qtd_caixa=6/6=1 quando a divisao e exata -- aqui simulado
+    direto no item (`cases='1'`), como o schema ja teria preenchido. Antes dessa
+    derivacao a linha dava QTY_MISMATCH_PO falso (6 pecas x Ordered=1 caixa)."""
+    po_lines = [_po(1, "Wafer Mix No Added Sugar", supplier_unit_id="1706",
+                     ordered="1", received="1", invoiced_total_cost="30.00", unit="Case")]
+    items = [_item(100, "Florbu WAFER MIX 270 g | 270 g | 6 pcs", "6", "5.00",
+                    total_price="30.00", cases="1", item_code="1706")]
+
+    resultado = reconcile_items_against_po(items, po_lines)
+    (linha,) = resultado["items"]
+    assert linha["qty_diff"] == Decimal("0")
+    assert QTY_MISMATCH_PO not in linha["issue_codes"]
+    assert linha["has_issue"] is False
+
+
+def test_po_single_unit_ignora_cases_derivado_mesmo_presente():
+    """Contraprova (mesma invoice Skyharvest 13019): 'Quickbury Cookie selection
+    in bag | 400 gr | 16 items', quantity=16, PO com Ordered=16 JA EM PECAS
+    ('Single Unit' -- nao 'Case'). Mesmo que o schema tenha derivado cases=1
+    (16/16), a comparacao tem que IGNORAR esse cases e usar quantity direto,
+    porque po.unit diz 'Single Unit' -- senao 1 (cases) x Ordered=16 quebraria
+    uma linha que hoje bate certo."""
+    po_lines = [_po(1, "Quickbury Cookie Selection", ordered="16", received="16",
+                     invoiced_total_cost="63.04", unit="Single Unit")]
+    items = [_item(100, "Quickbury Cookie selection in bag | 400 gr | 16 items", "16",
+                    "3.94", total_price="63.04", cases="1")]
+
+    resultado = reconcile_items_against_po(items, po_lines)
+    (linha,) = resultado["items"]
+    assert linha["qty_diff"] == Decimal("0")
+    assert QTY_MISMATCH_PO not in linha["issue_codes"]
+    assert linha["has_issue"] is False
+
+
 def test_linha_sem_po_nao_inventa_numero_do_lado_po():
     """Sem par no PO nao ha contra o que comparar: as colunas do lado PO
     ficam ausentes (viram NULL no banco), nunca zero."""
@@ -599,6 +637,58 @@ def test_tolerancia_freshpoint_exige_valor_exato():
     )
     (linha,) = resultado["items"]
     assert PRICE_MISMATCH_PO in linha["issue_codes"]
+
+
+def test_florida_distributing_confia_so_received_quando_ordered_furado():
+    """Caso real: invoice Florida Distributing 200488064, item Heineken B24 --
+    Vision ja aplicou o multiplicador (quantity=144, 6x24), PO real tem
+    Ordered=24 (furado, nao bate com nada) e Received=144 (confiavel).
+    confiar_so_received so entra em cena pra esse fornecedor (spec-caixa-
+    letra-florida-distributing) -- CONFERIDO, Ordered nunca e olhado."""
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294",
+                     ordered="24", received="144", invoiced_total_cost="230.28")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "144", "1.5992", "230.28", item_code="10294")]
+
+    resultado = reconcile_items_against_po(
+        items, po_lines, supplier_name="Florida Distributing",
+    )
+    (linha,) = resultado["items"]
+    assert QTY_MISMATCH_PO not in linha["issue_codes"]
+    assert linha["qty_diff"] == Decimal("0")
+
+
+def test_florida_distributing_confia_received_tambem_no_caminho_de_caixa():
+    """Caso real: 'LITE B24 12OZ 6P' nessa mesma invoice -- a PO dessa linha
+    especifica esta em Unit='Case' (diferente das irmas 'Single Unit'),
+    entao cai no caminho de caixa (usar_caixa). Ordered=0 (furado), Received=2
+    bate com cases=2 da invoice -- confiar_so_received tem que valer tambem
+    nesse caminho, nao so no de quantidade."""
+    po_lines = [_po(1, "Cerveja Lite Miller", supplier_unit_id="034100575052",
+                     ordered="0", received="2", invoiced_total_cost="2.7288", unit="Case")]
+    items = [_item(100, "LITE B24 12OZ 6P", "48", "1.3644", "2.7288",
+                    item_code="034100575052", cases="2")]
+
+    resultado = reconcile_items_against_po(
+        items, po_lines, supplier_name="Florida Distributing",
+    )
+    (linha,) = resultado["items"]
+    assert QTY_MISMATCH_PO not in linha["issue_codes"]
+    assert linha["qty_diff"] == Decimal("0")
+
+
+def test_mesmo_cenario_fora_de_florida_distributing_continua_divergente():
+    """Mesmo PO/item, OUTRO fornecedor: confiar_so_received nao entra, o
+    comportamento de hoje (exige Ordered x Received batendo) se mantem --
+    prova que o escopo por fornecedor protege o resto do sistema."""
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294",
+                     ordered="24", received="144", invoiced_total_cost="230.28")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "144", "1.5992", "230.28", item_code="10294")]
+
+    resultado = reconcile_items_against_po(
+        items, po_lines, supplier_name="Outro Fornecedor Qualquer",
+    )
+    (linha,) = resultado["items"]
+    assert QTY_MISMATCH_PO in linha["issue_codes"]
 
 
 if __name__ == "__main__":

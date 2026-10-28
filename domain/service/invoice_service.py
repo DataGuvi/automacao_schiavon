@@ -288,6 +288,7 @@ def save_invoice(
                 truncar(getattr(item, "upc", None), 20),
                 getattr(item, "cases", None),
                 truncar(getattr(item, "handwritten_code", None), 40),
+                getattr(item, "qtd_caixa", None),
             ))
         if linhas:
             cur.executemany(
@@ -295,8 +296,8 @@ def save_invoice(
                 INSERT INTO {SCHEMA}.fat_invoice_item
                     (id_invoice, ordem, descricao, tipo_linha, qtd, unidade,
                      preco_unit, valor_linha, anotacao_manual, item_code, upc,
-                     caixas, codigo_manual)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     caixas, codigo_manual, qtd_caixa)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 linhas,
             )

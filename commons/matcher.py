@@ -1,75 +1,343 @@
-"""Motor de match e comparacao — normalizacao, tolerancia e casamento de itens.
+"""Motor de match e comparacao - normalizacao, tolerancia e casamento de itens.
 
 Este modulo NAO importa nada do projeto (so stdlib + rapidfuzz), de proposito:
 assim ele e testavel sem Postgres e pode ser reaproveitado pela frente ERP. O
 de-para de vocabulario de item (antes o dict `_SINONIMOS_ITEM`) entra por
 parametro (`sinonimos`), carregado do banco pelo chamador.
 
-A cascata de match esta em `match_items()`; a justificativa de por que o preco
-nao pode ser chave unica do par esta no docstring de la.
+===========================================================================
+REGRAS DE NEGOCIO E DECISOES DE PROJETO
+Toda a justificativa fica aqui; as funcoes abaixo levam so o resumo de uma
+linha e uma referencia a secao.
+===========================================================================
+
+1. TOLERANCIA DE VALOR (`ABS_TOL`, `PCT_TOL`, `within_tolerance`)
+   So e divergencia se estourar os DOIS limites: 1 centavo num item de 2 dolares
+   e percentualmente grande mas irrelevante, e 0,3% num item de 500 dolares e o
+   arredondamento de sempre. Faltando um dos lados, "nao da pra comparar" conta
+   como NAO bate - quem chama decide o que fazer com o None.
+
+2. PRECO POR LIBRA x POR CAIXA (`is_unit_priced`)
+   A cotacao e sempre por LB. Na invoice de carne o `unit_price` tambem e por LB
+   mesmo com `unit='CS'`: o total fecha com o peso, nao com a contagem de caixas
+   (3 CS x 6.01 != 1256.09, mas 209.00 lb x 6.01 == 1256.09). Numa linha vendida
+   por caixa/unidade, ao contrario, quantidade x preco fecha o total (1 x 85.90
+   de uma caixa de alface) - essa linha nao e comparavel com preco por libra,
+   dai `unit_mismatch`. A coluna `unit` nao serve pra isso: esta suja ('CASE',
+   'case', 'CS', 'CX', '25#') e nula em quase 10% dos itens.
+   A cotacao as vezes traz uma FAIXA ('$4.95/5.35/$5.41'); a faixa inteira conta
+   como dentro do combinado (`parse_price_range`). Convencao do projeto:
+   `diff = invoice - cotacao` (positivo = cobraram a mais).
+
+3. VOCABULARIO DE ITEM (`norm_item`, parametro `sinonimos`)
+   `norm_text` sozinho nao basta porque os dois lados falam linguas diferentes
+   sobre o mesmo produto. Medido nos 4 itens reais em base, so 1 dos 4 pares
+   corretos alcancava o piso antigo de 60; com os dois passos abaixo os 4 passam
+   de 88, com margem de +41 a +58 sobre o segundo colocado.
+   - Passo 1, cauda de catalogo: ' - AMICK, Item #227059' (invoice) e ' - 40622'
+     (cotacao) sao estrutura, nao vocabulario. Do outro lado nao existem, entao
+     so diluem o score.
+   - Passo 2, de-para `sinonimos` ({token -> termo alvo}): abreviacao de mercado,
+     traducao PT/EN, sinonimo de corte. Era um dict hardcoded aqui; virou dado de
+     banco (dwschiavon2.dim_item_sinonimo), alimentado pela aba De-Para de uma
+     planilha do Google Sheets (conciliacao/sinonimos.py; entradas iniciais
+     migradas em manutencao/migrar_sinonimos_sheets.py) e injetado por parametro
+     pra nao quebrar a regra de este modulo nao importar nada do projeto.
+     A FRASE inteira e trocada ANTES dos tokens, senao 'CHIX TENDER' viraria
+     'CHICKEN TENDER' e nao casaria com a frase cadastrada. Aplicado aos DOIS
+     lados. `sinonimos=None` degrada com seguranca: sem o de-para o unico token
+     em comum entre 'CHIX TENDER JUMBO CVP' e 'CHICKEN - Tender / Sassami de
+     Frango' e 'TENDER' e o par correto faz 46 - errar pra menos e seguro, nunca
+     casa produto errado.
+   O resultado e texto de COMPARACAO: nunca exibir ao usuario.
+
+4. PISOS DE SIMILARIDADE (`EXACT_MIN_SCORE`, `FUZZY_THRESHOLD`, `CONFIDENT_SCORE`)
+   Os tres numeros foram RECALIBRADOS junto com `norm_item`. Antes dele a
+   comparacao era feita sobre o texto cru, onde marca, codigo de catalogo e nome
+   em portugues diluiam o score; os pisos antigos (60/50/70) refletiam essa nuvem
+   achatada - o comentario original registrava "o melhor par CORRETO observado
+   faz 69". Com `norm_item`, medido sobre os 4 pares corretos e 5 pares errados
+   que existem em base, as duas nuvens se separam:
+       pares corretos   88.0 .. 91.9
+       pares errados    24.6 .. 50.0   (o pior e Chuck Roll x Knuckle, 50.0)
+   Vao de 38 pontos; os pisos ficam dentro dele, longe das duas bordas.
+   ATENCAO ao mexer: sao 9 pares medidos, amostra pequena. Subir demais volta a
+   perder par correto em silencio (sai como 'no_quote_for_item'); descer demais
+   ressuscita o falso positivo por preco que o teste
+   `test_preco_igual_nao_basta_para_casar_produtos_sem_relacao` guarda. Qualquer
+   mudanca aqui deve ser medida de novo, nao estimada.
+   - `EXACT_MIN_SCORE` (65): Etapa 1 de `match_items`, onde o preco ja bate e a
+     descricao so precisa dar apoio minimo. Sem este piso, dois produtos sem
+     relacao casam so por custarem o mesmo: "Beef, Chuck Roll 'Neck Off'
+     Boneless" casou com "BEEF - Knuckle / Patinho" porque ambos custavam 4.99 e
+     era o unico candidato.
+   - `FUZZY_THRESHOLD` (70): Etapa 2, onde a descricao decide SOZINHA, sem apoio
+     do preco - piso mais alto que o da Etapa 1 justamente por isso.
+     `token_set_ratio` no lugar de `token_sort_ratio` porque a invoice carrega
+     marca e pack size a mais, e o sort_ratio pune diferenca de tamanho.
+   - `CONFIDENT_SCORE` (70): acima do piso mas abaixo disto o par se sustenta em
+     pouca evidencia textual. Aceita, mas marca `ambiguous` pra conferencia
+     humana: se o produto estiver errado, a divergencia verdadeira passa
+     despercebida como "coerente". Mantido em 70 de proposito - o corpus nao
+     sustenta valor mais alto: tirando os pares que `grades_conflict` ja barra
+     antes do score, o pior par CORRETO faz 88.0 e o pior par ERRADO faz 86.8
+     ('CHICKEN Breast Boneless' x 'CHICKEN Thighs Boneless', que so diferem no
+     corte). As nuvens quase se tocam, entao nao existe fronteira de confianca
+     defensavel nessa faixa - quem separa esse par e a atribuicao 1-para-1
+     gulosa da Etapa 2, nao o piso.
+
+5. DESEMPATE PELO SCORE SIMETRICO (`token_sort_ratio`)
+   `token_set_ratio` devolve EXATAMENTE 100 sempre que os tokens de um lado sao
+   subconjunto do outro. O nome do Catapult/cotacao e quase sempre mais curto que
+   a descricao da invoice, entao o token que DISTINGUE dois produtos parecidos
+   (sem acucar, sabor, tamanho, corte, cor) sai de graca quando aparece de um
+   lado so, e varias linhas da invoice empatam em 100 contra o mesmo nome.
+   Enquanto o empate era resolvido pela ORDEM das linhas, quem decidia o par nao
+   era a descricao. Caso real Restaurant Depot/21460631281488440 (nota sem
+   divergencia nenhuma):
+                                          token_set   token_sort
+       inv 'Red Bull ... Sugar Free' x PO 'Energy Drink Red Bull'
+                                             100.00        66.67  <- vencia, ERRADO
+       inv 'Red Bull ... Sugar Free' x PO '... Red Bull Sugar free'
+                                             100.00        86.49  <- par certo
+       inv 'Red Bull Energy Drink'   x PO 'Energy Drink Red Bull'
+                                             100.00        80.77  <- par certo
+       inv 'Red Bull Energy Drink'   x PO '... Red Bull Sugar free'
+                                              80.77        69.84
+   A linha do Sugar Free chegou primeiro, levou o PO normal e sobrou pro normal o
+   PO Sugar free: duas divergencias de preco que nao existem, as duas sem
+   `revisar` (100 e 80.77 passam do CONFIDENT_SCORE). `token_sort_ratio` e o
+   sinal que faltava - pune token sobrando em QUALQUER um dos dois lados - e
+   separa os tres empates acima.
+   Ele entra SO como critetio de desempate, nunca como piso nem misturado ao
+   score principal, porque em par CORRETO ele e baixo (a invoice carrega marca,
+   pack size e codigo que o outro lado nao tem): medido nos pares corretos em
+   base, 'BEEF PEELED KNUCKLE 3230...' x 'BEEF KNUCKLE KNUCKLE' faz set 100.00 /
+   sort 53.57, e 'CHICKEN TENDER JUMBO CVP' x 'CHICKEN TENDER TENDER DE CHICKEN'
+   faz set 90.32 / sort 60.71. Piso simetrico derrubaria par certo em silencio.
+   Ordem de atribuicao: `(-score, -score_simetrico, i, j)` - a ordem das linhas
+   fica como ultimo critetio, so pra o resultado ser deterministico. Empate que o
+   simetrico tambem nao resolve (dois candidatos com os DOIS scores iguais) sai
+   com `ambiguous`: nada na descricao distingue os dois. Ver
+   `_atribuir_guloso`, a atribuicao das duas frentes.
+
+6. GRADES DE CARNE (`grades_in`, `grades_conflict`)
+   CHOICE e SELECT sao cortes diferentes com precos diferentes; casa-los
+   produziria uma divergencia que nao existe. Dois lados citando grades sem nada
+   em comum nunca casam, em nenhuma etapa.
+
+7. FRESCO x CONGELADO NA MESMA INVOICE (`mesmo_item_estado_diferente`)
+   Caso real Prime Meats/1175605 (achado do cliente, Leandro Rocha): 'CHKN BREAST
+   BL/SL DRY GEN FZN' e 'CHKN BREAST BL/SL UNSIZED DRY GEN FRSH CVP' sao o mesmo
+   peito de frango pra quem recebe - so uma parte do pedido veio congelada e a
+   outra fresca. Estado e forma de entrega, nao identidade do produto, entao as
+   palavras de estado (`_PALAVRAS_ESTADO`) ficam FORA do de-para de sinonimos de
+   proposito: isto e regra de agrupar duas linhas da MESMA invoice, nao traducao
+   de vocabulario compartilhada com reconcile_quote.py.
+   Removidas as palavras de estado, `token_set_ratio` tolera bem token extra de
+   UM lado so, que e exatamente o formato do par acima: o lado congelado (sem
+   UNSIZED/CVP) fica um SUBCONJUNTO exato do lado fresco e pontua 100.
+   Justamente por aceitar subconjunto, a funcao EXIGE que as palavras de estado
+   dos dois lados sejam DIFERENTES - e a premissa dela ("o mesmo item, so o
+   estado muda"). Sem essa exigencia, duas linhas que nao falam de estado nenhum
+   passavam por variante de estado: as duas linhas de Red Bull da nota
+   21460631281488440 ('... Sugar Free ...' e '... Energy Drink ...') dao 100
+   depois do corte e seriam SOMADAS contra uma unica linha de PO por
+   `conciliacao/reconcile_erp.py::_herdar_po_de_irma_estado`. Dois lados sem
+   palavra de estado, ou com o mesmo estado, nao fundem.
+   `MESMO_ITEM_ESTADO_DIFERENTE_SCORE` (95) e alto de proposito: aqui a acao e
+   SOMAR duas linhas num grupo pra comparar com o PO, mais consequente que so
+   marcar "precisa revisao", entao pede muito mais evidencia textual que o
+   `CONFIDENT_SCORE` (70). Grade conflitante bloqueia - nunca funde CHOICE com
+   SELECT por coincidencia de score. Usado so pra decidir se duas linhas da
+   invoice sao a MESMA linha de PO, nao pra casar contra PO/cotacao (la o estado
+   pode ser informativo) - ver `conciliacao/reconcile_erp.py`.
+
+8. NOME DE FORNECEDOR (`match_supplier`, `pontuar_nome_catapult`,
+   `aceitar_prefixos_catapult`)
+   `token_set_ratio` porque a razao social da invoice costuma ser um
+   superconjunto do nome curto do cadastro ('CHENEY BROTHERS, INC.' / 'Cheney').
+   `match_supplier` serve so pra SUGERIR de-para pra revisao humana, nunca pra
+   decidir sozinho: 'Prime Meats' (carne) e 'Prime Distribution USA' (mercearia)
+   pontuam alto e sao fornecedores diferentes. Candidato de 1-2 letras ('FL') e
+   subconjunto de qualquer razao social longa ('FRESHPOINT CENTRAL FL') e
+   pontuaria 100, entao nome curto (`_MIN_CHARS_CANDIDATO_SUPPLIER`) so vale se
+   for IGUAL ao da nota (o proprio fornecedor 'FL').
+   No Catapult a busca e por PREFIXO do campo Name do PO. `pontuar_nome_catapult`
+   da 100 quando os tokens de um lado estao contidos nos do outro ('Leblon foods'
+   x 'Leblon'): palavra a mais ou a menos nao e diferenca, DESDE QUE o conjunto
+   menor tenha um token que identifique de fato - 'Sysco Foods' x 'Foods' nao
+   casa por subconjunto (`_TOKENS_GENERICOS`). Senao vale o melhor entre
+   `token_sort_ratio` e a razao dos textos sem espaco (cobre 'Fresh Poin' x
+   'Freshpoint'). Um token em comum entre nomes de tokens distintos ('Prime
+   Meats' x 'Prime Distribution') NAO chega ao piso `_PISO_NOME_CATAPULT` (85).
+   Prefixo IGUAL (normalizado) a um dos nomes tem precedencia: havendo igualdade,
+   so os iguais valem ('Prime' nao disputa com 'Prime Meats'). Mais de um aceito
+   sem igualdade = ambiguo: quem chama desempata por itens e valor, NUNCA pelo
+   score.
+
+9. CODIGO DE ITEM (`norm_code`)
+   Compara item_code/upc da invoice com Supplier Unit ID/scancode do PO, que
+   formatam o mesmo codigo de jeitos diferentes. Duas correcoes de bug moram
+   aqui (spec-codigo-na-nao-casa):
+   - 'N/A' disfarcado de codigo (`_SEM_CODIGO_RE`): 'NA-0001', 'N/A 0007', 'na' e
+     o jeito de escrever "esta linha nao tem codigo", nao um codigo de catalogo.
+     Sem o guard, a antiga normalizacao tirava as letras e sobrava um digito curto
+     ('1'), que colide com o Supplier Unit ID de um item SEM NENHUMA RELACAO no
+     mesmo PO (achado real, invoice 1104: 'NA-0001' casou por codigo com 'FEIJAO
+     CARIOCA GALANTE 1KG' so porque os dois normalizavam pra '1'). So pega 'N'+'A'
+     juntos (separador opcional) seguido so de digitos, entao nao afeta codigo
+     alfanumerico de verdade ('TOR-0003', 'NAT12345').
+   - so separador de FORMATACAO sai (`_SEPARADOR_RE`), nunca letra: o prefixo
+     alfanumerico e parte da IDENTIDADE do codigo. Achado real (fornecedor de
+     salgadinhos) - a antiga regex (`\\D+`, tirava tudo que nao e digito) reduzia
+     'TOR-0003', 'BIS-0003', '0003' e '3' pro MESMO '3', e o primeiro desses
+     codigos que aparecesse no PO blindava os outros no indice (`setdefault`),
+     entao o item certo nunca era alcancado pelo proprio codigo.
+   Zero a esquerda SO cai quando o que sobra e puramente numerico (EAN/UPC com
+   padding diferente nos dois lados, '00-078900-12345' x '78900-12345'); codigo
+   com letra mantem os zeros ('TOR0003' nao vira 'TOR3'). Vazio (nenhum digito,
+   so zeros, ou 'N/A') nunca casa com nada, nem com outro vazio.
+
+10. MATCH CONTRA A COTACAO (`match_items`)
+   Etapa 1 - assinatura de preco. Casa o que e facil e exato. Uma linha da
+   cotacao e uma tabela de preco, entao pode servir a varias linhas da invoice
+   (N-para-1 e legitimo aqui).
+   Etapa 2 - nome do item, so sobre o residuo. Por construcao, tudo que sobrou da
+   Etapa 1 tem preco que nao bate com nenhuma cotacao - ou seja, e exatamente
+   onde estao as divergencias. Guloso e 1-para-1.
+   Etapa 3 - o que sobrou fica 'unmatched'.
+   Por que o preco nao pode ser chave unica do par: se o par so existisse quando o
+   preco bate, todo item faturado com preco errado sairia como "sem cotacao" e a
+   divergencia que se quer achar ficaria invisivel.
+
+11. MATCH CONTRA O PO DO CATAPULT (`match_items_po`)
+   Cascata diferente da de `match_items`: la o preco decide primeiro porque a
+   invoice nao carrega codigo de produto; aqui o PO tem Supplier Unit ID /
+   scancode, entao o CODIGO decide primeiro e o preco so entra DEPOIS do match,
+   como um dos dois pontos comparados (o outro e quantidade) - nunca pra achar o
+   par. O PO nunca tem linha duplicada (garantia de quem popula `po_lines`), entao
+   um codigo normalizado aponta pra no maximo um item: ao contrario de
+   `match_items`, aqui nao existe N-para-1 legitimo entre codigos distintos.
+   Etapa 1 - codigo. `item_code`/`upc`/`handwritten_code` nessa ordem; o primeiro
+   que bater ganha. `handwritten_code` entra por ultimo de proposito: quando o
+   codigo IMPRESSO bate ele e mais confiavel; quando nao bate com nada (caso
+   Cheney Brothers - o impresso e catalogo do fornecedor, nao do Catapult), o
+   numero escrito a mao e a ultima tentativa antes do nome. So "cola" se bater de
+   verdade com um codigo real do PO, entao em fornecedor onde a anotacao a mao e
+   outra coisa (codigo da cotacao semanal, por exemplo) a linha simplesmente segue
+   pro residuo, sem risco de casar errado. Invoice sem nenhum desses codigos cai
+   direto no residuo. Sem checagem de linha ja reclamada nesta etapa, de
+   proposito: duas linhas da invoice com o MESMO codigo (produto faturado em duas
+   linhas) casam as duas com a mesma PO e se somam depois em `_comparar_grupo`.
+   Linha de PO "zerada" (`_po_zerado`) NAO conta como match por codigo aqui: ela
+   nunca foi de fato recebida/faturada neste PO, so existe na grade porque o
+   Catapult lista o catalogo inteiro do fornecedor (ou um cadastro alternativo do
+   mesmo item). Aceitar esse "match" rouba a linha certa (que so seria achada por
+   nome) e deixa `valor_po`/`qtd_po` com zero em vez do valor real. Dois casos
+   reais: MENA/11126, Sococo Agua de Coco (codigo impresso colidiu com o Supplier
+   Unit ID de um item do catalogo sem nenhuma atividade); Restaurant Depot/
+   21147023139465080, Nestle Pure Life 40x0.5L (o item_code bateu com o cadastro
+   do produto vendido A UNIDADE, `ordered`=160 mas `received`/
+   `invoiced_total_cost`=0 - o PACK de 40 unidades que a invoice de fato vendia
+   estava numa linha de PO SEPARADA, so achada por nome depois deste fix).
+   Etapa 2 - nome, fuzzy (`norm_item` + `token_set_ratio`) sobre o residuo, so
+   contra PO ainda nao reclamado E nao zerado. O filtro de zerada repete aqui
+   porque rejeitar so na Etapa 1 nao bastava: a linha decoy pode ter nome
+   textualmente MAIS parecido com a invoice do que a linha certa (no caso
+   Restaurant Depot, 'Agua Pure Life' bate melhor com "Nestle Pure Life -
+   Purified Water - 40/0.5L" do que 'Pack Agua 40un Nestle Pure Life 500ml', e e
+   a linha errada). Tenta o melhor score entre `item_name` e `receipt_alias` de
+   cada POLine - a invoice costuma falar mais perto do `receipt_alias` (grafia
+   curta, de recibo) do que do `item_name` de cadastro. Guloso e 1-para-1: maior
+   score fica com o par, o resto tenta o proximo candidato acima do limiar.
+   Etapa 2b - codigo contra linha ZERADA, ultimo recurso
+   (spec-po-zerado-ultimo-recurso). O codigo bate mas a linha nao foi recebida/
+   faturada neste PO: o item da invoice existe e a divergencia (valor/quantidade
+   contra $0) e justamente o que se quer mostrar (caso Gominas 5114, item 2914:
+   PO com Ordered=24/Received=0/$0.00 e invoice cobrando $34.00 no mesmo codigo).
+   Aqui a linha ja reclamada JA conta: uma PO zerada so e dada pra uma linha, e a
+   segunda que pedir o mesmo codigo fica sem par.
+   Etapa 3 - o que sobrou fica 'unmatched'.
+   O "reverse check" do fluxograma (item recebido/pedido mas nao faturado) e
+   `po_items_sem_invoice`.
+
+12. CAMPOS DO PO E DA INVOICE (`POLine`, `InvoiceCodeLine`)
+   `receipt_alias` vem na PROPRIA linha do PO (coluna "Receipt Alias" da grade) -
+   confirmado contra o ambiente real, nao precisa de ponte por
+   `dim_item_catapult`. `invoiced_total_cost` e o valor TOTAL da linha, nao preco
+   unitario.
+   `ordered` e `received` NAO estao sempre na mesma unidade um do outro: pra item
+   de peso variavel (acougue) o Catapult registra `ordered` em caixas (o que se
+   pede) e `received` em peso (o que se pesa na doca) - confirmado contra o
+   Catapult real, caso Cheney Brothers.
+   `unit` e a coluna "Unit" da grade Items: "Single Unit" quando `ordered`/
+   `invoiced_total_cost` estao em UNIDADES INDIVIDUAIS, "Case" ou equivalente
+   quando estao em CAIXA/PACOTE. E o sinal de verdade pra decidir qual dos dois
+   (achado do cliente: item de mercearia com pack embutido na descricao, "24x200g"
+   - o mesmo formato de descricao vale pro PO em "Single Unit", que exige
+   multiplicar a quantidade da invoice pelo N do pacote, e pro PO em "Case", onde
+   a quantidade IMPRESSA ja bate e multiplicar quebraria a comparacao). `None`
+   quando a coluna nao veio raspada (PO antigo, celula vazia): quem usa cai pro
+   fallback antigo, a categoria do fornecedor. Ver
+   `conciliacao/reconcile_erp.py::_comparar_grupo`.
+   `_po_zerado` exige os DOIS campos (`received` e `invoiced_total_cost`)
+   CONHECIDOS e zero. `ordered` sozinho nao prova atividade real - e so o que foi
+   pedido, nao o que chegou/foi cobrado. E quando os campos faltam (fixture de
+   teste, raspagem que nao capturou a celula), a falta de dado nao e prova de que
+   a linha e zerada.
+   `handwritten_code` e candidato de codigo igual a `item_code`/`upc`, nao um
+   terceiro tipo - ver secao 11.
+
+13. QUANTIDADE (`qty_matches_po`, `qty_matches_po_cases`)
+   Regra do acougue (item de peso variavel, confirmada com o cliente): no pedido o
+   que se sabe com exatidao e a CAIXA; o peso so e conhecido na conferencia,
+   porque varia por natureza do produto (fresco x congelado, que carrega agua a
+   mais). Por isso `qty_matches_po_cases` compara caixa contra caixa
+   (`invoice_cases` x `ordered`) e deixa `received` de fora: pra item catch-weight
+   `Received` e o peso realmente pesado na doca, nao uma contagem de caixas - nao
+   e comparavel a `Ordered` nem a `invoice_cases`. O peso continua validado do
+   lado do VALOR da linha (`compare_price`), nao aqui. `qty_matches_po` (os tres
+   valores par a par) vale pro resto.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, NamedTuple, Sequence
 
 from rapidfuzz import fuzz
 
-# Tolerancia padrao: so e divergencia se estourar os DOIS limites.
+# ---------------------------------------------------------------------------
+# Constantes. A justificativa de cada numero esta na secao indicada do topo.
+# ---------------------------------------------------------------------------
+
+# Tolerancia padrao de valor (secao 1).
 ABS_TOL = Decimal("0.01")
 PCT_TOL = Decimal("0.005")
 
-# -----------------------------------------------------------------------------
-# Pisos de similaridade
-#
-# Os tres numeros abaixo foram RECALIBRADOS junto com `norm_item()`. Antes dele
-# a comparacao era feita sobre o texto cru, onde marca, codigo de catalogo e o
-# nome em portugues diluiam o score; os pisos antigos (60/50/70) refletiam essa
-# nuvem achatada — o comentario original registrava "o melhor par CORRETO
-# observado faz 69".
-#
-# Com `norm_item()`, medido sobre os 4 pares corretos e 5 pares errados que
-# existem em base, as duas nuvens se separam:
-#
-#     pares corretos   88.0 .. 91.9
-#     pares errados    24.6 .. 50.0   (o pior e Chuck Roll x Knuckle, 50.0)
-#
-# Vao de 38 pontos. Os pisos ficam dentro dele, longe das duas bordas.
-#
-# ATENCAO ao mexer: sao 9 pares medidos, amostra pequena. Subir demais volta a
-# perder par correto em silencio (sai como 'no_quote_for_item'); descer demais
-# ressuscita o falso positivo por preco que o teste
-# `test_preco_igual_nao_basta_para_casar_produtos_sem_relacao` guarda.
-# Qualquer mudanca aqui deve ser medida de novo, nao estimada.
-# -----------------------------------------------------------------------------
-
-# Etapa 2 — a descricao decide SOZINHA, sem apoio do preco. Piso mais alto que
-# o da Etapa 1 justamente por isso.
-#
-# token_set_ratio no lugar de token_sort_ratio: a invoice carrega marca e pack
-# size a mais, e o sort_ratio pune diferenca de tamanho.
-FUZZY_THRESHOLD = 70.0
-
-# Etapa 1 — o preco ja bate, entao a descricao so precisa dar apoio minimo ao
-# par. Sem este piso, dois produtos sem relacao casam so por custarem o mesmo:
-# "Beef, Chuck Roll 'Neck Off' Boneless" casou com "BEEF - Knuckle / Patinho"
-# porque ambos custavam 4.99 e era o unico candidato.
+# Pisos de similaridade de item (secao 4). Medidos, nao estimados.
 EXACT_MIN_SCORE = 65.0
-
-# Acima do piso mas abaixo disto, o par se sustenta em pouca evidencia textual.
-# Aceita, mas marca para conferencia humana: se o produto estiver errado, a
-# divergencia verdadeira passa despercebida como "coerente".
-#
-# Mantido em 70 de proposito. O corpus nao sustenta um valor mais alto: tirando
-# os pares que `grades_conflict` ja barra antes do score, o pior par CORRETO faz
-# 88.0 e o pior par ERRADO faz 86.8 ('CHICKEN Breast Boneless' x 'CHICKEN
-# Thighs Boneless', que so diferem no corte). As nuvens quase se tocam, entao
-# nao existe fronteira de confianca defensavel nessa faixa — quem separa esse
-# par e a atribuicao 1-para-1 gulosa da Etapa 2, nao o piso.
+FUZZY_THRESHOLD = 70.0
 CONFIDENT_SCORE = 70.0
+
+# Piso mais baixo pra PO com codigo placeholder (spec-codigo-placeholder-casa-por-nome).
+# Medido pelo caso real (Smirnoff Ice, Florida Distributing): o par correto faz
+# 69.70, por uma fracao abaixo do FUZZY_THRESHOLD padrao - sem nenhum codigo pra
+# apoiar (a PO nunca tem candidato de verdade), exigir o mesmo piso de quando o
+# codigo some a invoice inteira. So entra em pares onde o lado do PO tem codigo
+# placeholder (R1) - resto do sistema usa FUZZY_THRESHOLD, inalterado.
+PLACEHOLDER_MIN_SCORE = 65.0
+
+# Piso pra fundir duas linhas da MESMA invoice por estado diferente (secao 7).
+MESMO_ITEM_ESTADO_DIFERENTE_SCORE = 95.0
+
+# Pisos de nome de fornecedor (secao 8).
+_PISO_NOME_CATAPULT = 85.0
+_MIN_CHARS_CANDIDATO_SUPPLIER = 3
 
 # Sufixos societarios removidos ao normalizar nome de fornecedor.
 _COMPANY_SUFFIXES = frozenset({
@@ -77,32 +345,34 @@ _COMPANY_SUFFIXES = frozenset({
     "LTD", "LTDA", "SA", "SL", "GROUP", "USA",
 })
 
-# Grades de carne que nunca podem casar entre si.
+# Palavras que nao identificam o fornecedor: sozinhas nao bastam pro subconjunto
+# de tokens valer 100 (secao 8).
+_TOKENS_GENERICOS = frozenset({
+    "food", "foods", "distribution", "distributor", "distributors", "distributing",
+    "supply", "supplies", "wholesale", "imports", "import", "usa", "us", "trading",
+    "group", "company", "co", "international", "products", "produce",
+})
+
+# Grades de carne que nunca podem casar entre si (secao 6).
 _GRADES = ("CHOICE", "SELECT", "PRIME", "ANGUS", "WAGYU")
+
+# Fresco x congelado: entrega, nao identidade do produto (secao 7).
+_PALAVRAS_ESTADO = frozenset({"FRESH", "FRSH", "FROZEN", "FRZN", "FZN", "FRZ"})
 
 # Rotulos de cabecalho que vazaram da planilha para dentro dos dados.
 HEADER_LABELS = frozenset({"ITEM", "PRICE", "COMMENTS", "PRECO", "PRODUTO"})
 
-# Cauda de catalogo da invoice: ' - MARCA, Item #NNNNN' no fim da descricao.
-# Padrao estrutural, presente nas quatro descricoes reais em base.
+# Caudas de catalogo cortadas antes de comparar descricao (secao 3): a da invoice
+# (' - MARCA, Item #NNNNN') e a da cotacao (' - 40622').
 _CAUDA_INVOICE_RE = re.compile(r"\s*-\s*[^,]+,\s*ITEM\s*#?\s*\d+\s*$", re.IGNORECASE)
-
-# Codigo interno no fim da linha de cotacao: ' - 40622'.
 _CAUDA_COTACAO_RE = re.compile(r"\s*-\s*\d{4,6}\s*$")
-
-# De-para de vocabulario entre os dois lados (abreviacao de mercado, traducao
-# PT/EN, sinonimo de corte). ERA um dict hardcoded aqui; virou dado de banco
-# (dwschiavon2.dim_item_sinonimo), injetado via parametro `sinonimos` para nao
-# quebrar a regra de este modulo nao importar nada do projeto. O de-para vive
-# na aba De-Para de uma planilha do Google Sheets (conciliacao/sinonimos.py);
-# as entradas iniciais foram migradas em manutencao/migrar_sinonimos_sheets.py.
-#
-# Contrato: mapa {token_normalizado -> termo alvo}, aplicado token a token aos
-# DOIS lados. Ausencia de sinonimos so enfraquece o match (errar para menos e
-# seguro); nunca casa produto errado.
 
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 _ITEM_CODE_RE = re.compile(r"-\s*(\d{4,6})\s*$")
+
+# 'N/A' disfarcado de codigo e separador de formatacao dentro do codigo (secao 9).
+_SEM_CODIGO_RE = re.compile(r"^N\s*[./-]?\s*A\s*[-\s]*\d*$", re.IGNORECASE)
+_SEPARADOR_RE = re.compile(r"[\s./-]+")
 
 
 # ---------------------------------------------------------------------------
@@ -110,52 +380,32 @@ _ITEM_CODE_RE = re.compile(r"-\s*(\d{4,6})\s*$")
 # ---------------------------------------------------------------------------
 
 def norm_text(value: str | None) -> str:
-    """Maiusculas, sem acento, sem pontuacao, espacos colapsados.
-
-    Trata o espaco nao-separavel (U+00A0) que aparece nos nomes vindos do Excel.
-    """
+    """Maiusculas, sem acento, sem pontuacao, espacos colapsados (trata o espaco
+    nao-separavel U+00A0 que vem dos nomes do Excel)."""
     if not value:
         return ""
-    text = unicodedata.normalize("NFKD", str(value))
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    text = text.replace("\xa0", " ").upper()
-    text = re.sub(r"[^0-9A-Z]+", " ", text)
-    return " ".join(text.split())
+    texto = unicodedata.normalize("NFKD", str(value))
+    texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
+    texto = texto.replace("\xa0", " ").upper()
+    texto = re.sub(r"[^0-9A-Z]+", " ", texto)
+    return " ".join(texto.split())
 
 
 def norm_supplier(value: str | None) -> str:
     """`norm_text` + remocao dos sufixos societarios (INC, LLC, CORP...)."""
-    tokens = [t for t in norm_text(value).split() if t not in _COMPANY_SUFFIXES]
+    tokens = [token for token in norm_text(value).split() if token not in _COMPANY_SUFFIXES]
     return " ".join(tokens)
 
 
 def norm_item(value: str | None, sinonimos: Mapping[str, str] | None = None) -> str:
-    """Normaliza descricao de item para COMPARACAO entre os dois lados.
-
-    `norm_text` sozinho nao basta porque os dois lados falam linguas diferentes
-    sobre o mesmo produto. Medido nos 4 itens reais em base, so 1 dos 4 pares
-    corretos alcancava o piso de 60; com os dois passos abaixo, os 4 passam de
-    88, com margem de +41 a +58 sobre o segundo colocado.
-
-    Passo 1 — corta a cauda de catalogo. E estrutura, nao vocabulario: a marca
-    e o codigo interno do distribuidor ('- AMICK, Item #227059') nao existem do
-    lado da cotacao, entao so diluem o score.
-
-    Passo 2 — aplica o de-para de vocabulario `sinonimos` (mapa
-    {token -> termo alvo}, vem de dim_item_sinonimo). Sem ele, o unico token em
-    comum entre 'CHIX TENDER JUMBO CVP' e 'CHICKEN - Tender / Sassami de Frango'
-    e 'TENDER', e o par correto faz 46. `sinonimos=None` -> Passo 2 nao traduz
-    (degrada com seguranca).
-
-    NAO usar para exibir nome ao usuario: o resultado e texto de comparacao.
-    """
+    """Normaliza descricao de item para COMPARACAO entre os dois lados: corta a
+    cauda de catalogo e aplica o de-para de vocabulario (secao 3)."""
     de_para = sinonimos or {}
-    texto = _CAUDA_INVOICE_RE.sub("", value or "")
-    texto = norm_text(_CAUDA_COTACAO_RE.sub("", texto))
-    # Frase inteira antes do token, senao 'CHIX TENDER' vira 'CHICKEN TENDER' e nao casa.
-    if texto in de_para:
-        return de_para[texto]
-    return " ".join(de_para.get(t, t) for t in texto.split())
+    sem_cauda = _CAUDA_INVOICE_RE.sub("", value or "")
+    normalizado = norm_text(_CAUDA_COTACAO_RE.sub("", sem_cauda))
+    if normalizado in de_para:
+        return de_para[normalizado]
+    return " ".join(de_para.get(token, token) for token in normalizado.split())
 
 
 def is_header_row(item_name: str | None) -> bool:
@@ -167,66 +417,93 @@ def extract_item_code(item_name: str | None) -> str | None:
     """Codigo numerico ao final do nome do item ('... - 40122' -> '40122')."""
     if not item_name:
         return None
-    match = _ITEM_CODE_RE.search(str(item_name).replace("\xa0", " ").strip())
-    return match.group(1) if match else None
+    achado = _ITEM_CODE_RE.search(str(item_name).replace("\xa0", " ").strip())
+    return achado.group(1) if achado else None
+
+
+def norm_code(value: str | None) -> str:
+    """Codigo de item comparavel entre invoice e PO: tira separador de formatacao
+    (nunca letra) e, se o resto e puramente numerico, o zero a esquerda (secao 9)."""
+    if not value:
+        return ""
+    texto = str(value).strip()
+    if _SEM_CODIGO_RE.match(texto):
+        return ""
+    sem_separador = _SEPARADOR_RE.sub("", texto).upper()
+    if not any(ch.isdigit() for ch in sem_separador):
+        return ""
+    if sem_separador.isdigit():
+        return sem_separador.lstrip("0")
+    return sem_separador
+
+
+def norm_code_so_digitos(value: str | None) -> str:
+    """Fallback de `norm_code` (secao 9, spec-codigo-na-nao-casa R7-R9): so
+    digitos, sem a letra do prefixo. Existe pro caso OPOSTO ao que `norm_code`
+    corrige — quando a letra preservada e um prefixo de MARCA colado pela
+    Vision, nao parte da identidade do codigo ('Elvan-1200711111' x Supplier
+    Unit ID '1200711111', sem o prefixo, achado real invoice Skyharvest
+    13019). So deve ser tentado quando `norm_code` (com letra) nao bate com
+    nada no PO, NUNCA como primeira tentativa nem para construir o indice do
+    PO — senao reabre a colisao que `norm_code` corrige ('TOR-0003' x
+    'BIS-0003' continuam distintos: a chave do PO no indice nunca vira so
+    digito)."""
+    if not value:
+        return ""
+    texto = str(value).strip()
+    if _SEM_CODIGO_RE.match(texto):
+        return ""
+    return re.sub(r"\D+", "", texto).lstrip("0")
 
 
 # ---------------------------------------------------------------------------
-# Preco
+# Preco e valor da linha (secoes 1 e 2)
 # ---------------------------------------------------------------------------
-
-def parse_price_range(price_raw: str | None) -> tuple[Decimal, Decimal] | None:
-    """Faixa de preco a partir do texto original da celula.
-
-    '$4.95/5.35/$5.41' -> (4.95, 5.41)      '$5,38' -> (5.38, 5.38)
-    'N/A' / '' / None  -> None
-
-    O fornecedor as vezes cota uma faixa em vez de um valor unico; nesse caso a
-    faixa inteira e considerada dentro do combinado.
-    """
-    if price_raw is None:
-        return None
-    cleaned = str(price_raw).strip().replace("$", "").replace(",", ".")
-    if not cleaned or cleaned.upper() in ("N/A", "NA", "-"):
-        return None
-    values: list[Decimal] = []
-    for token in _NUMBER_RE.findall(cleaned):
-        try:
-            values.append(Decimal(token))
-        except InvalidOperation:
-            continue
-    if not values:
-        return None
-    return min(values), max(values)
-
-
-def within_tolerance(
-    a: Decimal | float | None,
-    b: Decimal | float | None,
-    abs_tol: Decimal = ABS_TOL,
-    pct_tol: Decimal = PCT_TOL,
-) -> bool:
-    """True se `a` e `b` sao considerados iguais.
-
-    So diverge se estourar os DOIS limites: uma diferenca de 1 centavo num item
-    de 2 dolares e percentualmente grande mas irrelevante, e 0,3% num item de
-    500 dolares e o arredondamento de sempre.
-    """
-    if a is None or b is None:
-        return False
-    a, b = Decimal(str(a)), Decimal(str(b))
-    diff = abs(a - b)
-    if diff <= abs_tol:
-        return True
-    if b == 0:
-        return False
-    return (diff / abs(b)) <= pct_tol
-
 
 class PriceVerdict(NamedTuple):
     status: str                  # 'ok' | 'above' | 'below'
     diff: Decimal | None         # invoice - cotacao
     diff_pct: Decimal | None     # em %
+
+
+def parse_price_range(price_raw: str | None) -> tuple[Decimal, Decimal] | None:
+    """Faixa de preco a partir do texto original da celula.
+
+    '$4.95/5.35/$5.41' -> (4.95, 5.41); '$5,38' -> (5.38, 5.38); 'N/A' -> None.
+    """
+    if price_raw is None:
+        return None
+    limpo = str(price_raw).strip().replace("$", "").replace(",", ".")
+    if not limpo or limpo.upper() in ("N/A", "NA", "-"):
+        return None
+    valores: list[Decimal] = []
+    for numero in _NUMBER_RE.findall(limpo):
+        try:
+            valores.append(Decimal(numero))
+        except InvalidOperation:
+            continue
+    if not valores:
+        return None
+    return min(valores), max(valores)
+
+
+def within_tolerance(
+    valor: Decimal | float | None,
+    referencia: Decimal | float | None,
+    abs_tol: Decimal = ABS_TOL,
+    pct_tol: Decimal = PCT_TOL,
+) -> bool:
+    """True se os dois valores sao considerados iguais: so diverge se estourar os
+    DOIS limites (secao 1). O percentual e relativo a `referencia`."""
+    if valor is None or referencia is None:
+        return False
+    valor, referencia = Decimal(str(valor)), Decimal(str(referencia))
+    diferenca = abs(valor - referencia)
+    if diferenca <= abs_tol:
+        return True
+    if referencia == 0:
+        return False
+    return (diferenca / abs(referencia)) <= pct_tol
 
 
 def is_unit_priced(
@@ -235,28 +512,17 @@ def is_unit_priced(
     total_price: Decimal | float | None,
     rel_tol: Decimal = Decimal("0.01"),
 ) -> bool:
-    """True se a linha esta precificada por unidade/caixa, e nao por libra.
-
-    A cotacao e sempre por LB. Na invoice de carne o `unit_price` tambem e por
-    LB, mesmo com `unit='CS'`: o total fecha com o peso, nao com a quantidade
-    de caixas (3 CS x 6.01 != 1256.09, mas 209.00 lb x 6.01 == 1256.09).
-
-    Numa linha vendida por caixa ou unidade, ao contrario, quantidade x preco
-    fecha o total (1 x 85.90 == 85.90 de uma caixa de alface). Essa linha nao e
-    comparavel com um preco por libra — daí `unit_mismatch`.
-
-    A coluna `unit` nao serve para isso: esta suja ('CASE', 'case', 'CS', 'CX',
-    '25#') e nula em quase 10% dos itens.
-    """
+    """True se a linha esta precificada por unidade/caixa (quantidade x preco
+    fecha o total), e nao por libra (secao 2)."""
     if quantity is None or unit_price is None or total_price is None:
         return False
-    qty = Decimal(str(quantity))
-    price = Decimal(str(unit_price))
-    total = Decimal(str(total_price))
-    if total == 0:
+    quantidade = Decimal(str(quantity))
+    preco_unitario = Decimal(str(unit_price))
+    total_linha = Decimal(str(total_price))
+    if total_linha == 0:
         return False
-    esperado = qty * price
-    return abs(esperado - total) <= abs(total) * rel_tol
+    total_esperado = quantidade * preco_unitario
+    return abs(total_esperado - total_linha) <= abs(total_linha) * rel_tol
 
 
 def compare_price(
@@ -266,72 +532,64 @@ def compare_price(
     abs_tol: Decimal = ABS_TOL,
     pct_tol: Decimal = PCT_TOL,
 ) -> PriceVerdict:
-    """Compara o preco faturado com o cotado, respeitando faixa e tolerancia.
-
-    Convencao do projeto: `diff = invoice - cotacao` (positivo = cobraram a mais).
-    O percentual e sempre relativo ao preco principal da cotacao.
-    """
+    """Compara o preco faturado com o cotado, respeitando faixa e tolerancia
+    (secoes 1 e 2). `diff = invoice - cotacao`; o percentual e sobre a cotacao."""
     if invoice_price is None or quote_price is None:
         return PriceVerdict("ok", None, None)
 
-    invoice = Decimal(str(invoice_price))
-    quote = Decimal(str(quote_price))
+    faturado = Decimal(str(invoice_price))
+    cotado = Decimal(str(quote_price))
+    diferenca = faturado - cotado
+    diferenca_pct = (diferenca / cotado * 100) if cotado else None
 
-    diff = invoice - quote
-    diff_pct = (diff / quote * 100) if quote else None
+    minimo, maximo = cotado, cotado
+    faixa = parse_price_range(price_raw)
+    if faixa is not None:
+        minimo, maximo = min(faixa[0], cotado), max(faixa[1], cotado)
 
-    low, high = quote, quote
-    band = parse_price_range(price_raw)
-    if band is not None:
-        low, high = min(band[0], quote), max(band[1], quote)
+    if minimo <= faturado <= maximo:
+        return PriceVerdict("ok", diferenca, diferenca_pct)
+    if within_tolerance(faturado, maximo, abs_tol, pct_tol) or \
+            within_tolerance(faturado, minimo, abs_tol, pct_tol):
+        return PriceVerdict("ok", diferenca, diferenca_pct)
+    return PriceVerdict("above" if faturado > maximo else "below", diferenca, diferenca_pct)
 
-    if low <= invoice <= high:
-        return PriceVerdict("ok", diff, diff_pct)
-    if within_tolerance(invoice, high, abs_tol, pct_tol) or \
-            within_tolerance(invoice, low, abs_tol, pct_tol):
-        return PriceVerdict("ok", diff, diff_pct)
-    return PriceVerdict("above" if invoice > high else "below", diff, diff_pct)
+
+def invoice_line_total(
+    quantity: Decimal | float | None,
+    unit_price: Decimal | float | None,
+    total_price: Decimal | float | None,
+) -> Decimal | None:
+    """Valor faturado da linha: `valor_linha`; se ausente, cai pra qtd x preco
+    unitario (mesmo fallback do fluxograma)."""
+    if total_price is not None:
+        return Decimal(str(total_price))
+    if quantity is not None and unit_price is not None:
+        return Decimal(str(quantity)) * Decimal(str(unit_price))
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Grades de carne
+# Grades de carne (secao 6) e variante de estado da MESMA invoice (secao 7)
 # ---------------------------------------------------------------------------
 
 def grades_in(text: str | None) -> frozenset[str]:
     """Grades citadas no texto ('BEEF Coulotte 2pc (Select)' -> {'SELECT'})."""
     tokens = set(norm_text(text).split())
-    return frozenset(g for g in _GRADES if g in tokens)
+    return frozenset(grade for grade in _GRADES if grade in tokens)
 
 
 def grades_conflict(a: str | None, b: str | None) -> bool:
-    """True se os dois lados citam grades e elas nao tem nada em comum.
-
-    CHOICE e SELECT sao cortes diferentes com precos diferentes; casa-los
-    produziria uma divergencia que nao existe.
-    """
-    ga, gb = grades_in(a), grades_in(b)
-    return bool(ga and gb and not (ga & gb))
-
-
-# ---------------------------------------------------------------------------
-# Variante de estado (fresco x congelado) da MESMA linha de invoice
-# ---------------------------------------------------------------------------
-
-# Fresco x congelado e forma de entrega, nao identidade do produto — fica
-# FORA do de-para de sinonimos (`sinonimos`, vocabulario cotacao x invoice
-# compartilhado com reconcile_quote.py) de proposito: e regra especifica de
-# agrupar duas linhas da MESMA invoice, nao traducao de vocabulario.
-_PALAVRAS_ESTADO = frozenset({"FRESH", "FRSH", "FROZEN", "FRZN", "FZN", "FRZ"})
-
-# Piso alto de proposito: aqui a acao e SOMAR duas linhas da invoice num so
-# grupo pra comparar com o PO — mais consequente que so marcar "precisa
-# revisao" (o que os pisos de match_items_po fazem), entao pede muito mais
-# evidencia textual que o CONFIDENT_SCORE (70) daquele match.
-MESMO_ITEM_ESTADO_DIFERENTE_SCORE = 95.0
+    """True se os dois lados citam grades e elas nao tem nada em comum."""
+    grades_a, grades_b = grades_in(a), grades_in(b)
+    return bool(grades_a and grades_b and not (grades_a & grades_b))
 
 
 def _sem_palavras_estado(texto_normalizado: str) -> str:
-    return " ".join(t for t in texto_normalizado.split() if t not in _PALAVRAS_ESTADO)
+    """Tira FRESH/FROZEN e abreviacoes do texto ja normalizado."""
+    return " ".join(
+        token for token in texto_normalizado.split() if token not in _PALAVRAS_ESTADO
+    )
 
 
 def mesmo_item_estado_diferente(
@@ -340,34 +598,27 @@ def mesmo_item_estado_diferente(
     sinonimos: Mapping[str, str] | None = None,
     score_cutoff: float = MESMO_ITEM_ESTADO_DIFERENTE_SCORE,
 ) -> bool:
-    """True se `desc_a` e `desc_b` sao o MESMO produto entregue em estado
-    diferente (fresco x congelado) — caso real Prime Meats/1175605 (achado
-    do cliente, Leandro Rocha): 'CHKN BREAST BL/SL DRY GEN FZN' e 'CHKN
-    BREAST BL/SL UNSIZED DRY GEN FRSH CVP' sao o mesmo peito de frango pra
-    quem recebe — só uma parte do pedido veio congelada e a outra fresca.
-
-    Remove as palavras de estado antes de pontuar. `token_set_ratio` tolera
-    bem token extra de UM lado so, e e exatamente esse o formato do par
-    acima depois de tirar FZN/FRSH: o lado congelado (sem UNSIZED/CVP) fica
-    um SUBCONJUNTO exato do lado fresco, o que pontua 100.
-
-    Bloqueia grade de carne conflitante (`grades_conflict`) — nunca funde
-    CHOICE com SELECT so por coincidencia de score. Usado so pra decidir se
-    duas linhas da invoice sao a MESMA linha de PO, nao pra casar contra
-    PO/cotacao (lá o estado pode ser informativo) — ver
-    `conciliacao/reconcile_erp.py`.
-    """
+    """True se as duas descricoes sao o MESMO produto entregue em estado diferente
+    (fresco x congelado) e podem virar um grupo so (secao 7)."""
     if grades_conflict(desc_a, desc_b):
         return False
-    a = _sem_palavras_estado(norm_item(desc_a, sinonimos))
-    b = _sem_palavras_estado(norm_item(desc_b, sinonimos))
-    if not a or not b:
+    normalizado_a = norm_item(desc_a, sinonimos)
+    normalizado_b = norm_item(desc_b, sinonimos)
+    # O estado e o que tem de diferente: sem isso, duas linhas que nem falam de
+    # estado se fundiriam so pelo subconjunto de tokens.
+    estados_a = {t for t in normalizado_a.split() if t in _PALAVRAS_ESTADO}
+    estados_b = {t for t in normalizado_b.split() if t in _PALAVRAS_ESTADO}
+    if estados_a == estados_b:
         return False
-    return fuzz.token_set_ratio(a, b, score_cutoff=score_cutoff) >= score_cutoff
+    texto_a = _sem_palavras_estado(normalizado_a)
+    texto_b = _sem_palavras_estado(normalizado_b)
+    if not texto_a or not texto_b:
+        return False
+    return fuzz.token_set_ratio(texto_a, texto_b, score_cutoff=score_cutoff) >= score_cutoff
 
 
 # ---------------------------------------------------------------------------
-# Match de itens
+# Tipos de entrada e saida do match. Semantica dos campos do PO: secao 12.
 # ---------------------------------------------------------------------------
 
 class InvoiceLine(NamedTuple):
@@ -391,256 +642,9 @@ class ItemMatch(NamedTuple):
     ambiguous: bool = False        # empate no desempate -> conferencia humana
 
 
-_MIN_CHARS_CANDIDATO_SUPPLIER = 3
-
-
-def match_supplier(
-    name: str | None,
-    candidates: Sequence[str],
-    threshold: float = 80.0,
-) -> tuple[str | None, float]:
-    """Melhor candidato para um nome de fornecedor, por `token_set_ratio`.
-
-    `token_set_ratio` porque a razao social da invoice costuma ser um
-    superconjunto do nome curto do cadastro ('CHENEY BROTHERS, INC.' / 'Cheney').
-
-    ATENCAO: usar so para SUGERIR de-para para revisao humana, nunca para
-    decidir sozinho — 'Prime Meats' (carne) e 'Prime Distribution USA'
-    (mercearia) pontuam alto e sao fornecedores diferentes.
-    """
-    target = norm_supplier(name)
-    if not target or not candidates:
-        return None, 0.0
-    best, best_score = None, 0.0
-    for candidate in candidates:
-        norm_candidate = norm_supplier(candidate)
-        # Nome de 1-2 letras ('FL') e subconjunto de qualquer razao social longa
-        # ('FRESHPOINT CENTRAL FL') e pontuaria 100 em token_set_ratio.
-        # Nome curto so vale se for IGUAL ao da nota (o proprio fornecedor 'FL').
-        if len(norm_candidate) < _MIN_CHARS_CANDIDATO_SUPPLIER and norm_candidate != target:
-            continue
-        score = fuzz.token_set_ratio(target, norm_candidate)
-        if score > best_score:
-            best, best_score = candidate, score
-    return (best, best_score) if best_score >= threshold else (None, best_score)
-
-
-# Piso para aceitar variacao de escrita (typo/abreviacao) sem subconjunto de tokens.
-_PISO_NOME_CATAPULT = 85.0
-
-# Palavras que nao identificam o fornecedor: sozinhas nao bastam para o subconjunto de tokens.
-_TOKENS_GENERICOS = frozenset({
-    "food", "foods", "distribution", "distributor", "distributors", "distributing",
-    "supply", "supplies", "wholesale", "imports", "import", "usa", "us", "trading",
-    "group", "company", "co", "international", "products", "produce",
-})
-
-
-def pontuar_nome_catapult(nome: str | None, prefixo: str | None) -> float:
-    """Similaridade 0-100 entre o nome buscado e um prefixo de Name de PO.
-
-    100 quando um e igual ao outro ou os tokens de um estao contidos nos do outro
-    ('Leblon foods' x 'Leblon'): palavra a mais ou a menos nao e diferenca, desde
-    que o menor tenha um token que identifique (nao 'foods' sozinho). Senao
-    o melhor entre `token_sort_ratio` e a razao dos textos sem espaco (cobre
-    'Fresh Poin' x 'Freshpoint'). Um token em comum entre dois nomes com tokens
-    distintos ('Prime Meats' x 'Prime Distribution') NAO chega ao piso.
-    """
-    a, b = norm_supplier(nome), norm_supplier(prefixo)
-    if not a or not b:
-        return 0.0
-    ta, tb = set(a.lower().split()), set(b.lower().split())
-    if (ta <= tb or tb <= ta) and (ta if len(ta) <= len(tb) else tb) - _TOKENS_GENERICOS:
-        return 100.0
-    return max(
-        fuzz.token_sort_ratio(a, b),
-        fuzz.ratio(a.replace(" ", ""), b.replace(" ", "")),
-    )
-
-
-def aceitar_prefixos_catapult(
-    nomes: Sequence[str | None], prefixos: Sequence[str], piso: float = _PISO_NOME_CATAPULT,
-) -> tuple[list[str], dict[str, float]]:
-    """Prefixos de PO que sao confiavelmente o mesmo fornecedor de `nomes`.
-
-    Devolve `(aceitos, scores)`; `scores` = melhor pontuacao de cada prefixo
-    distinto (para diagnostico em log). Se algum prefixo e IGUAL (normalizado) a
-    um dos nomes, so os iguais valem ('Prime' nao disputa com 'Prime Meats').
-    Mais de um aceito sem igualdade = ambiguo: quem chama desempata por itens e
-    valor, nunca pelo score. Lista vazia = sem correspondencia confiavel.
-    """
-    distintos = list(dict.fromkeys(p for p in prefixos if p))
-    scores = {p: max((pontuar_nome_catapult(n, p) for n in nomes), default=0.0) for p in distintos}
-    alvos = {norm_supplier(n) for n in nomes if norm_supplier(n)}
-    exatos = [p for p in distintos if norm_supplier(p) in alvos]
-    if exatos:
-        return exatos, scores
-    return [p for p in distintos if scores[p] >= piso], scores
-
-
-def match_items(
-    invoice_lines: Sequence[InvoiceLine],
-    quote_lines: Sequence[QuoteLine],
-    fuzzy_threshold: float = FUZZY_THRESHOLD,
-    abs_tol: Decimal = ABS_TOL,
-    pct_tol: Decimal = PCT_TOL,
-    *,
-    sinonimos: Mapping[str, str] | None = None,
-) -> list[ItemMatch]:
-    """Casa itens da invoice com itens da cotacao, em cascata.
-
-    Etapa 1 — assinatura de preco. Casa o que e facil e exato. Uma linha da
-    cotacao e uma tabela de preco, entao pode servir a varias linhas da invoice
-    (N-para-1 e legitimo aqui).
-
-    Etapa 2 — nome do item, so sobre o residuo. Por construcao, tudo que sobrou
-    da Etapa 1 tem preco que nao bate com nenhuma cotacao — ou seja, e
-    exatamente onde estao as divergencias. Guloso e 1-para-1.
-
-    Etapa 3 — o que sobrou fica 'unmatched'.
-
-    Por que o preco nao pode ser chave unica do par: se o par so existisse
-    quando o preco bate, todo item faturado com preco errado sairia como "sem
-    cotacao" e a divergencia que se quer achar ficaria invisivel.
-
-    `sinonimos`: de-para de vocabulario ({token -> termo alvo}, de
-    dim_item_sinonimo), carregado uma vez pelo chamador e repassado a todas as
-    normalizacoes. `None` -> match sobre texto cru, so mais fraco.
-
-    A ordem de `invoice_lines` e preservada no retorno.
-    """
-    quotes = [q for q in quote_lines if q.price is not None and Decimal(str(q.price)) > 0]
-
-    matches: dict[Any, ItemMatch] = {}
-    residual: list[InvoiceLine] = []
-
-    # --- Etapa 1: assinatura de preco -------------------------------------
-    for line in invoice_lines:
-        if line.unit_price is None:
-            residual.append(line)
-            continue
-
-        candidates = [
-            q for q in quotes
-            if within_tolerance(line.unit_price, q.price, abs_tol, pct_tol)
-            and not grades_conflict(line.description, q.item_name)
-        ]
-        if not candidates:
-            residual.append(line)
-            continue
-
-        # Preco igual nao basta: dois produtos sem relacao podem custar o mesmo.
-        # A descricao precisa dar ao menos um apoio minimo ao par.
-        scored = sorted(
-            ((float(fuzz.token_set_ratio(norm_item(line.description, sinonimos),
-                                         norm_item(q.item_name, sinonimos))), q)
-             for q in candidates),
-            key=lambda pair: pair[0],
-            reverse=True,
-        )
-        top_score, top_quote = scored[0]
-        if top_score < EXACT_MIN_SCORE:
-            residual.append(line)
-            continue
-
-        empatado = sum(1 for score, _ in scored if score == top_score) > 1
-        matches[line.key] = ItemMatch(
-            line.key, top_quote.key, "exact", top_score,
-            ambiguous=empatado or top_score < CONFIDENT_SCORE,
-        )
-
-    # --- Etapa 2: nome do item, sobre o residuo ---------------------------
-    if residual and quotes:
-        inv_texts = [norm_item(line.description, sinonimos) for line in residual]
-        quo_texts = [norm_item(q.item_name, sinonimos) for q in quotes]
-
-        # Laco simples em vez de rapidfuzz.process.cdist: cdist exige numpy so
-        # para montar a matriz, e aqui ela e minuscula (dezenas x dezenas, um
-        # fornecedor por vez). `score_cutoff` faz o proprio rapidfuzz descartar
-        # o que esta abaixo do limiar, devolvendo 0.
-        pairs: list[tuple[float, int, int]] = []
-        for i, inv in enumerate(inv_texts):
-            for j, quo in enumerate(quo_texts):
-                score = fuzz.token_set_ratio(inv, quo, score_cutoff=fuzzy_threshold)
-                if score and not grades_conflict(residual[i].description,
-                                                 quotes[j].item_name):
-                    pairs.append((float(score), i, j))
-        pairs.sort(key=lambda p: (-p[0], p[1], p[2]))
-
-        used_invoice: set[int] = set()
-        used_quote: set[int] = set()
-        for score, i, j in pairs:
-            if i in used_invoice or j in used_quote:
-                continue
-            used_invoice.add(i)
-            used_quote.add(j)
-            matches[residual[i].key] = ItemMatch(
-                residual[i].key, quotes[j].key, "fuzzy", score,
-                ambiguous=score < CONFIDENT_SCORE,
-            )
-
-    # --- Etapa 3: o que sobrou --------------------------------------------
-    return [
-        matches.get(line.key, ItemMatch(line.key, None, "unmatched", None))
-        for line in invoice_lines
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Match de itens contra o PO do Catapult (comparacao='erp')
-#
-# Cascata diferente da de `match_items`: lá o preço decide primeiro porque a
-# invoice não carrega código de produto; aqui o PO tem `Supplier Unit ID` /
-# scancode, então o código decide primeiro e o preço só entra DEPOIS do match,
-# como um dos dois pontos comparados (o outro é quantidade) — nunca para
-# achar o par.
-# ---------------------------------------------------------------------------
-
-_CODE_RE = re.compile(r"\D+")
-
-
-def norm_code(value: str | None) -> str:
-    """So digitos, sem zero a esquerda — pra comparar item_code/upc da
-    invoice com Supplier Unit ID/scancode do PO, que formatam o mesmo codigo
-    de jeitos diferentes ('0012345' vs '12345', hifen, espaco).
-
-    Cai pra vazio quando nao sobra digito nenhum (ou o valor so tinha zeros).
-    Vazio nunca casa com nada, nem com outro vazio — ver `match_items_po`.
-    """
-    if not value:
-        return ""
-    return _CODE_RE.sub("", str(value)).lstrip("0")
-
-
 class POLine(NamedTuple):
-    """Uma linha de item do PO (Purchase Order) do Catapult, como raspada da
-    aba Items (`commons/catapult`).
-
-    `receipt_alias` vem na PRÓPRIA linha do PO (coluna "Receipt Alias" da
-    grade) — confirmado contra o ambiente real, não precisa de uma ponte
-    separada por `dim_item_catapult` pra resolver nome de invoice que não
-    bate com `item_name`. `invoiced_total_cost` é o valor TOTAL da linha,
-    não preço unitário.
-
-    `ordered`/`received` NÃO estão sempre na mesma unidade um do outro: pra
-    item de peso variável (açougue) o Catapult registra `ordered` em caixas
-    (o que se pede) e `received` em peso (o que se pesa na doca) — confirmado
-    contra o Catapult real (caso Cheney Brothers). Ver
-    `commons/matcher.py::qty_matches_po_cases` e
-    `conciliacao/reconcile_erp.py::_comparar_grupo`.
-
-    `unit` é a coluna "Unit" da grade Items do PO — "Single Unit" quando
-    `ordered`/`invoiced_total_cost` estão em UNIDADES INDIVIDUAIS do item, ou
-    "Case"/algo equivalente quando estão em CAIXA/PACOTE (achado do cliente:
-    item de mercearia com pack embutido na descrição, ex. "24x200g" — o
-    mesmo formato de descrição vale tanto pra PO em "Single Unit", que exige
-    multiplicar a quantidade da invoice pelo N do pacote pra bater, quanto
-    pra PO em "Case", onde a quantidade IMPRESSA já bate direto e multiplicar
-    quebraria a comparação). É o sinal de verdade pra decidir qual dos dois
-    -- ver `conciliacao/reconcile_erp.py::_comparar_grupo`. `None` quando a
-    coluna não veio raspada (PO antigo, ou célula vazia) — quem usa cai pro
-    fallback antigo (categoria do fornecedor).
-    """
+    """Linha de item do PO do Catapult, como raspada da aba Items
+    (`commons/catapult`). Unidades e `unit`/`receipt_alias`: secao 12."""
 
     key: Any
     supplier_unit_id: str | None
@@ -648,48 +652,20 @@ class POLine(NamedTuple):
     item_name: str | None
     ordered: Decimal | None = None
     received: Decimal | None = None
-    invoiced_total_cost: Decimal | None = None
+    invoiced_total_cost: Decimal | None = None   # valor TOTAL da linha
     receipt_alias: str | None = None
-    unit: str | None = None
+    unit: str | None = None                      # 'Single Unit' | 'Case' | None
 
 
 class InvoiceCodeLine(NamedTuple):
-    """Linha da invoice, só o que o match contra o PO precisa pra achar o
-    par. Quantidade e preço entram depois, na comparação (fora do motor de
-    match — ver `conciliacao/reconcile_erp.py`).
-
-    `handwritten_code` é candidato de código igual a `item_code`/`upc`, não
-    um terceiro tipo — só existe porque, pra alguns fornecedores (confirmado
-    contra o Catapult real: Cheney Brothers), o código IMPRESSO na nota é do
-    catálogo do fornecedor e não bate com o Catapult, mas o número escrito à
-    mão na linha é o scancode/Supplier Unit ID de verdade. Ver
-    `match_items_po` — só "cola" quando bate com um código real do PO, então
-    não arrisca casar errado em fornecedor onde a anotação à mão é outra
-    coisa (ex.: código da cotação semanal, sem relação com o Catapult)."""
+    """Linha da invoice, so o que o match contra o PO precisa pra achar o par.
+    Quantidade e preco entram depois (`conciliacao/reconcile_erp.py`)."""
 
     key: Any
     description: str | None
     item_code: str | None
     upc: str | None
-    handwritten_code: str | None = None
-
-
-def _po_zerado(po: "POLine") -> bool:
-    """True quando a linha do PO tem `received` E `invoiced_total_cost`
-    CONHECIDOS e os DOIS zero — sinal de que nada foi de fato recebido nem
-    faturado contra essa linha neste PO, mesmo que `ordered` nao seja zero
-    (caso real Restaurant Depot/21147023139465080: a linha 'Agua Pure Life'
-    — catalogo do item vendido a unidade — tinha ordered=160 mas
-    received=0/invoiced_total_cost=$0, enquanto a linha certa do PACK de 40
-    unidades, que era o que a invoice de fato vendia, tinha os dois
-    preenchidos ($21.80/4 recebidos) e só foi achada por nome depois desta
-    ficar de fora. `ordered` sozinho não prova atividade real — é só o que
-    foi pedido, não o que chegou/foi cobrado). So conta quando os dois
-    campos foram raspados (nenhum None): quando faltam (fixture de teste sem
-    esses campos, ou raspagem que nao capturou a celula), a falta de dado
-    nao e prova de que a linha e zerada — ver `match_items_po`."""
-    recebido, custo = po.received, po.invoiced_total_cost
-    return recebido is not None and custo is not None and recebido == 0 and custo == 0
+    handwritten_code: str | None = None   # mais um candidato de codigo (secao 11)
 
 
 class POMatch(NamedTuple):
@@ -700,6 +676,287 @@ class POMatch(NamedTuple):
     ambiguous: bool = False        # so 'nome' produz score < CONFIDENT_SCORE
 
 
+# ---------------------------------------------------------------------------
+# Nome de fornecedor (secao 8)
+# ---------------------------------------------------------------------------
+
+def match_supplier(
+    name: str | None,
+    candidates: Sequence[str],
+    threshold: float = 80.0,
+) -> tuple[str | None, float]:
+    """Melhor candidato para um nome de fornecedor, por `token_set_ratio`.
+
+    So pra SUGERIR de-para para revisao humana, nunca pra decidir sozinho (secao 8).
+    """
+    alvo = norm_supplier(name)
+    if not alvo or not candidates:
+        return None, 0.0
+    melhor, melhor_score = None, 0.0
+    for candidato in candidates:
+        candidato_norm = norm_supplier(candidato)
+        if len(candidato_norm) < _MIN_CHARS_CANDIDATO_SUPPLIER and candidato_norm != alvo:
+            continue
+        score = fuzz.token_set_ratio(alvo, candidato_norm)
+        if score > melhor_score:
+            melhor, melhor_score = candidato, score
+    return (melhor, melhor_score) if melhor_score >= threshold else (None, melhor_score)
+
+
+def pontuar_nome_catapult(nome: str | None, prefixo: str | None) -> float:
+    """Similaridade 0-100 entre o nome buscado e um prefixo de Name de PO: 100 por
+    subconjunto de tokens que identifique, senao o melhor fuzzy (secao 8)."""
+    nome_norm, prefixo_norm = norm_supplier(nome), norm_supplier(prefixo)
+    if not nome_norm or not prefixo_norm:
+        return 0.0
+    tokens_nome = set(nome_norm.lower().split())
+    tokens_prefixo = set(prefixo_norm.lower().split())
+    menor = tokens_nome if len(tokens_nome) <= len(tokens_prefixo) else tokens_prefixo
+    subconjunto = tokens_nome <= tokens_prefixo or tokens_prefixo <= tokens_nome
+    if subconjunto and menor - _TOKENS_GENERICOS:
+        return 100.0
+    return max(
+        fuzz.token_sort_ratio(nome_norm, prefixo_norm),
+        fuzz.ratio(nome_norm.replace(" ", ""), prefixo_norm.replace(" ", "")),
+    )
+
+
+def aceitar_prefixos_catapult(
+    nomes: Sequence[str | None], prefixos: Sequence[str], piso: float = _PISO_NOME_CATAPULT,
+) -> tuple[list[str], dict[str, float]]:
+    """Prefixos de PO que sao confiavelmente o mesmo fornecedor de `nomes`.
+
+    Devolve `(aceitos, scores)` - `scores` e a melhor pontuacao de cada prefixo
+    distinto, pra diagnostico em log. Igualdade tem precedencia; mais de um
+    aceito = ambiguo, quem chama desempata por itens e valor (secao 8).
+    """
+    distintos = list(dict.fromkeys(prefixo for prefixo in prefixos if prefixo))
+    scores = {
+        prefixo: max((pontuar_nome_catapult(nome, prefixo) for nome in nomes), default=0.0)
+        for prefixo in distintos
+    }
+    alvos = {norm_supplier(nome) for nome in nomes if norm_supplier(nome)}
+    exatos = [prefixo for prefixo in distintos if norm_supplier(prefixo) in alvos]
+    if exatos:
+        return exatos, scores
+    return [prefixo for prefixo in distintos if scores[prefixo] >= piso], scores
+
+
+# ---------------------------------------------------------------------------
+# Atribuicao 1-para-1, usada pelas duas frentes (secao 5)
+# ---------------------------------------------------------------------------
+
+def _atribuir_guloso(
+    pares: list[tuple[float, float, int, int]],
+) -> dict[int, tuple[float, int, bool]]:
+    """1-para-1 guloso sobre `(score, score_simetrico, i, j)`: o maior score
+    ganha, o simetrico desempata e cada indice so e usado uma vez; o resto tenta
+    o proximo candidato acima do piso (secao 5).
+
+    Devolve `{i: (score, j, indistinguivel)}`. `indistinguivel` = havia outro
+    candidato com os DOIS scores iguais disputando o mesmo `i` ou o mesmo `j`,
+    ou seja, nem o simetrico separou os dois - quem chama marca `ambiguous`.
+    """
+    ordenados = sorted(pares, key=lambda par: (-par[0], -par[1], par[2], par[3]))
+    empates_invoice = Counter((score, simetrico, i) for score, simetrico, i, _ in pares)
+    empates_outro = Counter((score, simetrico, j) for score, simetrico, _, j in pares)
+
+    usados_invoice: set[int] = set()
+    usados_outro: set[int] = set()
+    escolhidos: dict[int, tuple[float, int, bool]] = {}
+    for score, simetrico, i, j in ordenados:
+        if i in usados_invoice or j in usados_outro:
+            continue
+        usados_invoice.add(i)
+        usados_outro.add(j)
+        indistinguivel = (empates_invoice[(score, simetrico, i)] > 1
+                          or empates_outro[(score, simetrico, j)] > 1)
+        escolhidos[i] = (score, j, indistinguivel)
+    return escolhidos
+
+
+# ---------------------------------------------------------------------------
+# Match de itens contra a cotacao (secao 10)
+# ---------------------------------------------------------------------------
+
+def match_items(
+    invoice_lines: Sequence[InvoiceLine],
+    quote_lines: Sequence[QuoteLine],
+    fuzzy_threshold: float = FUZZY_THRESHOLD,
+    abs_tol: Decimal = ABS_TOL,
+    pct_tol: Decimal = PCT_TOL,
+    *,
+    sinonimos: Mapping[str, str] | None = None,
+) -> list[ItemMatch]:
+    """Casa itens da invoice com itens da cotacao, em cascata: preco, nome sobre o
+    residuo, resto 'unmatched' (secao 10). A ordem de `invoice_lines` e preservada."""
+    cotacoes = [
+        cotacao for cotacao in quote_lines
+        if cotacao.price is not None and Decimal(str(cotacao.price)) > 0
+    ]
+
+    matches: dict[Any, ItemMatch] = {}
+    residuo: list[InvoiceLine] = []
+
+    # --- Etapa 1: assinatura de preco -------------------------------------
+    for linha in invoice_lines:
+        if linha.unit_price is None:
+            residuo.append(linha)
+            continue
+
+        candidatos = [
+            cotacao for cotacao in cotacoes
+            if within_tolerance(linha.unit_price, cotacao.price, abs_tol, pct_tol)
+            and not grades_conflict(linha.description, cotacao.item_name)
+        ]
+        if not candidatos:
+            residuo.append(linha)
+            continue
+
+        texto_invoice = norm_item(linha.description, sinonimos)
+        pontuados = []
+        for cotacao in candidatos:
+            texto_cotacao = norm_item(cotacao.item_name, sinonimos)
+            pontuados.append((
+                float(fuzz.token_set_ratio(texto_invoice, texto_cotacao)),
+                float(fuzz.token_sort_ratio(texto_invoice, texto_cotacao)),
+                cotacao,
+            ))
+        pontuados.sort(key=lambda par: (-par[0], -par[1]))
+
+        melhor_score, melhor_simetrico, melhor_cotacao = pontuados[0]
+        if melhor_score < EXACT_MIN_SCORE:
+            residuo.append(linha)
+            continue
+
+        empatado = sum(1 for score, simetrico, _ in pontuados
+                       if (score, simetrico) == (melhor_score, melhor_simetrico)) > 1
+        matches[linha.key] = ItemMatch(
+            linha.key, melhor_cotacao.key, "exact", melhor_score,
+            ambiguous=empatado or melhor_score < CONFIDENT_SCORE,
+        )
+
+    # --- Etapa 2: nome do item, sobre o residuo ---------------------------
+    # Laco simples em vez de rapidfuzz.process.cdist: cdist exige numpy so pra
+    # montar a matriz, e aqui ela e minuscula (um fornecedor por vez).
+    if residuo and cotacoes:
+        textos_invoice = [norm_item(linha.description, sinonimos) for linha in residuo]
+        textos_cotacao = [norm_item(cotacao.item_name, sinonimos) for cotacao in cotacoes]
+
+        pares: list[tuple[float, float, int, int]] = []
+        for idx_invoice, texto_invoice in enumerate(textos_invoice):
+            for idx_cotacao, texto_cotacao in enumerate(textos_cotacao):
+                score = fuzz.token_set_ratio(
+                    texto_invoice, texto_cotacao, score_cutoff=fuzzy_threshold
+                )
+                if score and not grades_conflict(residuo[idx_invoice].description,
+                                                 cotacoes[idx_cotacao].item_name):
+                    simetrico = float(fuzz.token_sort_ratio(texto_invoice, texto_cotacao))
+                    pares.append((float(score), simetrico, idx_invoice, idx_cotacao))
+
+        for idx_invoice, (score, idx_cotacao, indistinguivel) in _atribuir_guloso(pares).items():
+            matches[residuo[idx_invoice].key] = ItemMatch(
+                residuo[idx_invoice].key, cotacoes[idx_cotacao].key, "fuzzy", score,
+                ambiguous=score < CONFIDENT_SCORE or indistinguivel,
+            )
+
+    # --- Etapa 3: o que sobrou --------------------------------------------
+    return [
+        matches.get(linha.key, ItemMatch(linha.key, None, "unmatched", None))
+        for linha in invoice_lines
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Match de itens contra o PO do Catapult, comparacao='erp' (secoes 11 e 12)
+# ---------------------------------------------------------------------------
+
+# "xxx" no Supplier Unit ID e placeholder de codigo nao cadastrado no Catapult,
+# nunca um codigo de catalogo de verdade (achado real: Smirnoff Ice Pack,
+# Florida Distributing - spec-codigo-placeholder-casa-por-nome). So o unico
+# valor confirmado; novo valor entra so com caso real.
+_CODIGOS_PLACEHOLDER = {"xxx"}
+
+
+def _codigo_e_placeholder(po: POLine) -> bool:
+    return (po.supplier_unit_id or "").strip().lower() in _CODIGOS_PLACEHOLDER
+
+
+def _po_zerado(po: POLine) -> bool:
+    """True quando `received` E `invoiced_total_cost` sao CONHECIDOS e os dois
+    zero: nada foi recebido nem faturado nessa linha (secoes 11 e 12)."""
+    recebido, custo = po.received, po.invoiced_total_cost
+    return recebido is not None and custo is not None and recebido == 0 and custo == 0
+
+
+def _indice_por_codigo(po_lines: Sequence[POLine]) -> dict[str, POLine]:
+    """Codigo normalizado -> primeira PO que o tem, testando `supplier_unit_id` e
+    depois `scancode`, na ordem de `po_lines`."""
+    indice: dict[str, POLine] = {}
+    for po in po_lines:
+        for codigo in (norm_code(po.supplier_unit_id), norm_code(po.scancode)):
+            if codigo:
+                indice.setdefault(codigo, po)
+    return indice
+
+
+def _po_por_codigo(
+    line: InvoiceCodeLine, code_index: dict[str, POLine], reclamados: set[Any],
+    *, permitir_zerado: bool,
+) -> POLine | None:
+    """PO cujo codigo bate com item_code/upc/handwritten_code, nessa ordem de
+    prioridade. `permitir_zerado` separa a Etapa 1 da 2b (secao 11). Cada
+    candidato tenta `norm_code` (com letra) primeiro e, so se esse nao bater
+    com nada no indice, `norm_code_so_digitos` sobre o MESMO valor cru
+    (spec-codigo-na-nao-casa R7-R9) — nunca o contrario, pra nao reabrir a
+    colisao que `norm_code` corrige."""
+    candidatos = (line.item_code, line.upc, line.handwritten_code)
+    for bruto in candidatos:
+        for codigo in (norm_code(bruto), norm_code_so_digitos(bruto)):
+            if not codigo or codigo not in code_index:
+                continue
+            po = code_index[codigo]
+            if po.key in reclamados:
+                continue
+            if not permitir_zerado and _po_zerado(po):
+                continue
+            return po
+    return None
+
+
+def _pontuar_pares_nome(
+    residual: Sequence[InvoiceCodeLine], disponiveis: Sequence[POLine],
+    sinonimos: Mapping[str, str] | None, fuzzy_threshold: float,
+) -> list[tuple[float, float, int, int]]:
+    """Score e score simetrico de cada par residuo x PO disponivel, pelo melhor
+    entre `item_name` e `receipt_alias` do PO (secoes 5 e 11). Devolve
+    (score, score_simetrico, indice_invoice, indice_po).
+
+    PO com codigo placeholder (`_codigo_e_placeholder`,
+    spec-codigo-placeholder-casa-por-nome) usa `PLACEHOLDER_MIN_SCORE` em vez
+    de `fuzzy_threshold` - sem nenhum codigo pra apoiar o par, o piso normal
+    (calibrado pra quando o codigo poderia ter batido e nao bateu) fica alto
+    demais pro caso onde nunca havia codigo nenhum pra comecar."""
+    textos_invoice = [norm_item(linha.description, sinonimos) for linha in residual]
+    pares: list[tuple[float, float, int, int]] = []
+    for idx_invoice, texto_invoice in enumerate(textos_invoice):
+        for idx_po, po in enumerate(disponiveis):
+            piso = PLACEHOLDER_MIN_SCORE if _codigo_e_placeholder(po) else fuzzy_threshold
+            melhor = (0.0, 0.0)
+            for nome in (po.item_name, po.receipt_alias):
+                if not nome:
+                    continue
+                texto_po = norm_item(nome, sinonimos)
+                score = fuzz.token_set_ratio(texto_invoice, texto_po,
+                                             score_cutoff=piso)
+                if score:
+                    simetrico = float(fuzz.token_sort_ratio(texto_invoice, texto_po))
+                    melhor = max(melhor, (float(score), simetrico))
+            if melhor[0]:
+                pares.append((melhor[0], melhor[1], idx_invoice, idx_po))
+    return pares
+
+
 def match_items_po(
     invoice_lines: Sequence[InvoiceCodeLine],
     po_lines: Sequence[POLine],
@@ -707,159 +964,76 @@ def match_items_po(
     *,
     sinonimos: Mapping[str, str] | None = None,
 ) -> list[POMatch]:
-    """Casa itens da invoice com itens do PO (Catapult), em cascata.
+    """Casa itens da invoice com itens do PO, em cascata: codigo, nome sobre o
+    residuo, codigo contra linha zerada como ultimo recurso, resto 'unmatched'.
 
-    Etapa 1 — codigo. `item_code`/`upc`/`handwritten_code` da invoice contra
-    `supplier_unit_id`/`scancode` do PO, normalizados por `norm_code` — os
-    tres sao candidatos de codigo, tentados nessa ordem, e o primeiro que
-    bater com o PO ganha. `handwritten_code` entra por ultimo de proposito:
-    quando o codigo IMPRESSO bate, ele e mais confiavel; quando nao bate com
-    nada (caso Cheney Brothers — o impresso e catalogo do fornecedor, nao do
-    Catapult), o numero escrito a mao e a ultima tentativa antes de cair pro
-    nome. So "cola" se bater de verdade com um codigo real do PO — em
-    fornecedor onde a anotacao a mao e outra coisa (ex.: codigo da cotacao
-    semanal), simplesmente nao acha nada em `code_index` e a linha segue pro
-    residuo normalmente, sem risco de casar errado. O PO nunca tem linha
-    duplicada (garantia de quem popula `po_lines`), entao um codigo
-    normalizado aponta pra no maximo um item — ao contrario de `match_items`,
-    aqui nao existe N-para-1 legitimo. Nem toda invoice tem algum desses
-    codigos — sem nenhum, a linha cai direto no residuo.
-
-    Um candidato de codigo que bate com uma linha de PO "zerada" (`received`
-    e `invoiced_total_cost` conhecidos e os dois 0 — `ordered` sozinho não
-    conta, ver `_po_zerado`) NAO conta como match — essa linha nunca foi de
-    fato recebida/faturada neste PO, so existe na grade porque o Catapult
-    lista o catalogo inteiro do fornecedor (ou um cadastro alternativo do
-    mesmo item, caso Restaurant Depot abaixo). Aceitar esse "match" rouba a
-    linha certa (que só seria achada na Etapa 2, por nome) e deixa
-    `valor_po`/`qtd_po` com zero em vez do valor real. Nesse caso a linha da
-    invoice cai pro residuo, como se o codigo nao tivesse batido com nada.
-
-    Dois casos reais confirmados: MENA/11126, Sococo Agua de Coco (codigo
-    impresso colidiu com o Supplier Unit ID de um item do catalogo sem
-    nenhuma atividade — `ordered`/`received`/`invoiced_total_cost` todos 0);
-    Restaurant Depot/21147023139465080, Nestle Pure Life 40x0.5L (o item_code
-    da invoice bateu com o cadastro do produto vendido A UNIDADE, `ordered`=
-    160 mas `received`/`invoiced_total_cost`=0 — o PACK de 40 unidades que a
-    invoice de fato vendia estava numa linha de PO SEPARADA, só achada por
-    nome depois deste fix).
-
-    Etapa 2 — nome do item, fuzzy (`norm_item` + `token_set_ratio`), sobre o
-    residuo da Etapa 1 e so contra item do PO ainda nao reclamado E nao
-    "zerado" (mesmo `_po_zerado` da Etapa 1 — uma linha decoy pode ter nome
-    textualmente mais parecido com a descricao da invoice do que a linha
-    certa, caso real Restaurant Depot acima: 'Agua Pure Life' bate melhor
-    por nome com "Nestle Pure Life - Purified Water - 40/0.5L" do que 'Pack
-    Agua 40un Nestle Pure Life 500ml', mas é a linha errada — sem esse
-    filtro aqui, rejeitar so na Etapa 1 nao bastava, o nome roubava a linha
-    certa de novo na Etapa 2). Tenta o melhor score entre `item_name` e
-    `receipt_alias` de cada `POLine` — a invoice costuma falar mais perto do
-    `receipt_alias` (grafia curta, de recibo) do que do `item_name` de
-    cadastro. Guloso e 1-para-1: maior score fica com o par, o resto tenta o
-    proximo candidato acima do limiar.
-
-    Etapa 3 — o que sobrou fica 'unmatched'.
-
-    A ordem de `invoice_lines` e preservada no retorno. Pra saber quais itens
-    do PO nenhuma linha da invoice reclamou (o "reverse check" do
-    fluxograma — recebido/pedido mas nao faturado), ver `po_items_sem_invoice`.
+    Regras e casos reais de cada etapa na secao 11 do topo. A ordem de
+    `invoice_lines` e preservada no retorno.
     """
-    code_index: dict[str, POLine] = {}
-    for po in po_lines:
-        for codigo in (norm_code(po.supplier_unit_id), norm_code(po.scancode)):
-            if codigo:
-                code_index.setdefault(codigo, po)
+    code_index = _indice_por_codigo(po_lines)
 
     matches: dict[Any, POMatch] = {}
-    claimed: set[Any] = set()
-    residual: list[InvoiceCodeLine] = []
+    reclamados: set[Any] = set()
+    residuo: list[InvoiceCodeLine] = []
 
-    # --- Etapa 1: codigo ----------------------------------------------
-    for line in invoice_lines:
-        po = next(
-            (code_index[c] for c in (norm_code(line.item_code), norm_code(line.upc),
-                                      norm_code(line.handwritten_code))
-             if c and c in code_index and not _po_zerado(code_index[c])),
-            None,
-        )
+    # --- Etapa 1: codigo, em linha de PO ativa ----------------------------
+    # Sem checar `reclamados`: duas linhas da invoice com o MESMO codigo casam as
+    # duas com a mesma PO e se somam depois em `_comparar_grupo`.
+    for linha in invoice_lines:
+        po = _po_por_codigo(linha, code_index, set(), permitir_zerado=False)
         if po is None:
-            residual.append(line)
+            residuo.append(linha)
             continue
-        matches[line.key] = POMatch(line.key, po.key, "codigo", None)
-        claimed.add(po.key)
+        matches[linha.key] = POMatch(linha.key, po.key, "codigo", None)
+        reclamados.add(po.key)
 
-    # --- Etapa 2: nome (item_name OU receipt_alias), sobre o residuo,
-    # contra PO ainda nao reclamado --------------------------------------
-    disponiveis = [po for po in po_lines if po.key not in claimed and not _po_zerado(po)]
-    if residual and disponiveis:
-        inv_texts = [norm_item(l.description, sinonimos) for l in residual]
-
-        pairs: list[tuple[float, int, int]] = []
-        for i, inv in enumerate(inv_texts):
-            for j, po in enumerate(disponiveis):
-                score = max(
-                    (fuzz.token_set_ratio(inv, norm_item(nome, sinonimos),
-                                          score_cutoff=fuzzy_threshold) or 0.0
-                     for nome in (po.item_name, po.receipt_alias) if nome),
-                    default=0.0,
-                )
-                if score:
-                    pairs.append((float(score), i, j))
-        pairs.sort(key=lambda p: (-p[0], p[1], p[2]))
-
-        used_invoice: set[int] = set()
-        used_po: set[int] = set()
-        for score, i, j in pairs:
-            if i in used_invoice or j in used_po:
-                continue
-            used_invoice.add(i)
-            used_po.add(j)
-            matches[residual[i].key] = POMatch(
-                residual[i].key, disponiveis[j].key, "nome", score,
-                ambiguous=score < CONFIDENT_SCORE,
+    # --- Etapa 2: nome, sobre o residuo, contra PO livre e nao zerado -----
+    disponiveis = [
+        po for po in po_lines if po.key not in reclamados and not _po_zerado(po)
+    ]
+    if residuo and disponiveis:
+        pares = _pontuar_pares_nome(residuo, disponiveis, sinonimos, fuzzy_threshold)
+        for idx_invoice, (score, idx_po, indistinguivel) in _atribuir_guloso(pares).items():
+            matches[residuo[idx_invoice].key] = POMatch(
+                residuo[idx_invoice].key, disponiveis[idx_po].key, "nome", score,
+                ambiguous=score < CONFIDENT_SCORE or indistinguivel,
             )
-            claimed.add(disponiveis[j].key)
+            reclamados.add(disponiveis[idx_po].key)
 
-    # --- Etapa 2b: codigo contra linha ZERADA, ultimo recurso ----------------
-    # O codigo bate, mas a linha nao foi recebida/faturada neste PO: o item da
-    # invoice existe e a divergencia (valor/quantidade contra $0) e o que se
-    # quer mostrar — spec-po-zerado-ultimo-recurso.
-    for line in invoice_lines:
-        if line.key in matches:
+    # --- Etapa 2b: codigo contra linha ZERADA, ultimo recurso -------------
+    # Aqui `reclamados` JA conta: uma PO zerada so e dada pra uma linha.
+    for linha in invoice_lines:
+        if linha.key in matches:
             continue
-        po = next(
-            (code_index[c] for c in (norm_code(line.item_code), norm_code(line.upc),
-                                      norm_code(line.handwritten_code))
-             if c and c in code_index and code_index[c].key not in claimed),
-            None,
-        )
+        po = _po_por_codigo(linha, code_index, reclamados, permitir_zerado=True)
         if po is not None:
-            matches[line.key] = POMatch(line.key, po.key, "codigo", None)
-            claimed.add(po.key)
+            matches[linha.key] = POMatch(linha.key, po.key, "codigo", None)
+            reclamados.add(po.key)
 
     # --- Etapa 3: o que sobrou --------------------------------------------
     return [
-        matches.get(line.key, POMatch(line.key, None, "unmatched", None))
-        for line in invoice_lines
+        matches.get(linha.key, POMatch(linha.key, None, "unmatched", None))
+        for linha in invoice_lines
     ]
 
 
 def po_items_sem_invoice(
     po_lines: Sequence[POLine], matches: Sequence[POMatch],
 ) -> list[Any]:
-    """Chaves do PO que nenhuma linha da invoice reclamou.
-
-    O "reverse check" do fluxograma: item pedido/recebido no PO mas sem par
-    em nenhuma linha da invoice processada nesta chamada.
+    """Chaves do PO que nenhuma linha da invoice reclamou - o "reverse check" do
+    fluxograma (pedido/recebido mas nao faturado).
 
     Hoje isto so alimenta relatorio/log: `fat_conciliacao_item` exige
-    `id_invoice_item` (NOT NULL), entao persistir esta lista como linha
-    propria ainda depende de estender o schema — fora do escopo desta rodada,
-    que e so o motor.
+    `id_invoice_item` (NOT NULL), entao persistir a lista como linha propria ainda
+    depende de estender o schema.
     """
-    reclamados = {m.po_key for m in matches if m.po_key is not None}
+    reclamados = {match.po_key for match in matches if match.po_key is not None}
     return [po.key for po in po_lines if po.key not in reclamados]
 
+
+# ---------------------------------------------------------------------------
+# Quantidade (secao 13)
+# ---------------------------------------------------------------------------
 
 def qty_matches_po(
     invoice_qty: Decimal | float | None,
@@ -868,12 +1042,8 @@ def qty_matches_po(
     abs_tol: Decimal = ABS_TOL,
     pct_tol: Decimal = PCT_TOL,
 ) -> bool:
-    """True se invoice.qtd, PO.Ordered e PO.Received batem entre si, par a
-    par, dentro da tolerancia (`within_tolerance`, igual ao resto do motor).
-
-    Falta de qualquer um dos tres e "nao da pra comparar", nao "bate" — quem
-    chama decide o que fazer com o None (ver `conciliacao/reconcile_erp.py`).
-    """
+    """True se invoice.qtd, PO.Ordered e PO.Received batem entre si, par a par,
+    dentro da tolerancia. Faltar um dos tres nao "bate" (secoes 1 e 13)."""
     if invoice_qty is None or po_ordered is None or po_received is None:
         return False
     return (within_tolerance(invoice_qty, po_ordered, abs_tol, pct_tol)
@@ -887,36 +1057,23 @@ def qty_matches_po_cases(
     abs_tol: Decimal = ABS_TOL,
     pct_tol: Decimal = PCT_TOL,
 ) -> bool:
-    """True se a contagem de CAIXAS da invoice bate com `Ordered` do PO.
-
-    Regra de negocio do acougue (item de peso variavel, confirmada com o
-    cliente): no pedido, o que se sabe com exatidao e a caixa — o peso so e
-    conhecido na conferencia, porque varia por natureza do produto (fresco x
-    congelado, que carrega agua a mais). Por isso a divergencia de
-    QUANTIDADE compara caixa contra caixa (`invoice_cases` x `po_ordered`).
-
-    `po_received` fica de fora de proposito: no Catapult, para item catch-
-    weight, `Received` e o peso realmente pesado na doca, nao uma contagem
-    de caixas — nao e comparavel a `Ordered` nem a `invoice_cases`. O peso
-    continua validado do lado do VALOR da linha (`compare_price`), nao aqui.
-
-    Falta de qualquer um dos dois e "nao da pra comparar", nao "bate" —
-    mesma convencao de `qty_matches_po`.
-    """
+    """True se a contagem de CAIXAS da invoice bate com `Ordered` do PO - regra do
+    acougue, `Received` fica de fora de proposito (secao 13)."""
     if invoice_cases is None or po_ordered is None:
         return False
     return within_tolerance(invoice_cases, po_ordered, abs_tol, pct_tol)
 
 
-def invoice_line_total(
-    quantity: Decimal | float | None,
-    unit_price: Decimal | float | None,
-    total_price: Decimal | float | None,
-) -> Decimal | None:
-    """Valor faturado da linha: `valor_linha`; se ausente, cai pra
-    qtd x preco unitario (mesmo fallback do fluxograma)."""
-    if total_price is not None:
-        return Decimal(str(total_price))
-    if quantity is not None and unit_price is not None:
-        return Decimal(str(quantity)) * Decimal(str(unit_price))
-    return None
+def qty_matches_po_received(
+    invoice_qty: Decimal | float | None,
+    po_received: Decimal | float | None,
+    abs_tol: Decimal = ABS_TOL,
+    pct_tol: Decimal = PCT_TOL,
+) -> bool:
+    """True se a quantidade da invoice bate com `Received` do PO - espelho de
+    `qty_matches_po_cases`: aqui quem fica de fora de proposito e `Ordered`
+    (spec-caixa-letra-florida-distributing, escopado por fornecedor - `Ordered`
+    furado em quase toda linha da PO real, so `Received` e confiavel)."""
+    if invoice_qty is None or po_received is None:
+        return False
+    return within_tolerance(invoice_qty, po_received, abs_tol, pct_tol)

@@ -270,7 +270,7 @@ def _fluxo_com(monkeypatch, tmp_path, ja_conciliada):
     rel.write_bytes(b"x")
     monkeypatch.setattr(rf, "ja_conciliada_erp", lambda conn, id_: ja_conciliada)
     monkeypatch.setattr(rf, "save_reconciliation_header", lambda conn, d: 1)
-    monkeypatch.setattr(rf, "save_reconciliation_items", lambda *a: None)
+    monkeypatch.setattr(rf, "save_reconciliation_items", lambda *a, **k: None)
     monkeypatch.setattr(rf, "_sincronizar_pendentes", lambda *a: None)
     monkeypatch.setattr(rf.proc, "concluir_etapa", lambda *a, **k: None)
     monkeypatch.setattr(rf, "gerar_relatorio_divergencia_erp", lambda h, r: rel)
