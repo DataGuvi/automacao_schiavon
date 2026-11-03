@@ -38,9 +38,6 @@ from commons.matcher import (  # noqa: E402
     norm_text,
     parse_price_range,
     po_items_sem_invoice,
-    qty_matches_po,
-    qty_matches_po_cases,
-    qty_matches_po_received,
     within_tolerance,
 )
 
@@ -143,6 +140,22 @@ def test_norm_item_frase_vem_antes_do_token():
     mapa = {"CHIX": "CHICKEN", "CHIX TENDER": "TENDER STRIPS"}
     assert norm_item("Chix Tender", mapa) == "TENDER STRIPS"
     assert norm_item("Chix Wings", mapa) == "CHICKEN WINGS"
+
+
+def test_norm_item_frase_casa_no_meio_da_descricao():
+    """spec-depara-frase-no-meio-da-descricao: caso real Ice Cream Daazken --
+    'ICE CREAM' (2 palavras) tem que traduzir mesmo cercado de outras
+    palavras, sem precisar cadastrar 'ICE' sozinho (colidiria com GELO)."""
+    mapa = {"ICE CREAM": "SORVETE"}
+    assert norm_item("Ice Cream Milho Verde 48fl 1.5 QT", mapa) == \
+        "SORVETE MILHO VERDE 48FL 1 5 QT"
+    from rapidfuzz import fuzz
+    assert fuzz.token_set_ratio(
+        norm_item("Ice Cream Milho Verde 48fl 1.5 QT", mapa),
+        "SORVETE DAAZKEN MILHO VERDE",
+    ) >= CONFIDENT_SCORE
+    # "ICE" sozinho (sem a palavra CREAM do lado) nao e tocado -- sem colisao com GELO.
+    assert norm_item("Ice Bag 10Lb", mapa) == "ICE BAG 10LB"
 
 
 def test_frase_do_de_para_faz_a_invoice_casar_com_o_po_por_nome():
@@ -861,58 +874,6 @@ def test_desempate_1_para_1_quando_dois_itens_batem_no_mesmo_receipt_alias():
     vencedores = [k for k, m in matches.items() if m.match_level == "nome"]
     assert vencedores == [10]
     assert matches[11].match_level == "unmatched"
-
-
-# ---------------------------------------------------------------------------
-# Comparacao qty/preco contra o PO
-# ---------------------------------------------------------------------------
-
-def test_qty_matches_po_as_tres_batem():
-    assert qty_matches_po(Decimal("10"), Decimal("10"), Decimal("10")) is True
-    # 1 centavo... quantidade usa a mesma tolerancia (abs 0.01 / pct 0.5%).
-    assert qty_matches_po(Decimal("200"), Decimal("201"), Decimal("200")) is True
-
-
-def test_qty_matches_po_diverge():
-    assert qty_matches_po(Decimal("10"), Decimal("8"), Decimal("8")) is False
-    assert qty_matches_po(Decimal("10"), Decimal("10"), Decimal("7")) is False
-
-
-def test_qty_matches_po_falta_de_dado_nao_bate():
-    assert qty_matches_po(None, Decimal("10"), Decimal("10")) is False
-    assert qty_matches_po(Decimal("10"), None, Decimal("10")) is False
-
-
-def test_qty_matches_po_cases_caixa_bate_mesmo_com_peso_variavel():
-    """Caso real Cheney Brothers/05-9100063327: Ordered=3 caixas, Received=209
-    lb (peso pesado na doca). Caixa da invoice bate com Ordered -> OK, mesmo
-    o peso (209) nunca podendo bater com uma contagem de caixa."""
-    assert qty_matches_po_cases(Decimal("3"), Decimal("3")) is True
-
-
-def test_qty_matches_po_cases_diverge():
-    assert qty_matches_po_cases(Decimal("2"), Decimal("3")) is False
-
-
-def test_qty_matches_po_cases_falta_de_dado_nao_bate():
-    assert qty_matches_po_cases(None, Decimal("3")) is False
-    assert qty_matches_po_cases(Decimal("3"), None) is False
-
-
-def test_qty_matches_po_received_bate_ignorando_ordered():
-    """Caso real Florida Distributing: Ordered furado (24), quantity ja
-    multiplicado (144) bate exato com Received (144) -- Ordered nunca entra
-    na funcao (spec-caixa-letra-florida-distributing)."""
-    assert qty_matches_po_received(Decimal("144"), Decimal("144")) is True
-
-
-def test_qty_matches_po_received_diverge():
-    assert qty_matches_po_received(Decimal("6"), Decimal("144")) is False
-
-
-def test_qty_matches_po_received_falta_de_dado_nao_bate():
-    assert qty_matches_po_received(None, Decimal("144")) is False
-    assert qty_matches_po_received(Decimal("144"), None) is False
 
 
 def test_mesmo_item_estado_diferente_frango_fresco_e_congelado():

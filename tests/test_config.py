@@ -82,6 +82,7 @@ def test_config_minima_carrega_com_defaults():
     assert c.vision.modelo == "claude-sonnet-4-6"
     assert c.ecrs.headless is True
     assert c.sinonimos_sheet_id == ""
+    assert c.conferencia_manual_sheet_id == ""
     assert c.alerta_email == ""
 
 

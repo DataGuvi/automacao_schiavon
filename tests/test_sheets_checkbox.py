@@ -26,10 +26,10 @@ def _servico(abas):
 def test_checkbox_na_coluna_e_da_aba_certa(monkeypatch):
     svc = _servico({"De-Para": 11, "Pendentes": 22})
     monkeypatch.setattr(sheets, "_service", lambda: svc)
-    sheets.garantir_checkbox("sheet-1", "Pendentes", 4)
+    sheets.garantir_checkbox("sheet-1", "Pendentes", 4, 169)
     corpo = svc.spreadsheets.return_value.batchUpdate.call_args.kwargs["body"]
     req = corpo["requests"][0]["setDataValidation"]
-    assert req["range"] == {"sheetId": 22, "startRowIndex": 1,
+    assert req["range"] == {"sheetId": 22, "startRowIndex": 1, "endRowIndex": 169,
                             "startColumnIndex": 4, "endColumnIndex": 5}
     assert req["rule"]["condition"]["type"] == "BOOLEAN"
 
@@ -37,7 +37,7 @@ def test_checkbox_na_coluna_e_da_aba_certa(monkeypatch):
 def test_checkbox_aba_inexistente_levanta_sheets_error(monkeypatch):
     monkeypatch.setattr(sheets, "_service", lambda: _servico({"De-Para": 11}))
     try:
-        sheets.garantir_checkbox("sheet-1", "Pendentes", 4)
+        sheets.garantir_checkbox("sheet-1", "Pendentes", 4, 169)
     except sheets.SheetsError as exc:
         assert "Pendentes" in str(exc)
     else:

@@ -36,15 +36,17 @@ def main() -> None:
     linhas = read_values(sheet_id, f"{_ABA_PENDENTES}!A1:E1")
     cab = linhas[0] if linhas else []
     tem_cabecalho = len(cab) > _COLUNA_RESOLVIDO and bool(str(cab[_COLUNA_RESOLVIDO]).strip())
+    todas = read_values(sheet_id, f"{_ABA_PENDENTES}!A:A")
+    total_linhas = len(todas)
     print(f"  cabecalho da E: {'ja existe' if tem_cabecalho else 'sera escrito'}")
-    print("  checkbox: coluna E, da linha 2 em diante")
+    print(f"  checkbox: coluna E, da linha 2 ate {total_linhas}")
     if not args.aplicar:
         print("  [simulacao] use --aplicar para gravar")
         return
 
     if not tem_cabecalho:
         update_values(sheet_id, f"{_ABA_PENDENTES}!E1", [[_CABECALHO]])
-    garantir_checkbox(sheet_id, _ABA_PENDENTES, _COLUNA_RESOLVIDO)
+    garantir_checkbox(sheet_id, _ABA_PENDENTES, _COLUNA_RESOLVIDO, total_linhas)
     print("  ok")
 
 

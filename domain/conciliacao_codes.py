@@ -61,9 +61,10 @@ class IssueCode(StrEnum):
 
     # --- comparação contra o PO do Catapult (nível da linha) — comparacao='erp'
     NO_PO_FOR_ITEM = "no_po_for_item"              # item da nota sem par no PO
-    QTY_MISMATCH_PO = "qty_mismatch_po"            # invoice x Ordered x Received divergem
+    QTY_MISMATCH_PO = "qty_mismatch_po"            # Ordered != Received, junto de divergencia de valor
     PRICE_MISMATCH_PO = "price_mismatch_po"        # valor da linha x Invoiced Total Cost diverge
     PO_FECHADO_MANUAL = "po_fechado_manual"        # PO fechado a mao no Catapult; item identificado
+    PEDIDO_ZERADO = "pedido_zerado"                # Ordered=0 com Received>0: sem pedido, conferir a mao
 
     # --- qualidade da leitura (nível da linha) — ligam `revisar`, não o veredito
     LOW_VISION_CONFIDENCE = "low_vision_confidence"  # confiança da leitura abaixo do piso
@@ -87,9 +88,10 @@ _DESCRICAO: dict[IssueCode, str] = {
     IssueCode.PRICE_ABOVE_QUOTE: "Faturado acima do cotado, além da tolerância.",
     IssueCode.PRICE_BELOW_QUOTE: "Faturado abaixo do cotado, além da tolerância.",
     IssueCode.NO_PO_FOR_ITEM: "Item da nota sem par no PO do Catapult.",
-    IssueCode.QTY_MISMATCH_PO: "Quantidade faturada não bate com Ordered/Received do PO.",
+    IssueCode.QTY_MISMATCH_PO: "Ordered e Received do PO diferem (informativo, junto de divergência de valor).",
     IssueCode.PRICE_MISMATCH_PO: "Valor da linha não bate com o Invoiced Total Cost do PO.",
     IssueCode.PO_FECHADO_MANUAL: "PO já fechado à mão no Catapult: item identificado, sem PO para comparar.",
+    IssueCode.PEDIDO_ZERADO: "Pedido zerado com quantidade recebida: sem pedido para comparar.",
     IssueCode.LOW_VISION_CONFIDENCE: "Leitura do PDF abaixo do piso de confiança.",
     IssueCode.HANDWRITTEN_PRESENT: "Linha com anotação à mão na nota.",
 }

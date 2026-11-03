@@ -92,10 +92,15 @@ def estado_pendentes(sheet_id: str) -> tuple[set[str], set[str]]:
     return marcados, abertos
 
 
-def _checkbox_sem_falhar(sheet_id: str) -> None:
-    """Checkbox é secundário: as linhas já foram gravadas, falha só loga (`manutencao.preparar_pendentes` refaz)."""
+def _checkbox_sem_falhar(sheet_id: str, total_linhas: int) -> None:
+    """Checkbox é secundário: as linhas já foram gravadas, falha só loga (`manutencao.preparar_pendentes` refaz).
+
+    `total_linhas` limita a validação às linhas que existem de fato — faixa
+    sem limite faz o Sheets gravar `False` em milhares de linhas em branco
+    (ver `commons.sheets.garantir_checkbox`).
+    """
     try:
-        garantir_checkbox(sheet_id, _ABA_PENDENTES, _COLUNA_RESOLVIDO)
+        garantir_checkbox(sheet_id, _ABA_PENDENTES, _COLUNA_RESOLVIDO, total_linhas)
     except SheetsError:
         log.exception("checkbox da Pendentes nao aplicado")
 
@@ -139,5 +144,5 @@ def sincronizar_pendentes(sheet_id: str | None, novas: list[PendenteRow]) -> int
         sheet_id, _RANGE_PENDENTES,
         [[p.fornecedor, p.item, p.origem, p.data, False] for p in unicas.values()],
     )
-    _checkbox_sem_falhar(sheet_id)
+    _checkbox_sem_falhar(sheet_id, len(existentes) + len(unicas))
     return len(unicas)

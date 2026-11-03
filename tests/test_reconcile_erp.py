@@ -26,6 +26,7 @@ from domain.service.insumo_service import (  # noqa: E402
 )
 from conciliacao.reconcile_erp import (  # noqa: E402
     NO_PO_FOR_ITEM,
+    PEDIDO_ZERADO,
     PO_NAO_ENCONTRADA,
     PRICE_MISMATCH_PO,
     QTY_MISMATCH_PO,
@@ -35,14 +36,16 @@ from conciliacao.reconcile_erp import (  # noqa: E402
 
 
 def _po(key, item_name, supplier_unit_id=None, ordered=None, received=None,
-        invoiced_total_cost=None, receipt_alias=None, unit=None):
+        invoiced_total_cost=None, receipt_alias=None, invoiced_unit_cost=None,
+        ordered_unit_cost=None):
     return POLine(
         key, supplier_unit_id, None, item_name,
         None if ordered is None else Decimal(str(ordered)),
         None if received is None else Decimal(str(received)),
         None if invoiced_total_cost is None else Decimal(str(invoiced_total_cost)),
         receipt_alias,
-        unit,
+        None if invoiced_unit_cost is None else Decimal(str(invoiced_unit_cost)),
+        None if ordered_unit_cost is None else Decimal(str(ordered_unit_cost)),
     )
 
 
@@ -74,16 +77,22 @@ def test_item_conferido_qty_e_preco_batem():
     assert resultado["po_orphans"] == []
 
 
-def test_quantidade_divergente_gera_qty_mismatch():
+def test_quantidade_menor_sem_invoiced_unit_cost_vira_price_mismatch():
+    """Faturou 8 unidades onde o PO pediu/recebeu 10, no mesmo preco
+    unitario -- o valor total da linha ja nao bate com o PO (48.08 x 60.10),
+    entao a divergencia sai como PRICE_MISMATCH_PO (passo 1 da cascata),
+    nao QTY_MISMATCH_PO: sem uma checagem independente de contagem, uma
+    quantidade errada ao mesmo preco sempre se manifesta no total primeiro
+    (spec-qtd-mismatch-custo-unitario)."""
     po_lines = [_po(1, "Beef Brisket Boneless", supplier_unit_id="TEU45",
                      ordered="10", received="10", invoiced_total_cost="60.10")]
-    # Faturou 8, mas o PO pediu/recebeu 10 -> diverge em quantidade.
     items = [_item(100, "BEEF - Brisket / Maca de Peito", "8", "6.01", "48.08",
                     item_code="TEU45")]
 
     resultado = reconcile_items_against_po(items, po_lines)
     (linha,) = resultado["items"]
-    assert QTY_MISMATCH_PO in linha["issue_codes"]
+    assert PRICE_MISMATCH_PO in linha["issue_codes"]
+    assert QTY_MISMATCH_PO not in linha["issue_codes"]
     assert linha["has_issue"] is True
 
 
@@ -113,20 +122,6 @@ def test_item_peso_variavel_com_cases_confere_mesmo_com_ordered_diferente_de_rec
     assert linha["cases_invoice"] == Decimal("3")
     assert QTY_MISMATCH_PO not in linha["issue_codes"]
     assert linha["has_issue"] is False
-
-
-def test_item_peso_variavel_com_cases_diverge_quando_caixa_nao_bate():
-    """Mesmo cenario, mas a invoice faturou 2 caixas onde o PO pediu 3 —
-    divergencia de verdade, e a regra de cases tem que continuar acusando."""
-    po_lines = [_po(1, "Beef Sirloin Top Butt", supplier_unit_id="40102",
-                     ordered="3", received="140", invoiced_total_cost="841.40")]
-    items = [_item(100, "BEEF SIRLOIN TOP BUTT XT ANGUS N/R", "140.00", "6.01",
-                    "841.40", item_code="40102", cases="2")]
-
-    resultado = reconcile_items_against_po(items, po_lines, categoria_fornecedor="carne")
-    (linha,) = resultado["items"]
-    assert QTY_MISMATCH_PO in linha["issue_codes"]
-    assert linha["has_issue"] is True
 
 
 def test_variante_de_estado_herda_po_da_irma_ja_casada():
@@ -244,7 +239,8 @@ def test_receipt_alias_do_po_resgata_item_com_nome_de_cadastro_fraco():
 
     resultado_sem = reconcile_items_against_po(items, sem_alias)
     (linha_sem,) = resultado_sem["items"]
-    assert linha_sem["match_level"] == "unmatched"
+    # Sem o alias o nome nao casa; so o valor igual (spec-casamento-por-valor) acha o par.
+    assert linha_sem["match_level"] == "valor"
 
     resultado = reconcile_items_against_po(items, com_alias)
     (linha,) = resultado["items"]
@@ -274,8 +270,17 @@ def test_duas_linhas_da_invoice_casam_com_o_mesmo_item_do_po():
     Comparar cada linha ISOLADA contra o total do PO (2 x $21.79 == $43.58)
     sempre acusaria PRICE_MISMATCH_PO, mesmo a soma batendo exato — e o bug
     que este teste guarda. A soma das duas linhas bate com o total do PO,
-    entao so QTY_MISMATCH_PO deve aparecer (por causa do Ordered=0, nao do
-    preco)."""
+    entao nao ha PRICE_MISMATCH_PO.
+
+    Limite conhecido, aceito pelo usuario (spec-qtd-mismatch-custo-unitario):
+    sem `invoiced_unit_cost` (coluna que o PO real nao tem raspada aqui) o
+    passo 2 da cascata nunca roda, entao QTY_MISMATCH_PO NAO aparece mais —
+    diferente do comportamento antigo (que acusava por `Ordered=0` ser uma
+    divergencia real, mesmo com `Received` presente). A leitura de
+    quantidade da invoice e tratada como menos confiavel que o dado do
+    Catapult; esse caso fica mudo por desenho. (Mesmo com `invoiced_unit_cost`
+    presente, o passo 2 so compararia contra `Received`, nunca `Ordered` —
+    R2 — entao `Ordered=0` por si so deixou de ser o motivo do silencio.)"""
     po_lines = [_po(1, "Egg Farm Fresh Extra Large Dozen", supplier_unit_id=None,
                      ordered="0", received="2", invoiced_total_cost="43.58")]
     items = [
@@ -291,43 +296,26 @@ def test_duas_linhas_da_invoice_casam_com_o_mesmo_item_do_po():
         assert PRICE_MISMATCH_PO not in linha["issue_codes"], \
             "preco nao pode divergir: a SOMA das duas linhas bate com o total do PO"
         assert linha["price_diff"] == Decimal("0.00")
-        # Ordered=0 (fornecedor sem PO previo) diverge de verdade — nao e bug.
-        assert QTY_MISMATCH_PO in linha["issue_codes"]
+        assert QTY_MISMATCH_PO not in linha["issue_codes"]
 
 
 def test_linha_carrega_numeros_do_po_para_persistir():
     """O lado PO da comparacao tem que sair na linha, nao so o veredito —
     e o que `fat_conciliacao_item` grava (qtd_po, qtd_po_recebida, dif_qtd,
     valor_invoice, valor_po) pra auditar uma divergencia sem reabrir o
-    Catapult. Faturou 8 onde o PO pediu/recebeu 10: dif_qtd = -2."""
+    Catapult. PO pediu 10 e recebeu 8: dif_qtd = Received - Ordered = -2."""
     po_lines = [_po(1, "Beef Brisket Boneless", supplier_unit_id="TEU45",
-                     ordered="10", received="10", invoiced_total_cost="60.10")]
+                     ordered="10", received="8", invoiced_total_cost="60.10")]
     items = [_item(100, "BEEF - Brisket / Maca de Peito", "8", "6.01", "48.08",
                     item_code="TEU45")]
 
     resultado = reconcile_items_against_po(items, po_lines)
     (linha,) = resultado["items"]
     assert linha["qty_po"] == Decimal("10")
-    assert linha["qty_po_received"] == Decimal("10")
+    assert linha["qty_po_received"] == Decimal("8")
     assert linha["qty_diff"] == Decimal("-2")
     assert linha["total_invoice"] == Decimal("48.08")
     assert linha["total_po"] == Decimal("60.10")
-
-
-def test_dif_qtd_usa_caixa_no_peso_variavel():
-    """No acougue a comparacao de quantidade e caixa x Ordered, entao a
-    diferenca tambem tem que sair em CAIXA — faturou 2 onde o PO pediu 3,
-    dif_qtd = -1. Subtrair `qtd - qtd_po` no SQL daria -138 (peso menos
-    caixa), numero sem sentido; e por isso que a coluna e calculada aqui."""
-    po_lines = [_po(1, "Beef Sirloin Top Butt", supplier_unit_id="40102",
-                     ordered="3", received="140", invoiced_total_cost="841.40")]
-    items = [_item(100, "BEEF SIRLOIN TOP BUTT XT ANGUS N/R", "140.00", "6.01",
-                    "841.40", item_code="40102", cases="2")]
-
-    resultado = reconcile_items_against_po(items, po_lines, categoria_fornecedor="carne")
-    (linha,) = resultado["items"]
-    assert linha["qty_diff"] == Decimal("-1")
-    assert linha["qty_po"] == Decimal("3")
 
 
 def test_cases_fora_de_carne_nao_e_comparado_contra_ordered():
@@ -344,89 +332,6 @@ def test_cases_fora_de_carne_nao_e_comparado_contra_ordered():
                      ordered="48", received="48", invoiced_total_cost="120.00")]
     items = [_item(100, "NESTLE LEITE NINHO INTEGRAL INSTANT 12x360 GR", "48", "2.50",
                     "120.00", cases="4")]
-
-    resultado = reconcile_items_against_po(items, po_lines)
-    (linha,) = resultado["items"]
-    assert linha["qty_diff"] == Decimal("0")
-    assert QTY_MISMATCH_PO not in linha["issue_codes"]
-    assert linha["has_issue"] is False
-
-
-def test_po_single_unit_compara_quantity_multiplicada():
-    """Caso real (achado do cliente, confirmado ao vivo contra o Catapult):
-    'LASANHA DONA BENTA 20X500G', Qtde impressa 1, unit_price 59.99 -- a
-    Vision multiplica pelo pack da descricao (regra 8) e extrai quantity=20,
-    cases=1, total_price=59.99 (o total real faturado, sem recalcular). A PO
-    desse item esta em 'Single Unit' (Ordered=20, na mesma unidade de
-    `quantity` ja multiplicado) -- bate certinho na QUANTIDADE. O VALOR
-    (`Invoiced Total Cost`) NAO acompanha esse multiplicador -- e sempre o
-    total real da linha (59.99), confirmado contra dado real do Catapult:
-    usar quantity x unit_price ali gerava divergencia de valor gigante e
-    falsa."""
-    po_lines = [_po(1, "Lasanha Dona Benta", ordered="20", received="20",
-                     invoiced_total_cost="59.99", unit="Single Unit")]
-    items = [_item(100, "LASANHA DONA BENTA 20X500G", "20", "59.99",
-                    total_price="59.99", cases="1")]
-
-    resultado = reconcile_items_against_po(items, po_lines)
-    (linha,) = resultado["items"]
-    assert linha["qty_diff"] == Decimal("0")
-    assert QTY_MISMATCH_PO not in linha["issue_codes"]
-    assert PRICE_MISMATCH_PO not in linha["issue_codes"]
-    assert linha["has_issue"] is False
-
-
-def test_po_case_compara_cases_nao_quantity_multiplicada():
-    """Caso real (achado do cliente): 'Aviacao Manteiga Pote Com Sal
-    24x200g', Qtde impressa 2, unit_price 165.90 -- mesmo formato de
-    descricao da lasanha, mas a PO desse item esta em 'Case' (Ordered=2, a
-    contagem IMPRESSA de caixas). Usar `quantity` multiplicado (48) contra
-    Ordered=2 daria falso QTY_MISMATCH_PO; a funcao tem que preferir
-    `cases` (2) quando `po.unit == 'Case'`, e o valor comparavel e o total
-    real faturado (331.80), nao quantity(48) x unit_price."""
-    po_lines = [_po(1, "Aviacao Manteiga Pote Com Sal", ordered="2", received="2",
-                     invoiced_total_cost="331.80", unit="Case")]
-    items = [_item(100, "Aviacao Manteiga Pote Com Sal 24x200g", "48", "165.90",
-                    total_price="331.80", cases="2")]
-
-    resultado = reconcile_items_against_po(items, po_lines)
-    (linha,) = resultado["items"]
-    assert linha["qty_diff"] == Decimal("0")
-    assert QTY_MISMATCH_PO not in linha["issue_codes"]
-    assert PRICE_MISMATCH_PO not in linha["issue_codes"]
-    assert linha["has_issue"] is False
-
-
-def test_po_case_ordered_1_com_cases_derivado_de_qtd_caixa_confere():
-    """Caso real (invoice Skyharvest 13019, replay 2026-10-28): 'Florbu WAFER MIX
-    270 g | 270 g | 6 pcs', quantity=6 (pecas faturadas), PO 'Case' com Ordered=1
-    (1 caixa). O schema da Vision (spec-cases-derivado-qtd-caixa) deriva
-    cases=quantity/qtd_caixa=6/6=1 quando a divisao e exata -- aqui simulado
-    direto no item (`cases='1'`), como o schema ja teria preenchido. Antes dessa
-    derivacao a linha dava QTY_MISMATCH_PO falso (6 pecas x Ordered=1 caixa)."""
-    po_lines = [_po(1, "Wafer Mix No Added Sugar", supplier_unit_id="1706",
-                     ordered="1", received="1", invoiced_total_cost="30.00", unit="Case")]
-    items = [_item(100, "Florbu WAFER MIX 270 g | 270 g | 6 pcs", "6", "5.00",
-                    total_price="30.00", cases="1", item_code="1706")]
-
-    resultado = reconcile_items_against_po(items, po_lines)
-    (linha,) = resultado["items"]
-    assert linha["qty_diff"] == Decimal("0")
-    assert QTY_MISMATCH_PO not in linha["issue_codes"]
-    assert linha["has_issue"] is False
-
-
-def test_po_single_unit_ignora_cases_derivado_mesmo_presente():
-    """Contraprova (mesma invoice Skyharvest 13019): 'Quickbury Cookie selection
-    in bag | 400 gr | 16 items', quantity=16, PO com Ordered=16 JA EM PECAS
-    ('Single Unit' -- nao 'Case'). Mesmo que o schema tenha derivado cases=1
-    (16/16), a comparacao tem que IGNORAR esse cases e usar quantity direto,
-    porque po.unit diz 'Single Unit' -- senao 1 (cases) x Ordered=16 quebraria
-    uma linha que hoje bate certo."""
-    po_lines = [_po(1, "Quickbury Cookie Selection", ordered="16", received="16",
-                     invoiced_total_cost="63.04", unit="Single Unit")]
-    items = [_item(100, "Quickbury Cookie selection in bag | 400 gr | 16 items", "16",
-                    "3.94", total_price="63.04", cases="1")]
 
     resultado = reconcile_items_against_po(items, po_lines)
     (linha,) = resultado["items"]
@@ -639,54 +544,243 @@ def test_tolerancia_freshpoint_exige_valor_exato():
     assert PRICE_MISMATCH_PO in linha["issue_codes"]
 
 
-def test_florida_distributing_confia_so_received_quando_ordered_furado():
-    """Caso real: invoice Florida Distributing 200488064, item Heineken B24 --
-    Vision ja aplicou o multiplicador (quantity=144, 6x24), PO real tem
-    Ordered=24 (furado, nao bate com nada) e Received=144 (confiavel).
-    confiar_so_received so entra em cena pra esse fornecedor (spec-caixa-
-    letra-florida-distributing) -- CONFERIDO, Ordered nunca e olhado."""
-    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294",
-                     ordered="24", received="144", invoiced_total_cost="230.28")]
-    items = [_item(100, "HEINEKEN B24 12OZ 6P", "144", "1.5992", "230.28", item_code="10294")]
+def test_cascata_custo_total_e_custo_unitario_batem_confere():
+    """Caso (a): valor total bate com Invoiced Total Cost e o custo por
+    unidade implicito na invoice (valor_total / Received) bate com Invoiced
+    Unit Cost -- as duas etapas da cascata passam, sem QTY_MISMATCH_PO.
+    Divide por Received (nao Ordered, spec-qtd-mismatch-custo-unitario R2):
+    e o que o proprio Catapult usa pra calcular Invoiced Unit Cost."""
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", received="10",
+                     invoiced_total_cost="100.00", invoiced_unit_cost="10.00")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "10", "10.00", "100.00", item_code="10294")]
 
-    resultado = reconcile_items_against_po(
-        items, po_lines, supplier_name="Florida Distributing",
-    )
+    resultado = reconcile_items_against_po(items, po_lines)
+    (linha,) = resultado["items"]
+    assert PRICE_MISMATCH_PO not in linha["issue_codes"]
+    assert QTY_MISMATCH_PO not in linha["issue_codes"]
+    assert linha["has_issue"] is False
+
+
+def test_fora_de_carne_custo_unitario_diferente_nao_gera_divergencia():
+    """Fora de carne o passo 2 nao roda (spec-quantidade-informativa-pedido-zerado
+    R2): valor total bate, `invoiced_unit_cost` incoerente e ignorado."""
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", ordered="10",
+                     received="10", invoiced_total_cost="100.00", invoiced_unit_cost="12.00")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "10", "10.00", "100.00", item_code="10294")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert linha["issue_codes"] == []
+    assert linha["has_issue"] is False
+
+
+def test_fora_de_carne_valor_diverge_e_custo_unitario_bate_ainda_diverge():
+    """O valor decide (R2): total diverge de $100, mesmo com o custo unitario
+    batendo, sai PRICE_MISMATCH_PO."""
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", ordered="10",
+                     received="10", invoiced_total_cost="200.00", invoiced_unit_cost="9.00")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "10", "9.00", "90.00", item_code="10294")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert linha["issue_codes"] == [PRICE_MISMATCH_PO]
+    assert linha["has_issue"] is True
+
+
+def test_quantidade_sozinha_divergente_fica_conferido():
+    """Regra 4 do Elton: valor bate, Ordered=10 e Received=8 (faltando 2) -- so
+    informativo, a nota fica conferida."""
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", ordered="10",
+                     received="8", invoiced_total_cost="100.00")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "8", "12.50", "100.00", item_code="10294")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert linha["issue_codes"] == []
+    assert linha["qty_diff"] == Decimal("-2")
+    assert linha["has_issue"] is False
+
+
+def test_quantidade_diverge_junto_do_valor_reporta_as_duas():
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", ordered="10",
+                     received="8", invoiced_total_cost="100.00")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "8", "11.25", "90.00", item_code="10294")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert PRICE_MISMATCH_PO in linha["issue_codes"]
+    assert QTY_MISMATCH_PO in linha["issue_codes"]
+    assert linha["has_issue"] is True
+
+
+def test_valor_diverge_com_ordered_igual_a_received_so_preco():
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", ordered="10",
+                     received="10", invoiced_total_cost="100.00")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "10", "9.00", "90.00", item_code="10294")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert linha["issue_codes"] == [PRICE_MISMATCH_PO]
+
+
+def test_pedido_zerado_com_recebido_vai_para_conferencia_manual():
+    """Caso do mercadinho: Ordered=0 e Received>0 -- sem pedido para comparar."""
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", ordered="0",
+                     received="5", invoiced_total_cost="50.00")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "5", "10.00", "50.00", item_code="10294")]
+
+    resultado = reconcile_items_against_po(items, po_lines)
+    (linha,) = resultado["items"]
+    assert PEDIDO_ZERADO in linha["issue_codes"]
+    assert linha["has_issue"] is True
+    assert PEDIDO_ZERADO in resultado["issue_codes"]
+
+
+def test_casa_por_valor_quando_nome_nao_casa():
+    po_lines = [_po(1, "Xyzzy Plugh", supplier_unit_id="999", ordered="2", received="2",
+                     invoiced_total_cost="77.35")]
+    items = [_item(100, "Abcd Efgh", "2", "38.675", "77.35")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert linha["match_level"] == "valor"
+    assert linha["issue_codes"] == []
+
+
+def test_valor_igual_em_duas_linhas_desempata_pelo_custo_unitario():
+    po_lines = [
+        _po(1, "Xyzzy Plugh", supplier_unit_id="999", ordered="2", received="2",
+            invoiced_total_cost="80.00", ordered_unit_cost="30.00"),
+        _po(2, "Qwerty Uiop", supplier_unit_id="998", ordered="4", received="4",
+            invoiced_total_cost="80.00", ordered_unit_cost="20.00"),
+    ]
+    items = [_item(100, "Abcd Efgh", "1", "80.00", "80.00")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert linha["id_po_item"] == 2
+    assert linha["match_level"] == "valor"
+
+
+def test_valor_igual_sem_desempate_fica_sem_par():
+    po_lines = [
+        _po(1, "Xyzzy Plugh", supplier_unit_id="999", ordered="4", received="4",
+            invoiced_total_cost="80.00", ordered_unit_cost="20.00"),
+        _po(2, "Qwerty Uiop", supplier_unit_id="998", ordered="4", received="4",
+            invoiced_total_cost="80.00", ordered_unit_cost="20.00"),
+    ]
+    items = [_item(100, "Abcd Efgh", "1", "80.00", "80.00")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert linha["issue_codes"] == [NO_PO_FOR_ITEM]
+
+
+def test_valor_nao_rouba_linha_zerada():
+    po_lines = [_po(1, "Xyzzy Plugh", supplier_unit_id="999", ordered="2", received="0",
+                     invoiced_total_cost="0")]
+    items = [_item(100, "Abcd Efgh", "1", "0.00", "0.00")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert linha["issue_codes"] == [NO_PO_FOR_ITEM]
+
+
+def test_pedido_zerado_nao_vale_com_received_zero():
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", ordered="0",
+                     received="0", invoiced_total_cost="0")]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "5", "10.00", "50.00", item_code="10294")]
+
+    (linha,) = reconcile_items_against_po(items, po_lines)["items"]
+    assert PEDIDO_ZERADO not in linha["issue_codes"]
+
+
+@pytest.mark.parametrize("received,invoiced_unit_cost", [
+    (None, "10.00"),
+    ("0", "10.00"),
+    ("10", None),
+])
+def test_cascata_dado_ausente_do_catapult_nunca_gera_qty_mismatch(received, invoiced_unit_cost):
+    """Caso (d): total bate certinho, mas falta o que o passo 2 precisa
+    (Received ausente/zero, ou Invoiced Unit Cost ausente) -- pula o passo 2
+    e nunca marca QTY_MISMATCH_PO por falta de dado (fail-safe: o nome real
+    da coluna "Invoiced Unit Cost" ainda nao foi confirmado contra uma tela
+    real do Catapult)."""
+    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294", received=received,
+                     invoiced_total_cost="100.00", invoiced_unit_cost=invoiced_unit_cost)]
+    items = [_item(100, "HEINEKEN B24 12OZ 6P", "10", "10.00", "100.00", item_code="10294")]
+
+    resultado = reconcile_items_against_po(items, po_lines)
     (linha,) = resultado["items"]
     assert QTY_MISMATCH_PO not in linha["issue_codes"]
-    assert linha["qty_diff"] == Decimal("0")
 
 
-def test_florida_distributing_confia_received_tambem_no_caminho_de_caixa():
-    """Caso real: 'LITE B24 12OZ 6P' nessa mesma invoice -- a PO dessa linha
-    especifica esta em Unit='Case' (diferente das irmas 'Single Unit'),
-    entao cai no caminho de caixa (usar_caixa). Ordered=0 (furado), Received=2
-    bate com cases=2 da invoice -- confiar_so_received tem que valer tambem
-    nesse caminho, nao so no de quantidade."""
-    po_lines = [_po(1, "Cerveja Lite Miller", supplier_unit_id="034100575052",
-                     ordered="0", received="2", invoiced_total_cost="2.7288", unit="Case")]
-    items = [_item(100, "LITE B24 12OZ 6P", "48", "1.3644", "2.7288",
-                    item_code="034100575052", cases="2")]
+def test_cascata_carne_usa_ordered_unit_cost_em_vez_de_invoiced_unit_cost():
+    """Carne (spec-qtd-mismatch-custo-unitario R9): a grade real nao tem a
+    coluna "Invoiced Unit Cost" (confirmado ao vivo, PO Eastern-008922-RS2) --
+    so "Ordered Unit Cost". `categoria_fornecedor="carne"` troca a fonte do
+    passo 2 para `po.ordered_unit_cost`; valor total bate, e `valor_total /
+    received` (100.00/10=10.00) bate com `ordered_unit_cost` (10.00) mesmo
+    com `invoiced_unit_cost` ausente (como e o caso real)."""
+    po_lines = [_po(1, "Cupim", supplier_unit_id="17005", received="10",
+                     invoiced_total_cost="100.00", ordered_unit_cost="10.00")]
+    items = [_item(100, "CUPIM PESO MEDIO 4.5LB", "10", "10.00", "100.00", item_code="17005")]
 
-    resultado = reconcile_items_against_po(
-        items, po_lines, supplier_name="Florida Distributing",
-    )
+    resultado = reconcile_items_against_po(items, po_lines, categoria_fornecedor="carne")
     (linha,) = resultado["items"]
+    assert PRICE_MISMATCH_PO not in linha["issue_codes"]
     assert QTY_MISMATCH_PO not in linha["issue_codes"]
-    assert linha["qty_diff"] == Decimal("0")
 
 
-def test_mesmo_cenario_fora_de_florida_distributing_continua_divergente():
-    """Mesmo PO/item, OUTRO fornecedor: confiar_so_received nao entra, o
-    comportamento de hoje (exige Ordered x Received batendo) se mantem --
-    prova que o escopo por fornecedor protege o resto do sistema."""
-    po_lines = [_po(1, "Cerveja Pilsen", supplier_unit_id="10294",
-                     ordered="24", received="144", invoiced_total_cost="230.28")]
-    items = [_item(100, "HEINEKEN B24 12OZ 6P", "144", "1.5992", "230.28", item_code="10294")]
+def test_cascata_carne_tolera_ruido_de_arredondamento_do_ordered_unit_cost():
+    """Achado real (PO Eastern-008922-RS2, Coxao Duro): `valor_total/received`
+    (305.24/76.5=3.990065...) nunca bate EXATO com `ordered_unit_cost` (3.99)
+    -- carne tem tolerancia de PRECO zero (passo 1), mas o passo 2 usa a
+    tolerancia PADRAO do motor (R10), senao este caso real (sem divergencia
+    nenhuma) daria QTY_MISMATCH_PO sempre, so por ruido de arredondamento."""
+    po_lines = [_po(1, "Coxao Duro", supplier_unit_id="72040CHR-ANG", received="76.5",
+                     invoiced_total_cost="305.24", ordered_unit_cost="3.99")]
+    items = [_item(100, "COXAO DURO/ OUT SIDE FLAT", "1", "305.24", "305.24",
+                    item_code="72040CHR-ANG")]
 
-    resultado = reconcile_items_against_po(
-        items, po_lines, supplier_name="Outro Fornecedor Qualquer",
-    )
+    resultado = reconcile_items_against_po(items, po_lines, categoria_fornecedor="carne")
+    (linha,) = resultado["items"]
+    assert PRICE_MISMATCH_PO not in linha["issue_codes"]
+    assert QTY_MISMATCH_PO not in linha["issue_codes"]
+
+
+def test_cascata_carne_total_diverge_mas_ordered_unit_cost_bate_sem_divergencia():
+    """Caso real que motivou a R11 (Eastern Quality Foods, achado na rodada
+    de reprocessamento, 2026-10-30): o total ainda nao bate com o Invoiced
+    Total Cost (ex. nota lancada so parcialmente no Catapult), mas o custo
+    por libra/unidade ja confere com o catalogo (`ordered_unit_cost`) -- sem
+    divergencia nenhuma, nem PRICE_MISMATCH_PO nem QTY_MISMATCH_PO."""
+    po_lines = [_po(1, "Cupim", supplier_unit_id="17005", received="10",
+                     invoiced_total_cost="200.00", ordered_unit_cost="10.00")]
+    items = [_item(100, "CUPIM PESO MEDIO 4.5LB", "10", "10.00", "100.00", item_code="17005")]
+
+    resultado = reconcile_items_against_po(items, po_lines, categoria_fornecedor="carne")
+    (linha,) = resultado["items"]
+    assert linha["issue_codes"] == []
+    assert linha["has_issue"] is False
+
+
+def test_cascata_carne_ordered_unit_cost_diverge_gera_qty_mismatch():
+    """Mesmo cenario, mas `ordered_unit_cost` (12.00) nao bate com o custo
+    por unidade implicito (10.00) -- QTY_MISMATCH_PO, sem PRICE_MISMATCH_PO
+    (o valor total, passo 1, bate certinho)."""
+    po_lines = [_po(1, "Cupim", supplier_unit_id="17005", received="10",
+                     invoiced_total_cost="100.00", ordered_unit_cost="12.00")]
+    items = [_item(100, "CUPIM PESO MEDIO 4.5LB", "10", "10.00", "100.00", item_code="17005")]
+
+    resultado = reconcile_items_against_po(items, po_lines, categoria_fornecedor="carne")
+    (linha,) = resultado["items"]
+    assert QTY_MISMATCH_PO in linha["issue_codes"]
+    assert PRICE_MISMATCH_PO not in linha["issue_codes"]
+
+
+def test_cascata_carne_ignora_invoiced_unit_cost_presente():
+    """Carne usa SO `ordered_unit_cost`: mesmo com `invoiced_unit_cost`
+    presente e coerente (10.00), um `ordered_unit_cost` divergente (12.00)
+    ainda gera QTY_MISMATCH_PO -- a categoria decide a fonte, nao a
+    presenca do dado."""
+    po_lines = [_po(1, "Cupim", supplier_unit_id="17005", received="10",
+                     invoiced_total_cost="100.00", invoiced_unit_cost="10.00",
+                     ordered_unit_cost="12.00")]
+    items = [_item(100, "CUPIM PESO MEDIO 4.5LB", "10", "10.00", "100.00", item_code="17005")]
+
+    resultado = reconcile_items_against_po(items, po_lines, categoria_fornecedor="carne")
     (linha,) = resultado["items"]
     assert QTY_MISMATCH_PO in linha["issue_codes"]
 

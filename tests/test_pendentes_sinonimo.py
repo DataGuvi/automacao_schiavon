@@ -80,8 +80,8 @@ class _FakeSheet:
     def append_values(self, _sheet_id, _range, rows):
         self.gravados.extend(rows)
 
-    def garantir_checkbox(self, _sheet_id, aba, coluna):
-        self.checkboxes.append((aba, coluna))
+    def garantir_checkbox(self, _sheet_id, aba, coluna, total_linhas):
+        self.checkboxes.append((aba, coluna, total_linhas))
 
 
 def _instalar_fake(monkeypatch, fake: _FakeSheet):
@@ -114,7 +114,7 @@ def test_pendente_nova_e_gravada(monkeypatch):
     # Coluna E "Ja resolvi?" nasce com o booleano False (nunca a string).
     assert fake.gravados == [["Cheney Brothers", "BEEF SIRLOIN", "cotacao", "2026-06-25", False]]
     assert fake.gravados[0][4] is False
-    assert fake.checkboxes == [("Pendentes", 4)]
+    assert fake.checkboxes == [("Pendentes", 4, 2)]
 
 
 def test_pendente_ja_existente_nao_duplica(monkeypatch):

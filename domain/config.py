@@ -98,6 +98,7 @@ class Config:
     twilio: ConfigTwilio
     alerta_email: str
     sinonimos_sheet_id: str
+    conferencia_manual_sheet_id: str
 
     def checar_sistema(self, sistema: Sistema) -> tuple[bool, str | None]:
         """Proxy barato de "dá para autenticar?": credenciais do sistema presentes.
@@ -174,7 +175,7 @@ class Config:
             ecrs=ConfigEcrs(
                 usuario=txt("ECRS_USER"), senha=txt("ECRS_PASSWORD"),
                 access_email=txt("CLOUDFLARE_ACCESS_EMAIL"),
-                headless=_booleano(valores, "ECRS_HEADLESS", False),
+                headless=_booleano(valores, "ECRS_HEADLESS", True),
                 url_hq=txt("ECRS_HQ"), url_windermere=txt("ECRS_WINDERMERE"),
                 url_drphilips=txt("ECRS_DRPHILIPS"),
             ),
@@ -188,6 +189,7 @@ class Config:
             ),
             alerta_email=txt("ALERTA_EMAIL"),
             sinonimos_sheet_id=txt("SINONIMOS_SHEET_ID"),
+            conferencia_manual_sheet_id=txt("CONFERENCIA_MANUAL_SHEET_ID"),
         )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -52,7 +53,7 @@ def _rodar(monkeypatch, banco, achou_po):
     """Uma execucao do robo para uma nota."""
     gravou = []
     po = _po(1, "Chicken Breast", supplier_unit_id="X1", ordered="5", received="5",
-             invoiced_total_cost="100", unit="Case")
+             invoiced_total_cost="100")
     monkeypatch.setattr(flow, "_buscar_po", lambda *a, **k: [po] if achou_po else None)
     monkeypatch.setattr(flow.proc, "aguardar_po_ordered", banco.aguardar)
     monkeypatch.setattr(flow, "_gravar_resultado", lambda *a, **k: gravou.append(a))
@@ -168,6 +169,22 @@ def test_sem_numero_de_invoice_vai_direto_ao_nome(monkeypatch):
     header = {**HEADER, "invoice_number": None}
     flow._buscar_po(None, "u", header, [], {}, lambda n: None)
     assert chamadas == ["nome"]
+
+
+# spec-limpar-decimais-invoiced-total-cost
+def test_decimais_excedentes_sao_limpos_antes_de_devolver_e_gravados_no_catapult(monkeypatch):
+    sujo = _po(1, "Chicken Breast", supplier_unit_id="X1", ordered="5",
+               invoiced_total_cost="479.9952")
+    _preparar_buscas(monkeypatch, [{"href": "h"}], [])
+    monkeypatch.setattr(flow, "to_po_lines", lambda *a: [sujo])
+    gravados = []
+    monkeypatch.setattr(
+        flow, "atualizar_invoiced_total_cost",
+        lambda page, ajustes: gravados.append(ajustes) or len(ajustes),
+    )
+    resultado = flow._buscar_po(None, "u", HEADER, [], {}, lambda n: None)
+    assert resultado[0].invoiced_total_cost == Decimal("480.00")
+    assert len(gravados) == 1 and gravados[0][0]["valor_invoice"] == Decimal("480.00")
 
 
 # --- aguardar_po_ordered: SQL ---------------------------------------------------

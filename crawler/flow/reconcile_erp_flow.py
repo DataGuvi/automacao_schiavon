@@ -34,6 +34,7 @@ from commons.catapult import (
     fechar_browser,
     parar_playwright,
     fill_receiving_invoice_info,
+    limpar_decimais_invoiced_total_cost,
     open_catapult_session,
     open_purchase_order,
     open_worksheets,
@@ -49,6 +50,8 @@ from commons.exception import BusinessException, DataAccessException, Integracao
 from commons.logging_config import get_logger
 from commons.matcher import POLine, norm_supplier
 from commons.sheets import SheetsError
+from conciliacao.conferencia_manual import ItemConferencia
+from conciliacao.conferencia_manual import sincronizar_pendentes as sincronizar_conferencia_manual
 from conciliacao.pendentes_sinonimo import extrair_pendentes, sincronizar_pendentes
 from conciliacao.reconcile_erp import (
     SKIPPED_INSUMO_ANNOTATION,
@@ -81,6 +84,7 @@ from domain.service.conciliacao_service import (
     fetch_invoice_headers_for_reconciliation,
     fetch_invoice_headers_reprocesso,
     fetch_invoice_items_by_headers,
+    fetch_invoices_conferencia_manual_pendente,
     fetch_item_sinonimos,
     fetch_supplier_aliases,
     ja_conciliada_erp,
@@ -155,6 +159,8 @@ def reconcile_erp_flow(
             log.info("-- loja %s: %s nota(s) --", id_loja, len(headers_loja))
             _conciliar_loja(conn, id_loja, headers_loja, items_by_header, sinonimos,
                              resolver_fornecedor, aliases_invoice, config, sheet_id, totais)
+
+        _sincronizar_conferencia_manual_pendentes(conn, config, totais)
 
         if totais.get("sheets_tentativas"):
             sem_erro = not totais.get("sheets_erro")
@@ -498,7 +504,8 @@ def _buscar_po(
             page, achados, items, sinonimos, f"invoice {invoice_number!r}",
         )
         if escolha is not None:
-            return _abrir_po_escolhido(page, header, achados, *escolha)
+            indice, candidatos, achados_usados = escolha
+            return _abrir_po_escolhido(page, header, achados_usados, indice, candidatos)
         if 0 < len(achados) <= _MAX_CANDIDATOS_DESEMPATE:
             open_worksheets(page, url)  # os POs abertos tiraram a tela da busca
         log.info("nota %s: sem PO pela Invoice Reference, buscando pelo nome", invoice_number)
@@ -526,37 +533,58 @@ def _buscar_po(
 
     escolha = _desempatar_por_itens(
         page, achados, items, sinonimos, f"{termo_busca!r} (fornecedor lido: {supplier_name!r})",
+        cortar_mais_recentes=True,
     )
     if escolha is None:
         return []
-    return _abrir_po_escolhido(page, header, achados, *escolha)
+    indice, candidatos, achados_usados = escolha
+    return _abrir_po_escolhido(page, header, achados_usados, indice, candidatos)
 
 
 def _desempatar_por_itens(
     page, achados: list[dict], items: list[dict], sinonimos: dict, busca: str,
-) -> tuple[int, list[list[POLine]]] | None:
+    cortar_mais_recentes: bool = False,
+) -> tuple[int, list[list[POLine]], list[dict]] | None:
     """Abre cada PO candidato, raspa os itens e escolhe o que casa com a nota.
 
-    `None` = sem candidato, candidatos demais ou nenhum casou pelos itens.
-    Vale também para um PO só: um 'Ordered' aberto do fornecedor não é
-    necessariamente o desta nota, e `fill_receiving_invoice_info` escreve
-    número/data da nota no Catapult de produção — só depois de conferir
-    que os itens casam.
+    `None` = sem candidato, candidatos demais (e `cortar_mais_recentes=False`)
+    ou nenhum casou pelos itens. Vale também para um PO só: um 'Ordered'
+    aberto do fornecedor não é necessariamente o desta nota, e
+    `fill_receiving_invoice_info` escreve número/data da nota no Catapult de
+    produção — só depois de conferir que os itens casam.
+
+    Terceiro item do retorno é a lista de `achados` REALMENTE usada no
+    desempate (igual a `achados` quando não cortou) — quem chama usa ela,
+    não a lista original, pra `indice` continuar válido depois do corte.
+
+    `cortar_mais_recentes=True` (spec-ordenar-po-por-data-criacao, só a busca
+    por fornecedor — `search_purchase_orders_by_supplier` já devolve
+    `achados` ordenado por 'Date Created' descendente): candidatos demais usa
+    só os `_MAX_CANDIDATOS_DESEMPATE` PRIMEIROS (mais recentes) em vez de
+    desistir. `cortar_mais_recentes=False` (busca por Invoice Reference, sem
+    ordenação): comportamento de sempre — candidatos demais é ambíguo
+    demais, desiste.
     """
     if not achados:
         return None
     if len(achados) > _MAX_CANDIDATOS_DESEMPATE:
-        # Fornecedor de entrega frequente (ex. FreshPoint, 199+ PO 'Ordered'
-        # num store só) — abrir e raspar cada candidato pra desempatar por
-        # itens não escala (seriam centenas de navegações). Sem um jeito
-        # mais barato de pré-filtrar (a grade de busca não expõe data
-        # sem abrir o PO), trata como ambíguo demais em vez de travar a
-        # loja inteira nessa nota.
-        log.warning(
-            "%s PO(s) 'Ordered' para %s - mais que %s, nao da pra desempatar abrindo um por um - tratando como sem PO",
-            len(achados), busca, _MAX_CANDIDATOS_DESEMPATE,
+        if not cortar_mais_recentes:
+            # Fornecedor de entrega frequente (ex. FreshPoint, 199+ PO
+            # 'Ordered' num store só) — abrir e raspar cada candidato pra
+            # desempatar por itens não escala (seriam centenas de
+            # navegações), e esta busca (Invoice Reference) não vem ordenada
+            # por data. Trata como ambíguo demais em vez de travar a loja
+            # inteira nessa nota.
+            log.warning(
+                "%s PO(s) 'Ordered' para %s - mais que %s, nao da pra desempatar abrindo um por um - tratando como sem PO",
+                len(achados), busca, _MAX_CANDIDATOS_DESEMPATE,
+            )
+            return None
+        log.info(
+            "%s PO(s) 'Ordered' para %s - mais que %s, desempatando so entre os %s mais recentes",
+            len(achados), busca, _MAX_CANDIDATOS_DESEMPATE, _MAX_CANDIDATOS_DESEMPATE,
         )
-        return None
+        achados = achados[:_MAX_CANDIDATOS_DESEMPATE]
 
     candidatos: list[list[POLine]] = []
     for achado in achados:
@@ -569,13 +597,17 @@ def _desempatar_por_itens(
             len(achados), busca,
         )
         return None
-    return indice, candidatos
+    return indice, candidatos, achados
 
 
 def _abrir_po_escolhido(
     page, header: dict, achados: list[dict], indice: int, candidatos: list[list[POLine]],
 ) -> list[POLine]:
-    """Abre o PO escolhido, grava número/data da nota nele e devolve os itens."""
+    """Abre o PO escolhido, grava número/data da nota, limpa decimais excedentes do
+    Invoiced Total Cost e devolve os itens (já limpos) pra conciliação.
+
+    Ordem (spec-limpar-decimais-invoiced-total-cost): Receive Date primeiro, limpeza
+    de decimais depois — a conciliação roda só depois disto, por quem chama."""
     open_purchase_order(page, achados[indice]["href"])
     invoice_number = str(header.get("invoice_number") or "").strip()
     if invoice_number and header.get("invoice_date"):
@@ -585,7 +617,14 @@ def _abrir_po_escolhido(
             "nota id=%s: sem numero ou data, nao preenche Receiving Information no Catapult",
             header.get("id"),
         )
-    return candidatos[indice]
+    po_lines, ajustes_decimais = limpar_decimais_invoiced_total_cost(candidatos[indice])
+    if ajustes_decimais:
+        n = atualizar_invoiced_total_cost(page, ajustes_decimais)
+        log.info(
+            "PO %s: %s Invoiced Total Cost com mais de 2 casas decimais, ajustado(s)",
+            achados[indice].get("name"), n,
+        )
+    return po_lines
 
 
 def _gravar_skip_insumo(conn, header: dict, totais: dict) -> None:
@@ -753,4 +792,34 @@ def _sincronizar_pendentes(
         totais["sheets_tentativas"] = totais.get("sheets_tentativas", 0) + 1
         totais["sheets_erro"] = totais.get("sheets_erro", 0) + 1
         log.warning("falha sincronizando pendentes no Sheets: %s", exc)
+
+
+def _sincronizar_conferencia_manual_pendentes(conn, config: Config, totais: dict) -> None:
+    """Registra na aba `Conferência Manual` todo o backlog de invoices que
+    ainda precisam de conferência manual (confiança baixa, PO não encontrado,
+    produto não identificado/não conciliada), uma vez por execução — não por
+    invoice, como `_sincronizar_pendentes` (esta lê o backlog inteiro do
+    banco, não só as notas desta execução).
+
+    Secundário ao resultado principal: nunca propaga. `SheetsError`/
+    `DataAccessException` viram contagem em `totais['sheets_*']` (mesmo
+    agregado que `_sincronizar_pendentes` já usa).
+    """
+    sheet_id = config.conferencia_manual_sheet_id or None
+    if not sheet_id:
+        return
+    try:
+        pendentes = fetch_invoices_conferencia_manual_pendente(conn)
+        novas = [
+            ItemConferencia(p["loja"] or "", p["fornecedor"] or "", p["numero_invoice"] or "", p["motivo"])
+            for p in pendentes if p.get("fornecedor") and p.get("numero_invoice")
+        ]
+        n = sincronizar_conferencia_manual(sheet_id, novas)
+        totais["sheets_tentativas"] = totais.get("sheets_tentativas", 0) + 1
+        if n:
+            log.info("(%s invoice(s) nova(s) na aba Conferencia Manual)", n)
+    except (SheetsError, DataAccessException) as exc:
+        totais["sheets_tentativas"] = totais.get("sheets_tentativas", 0) + 1
+        totais["sheets_erro"] = totais.get("sheets_erro", 0) + 1
+        log.warning("falha sincronizando Conferencia Manual no Sheets: %s", exc)
 

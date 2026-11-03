@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from playwright.sync_api import Error as PwError
 from playwright.sync_api import TimeoutError as PwTimeout
@@ -44,7 +44,7 @@ __all__ = [
     "CatapultLoginError", "handle_cloudflare_access", "login", "open_catapult_session",
     "open_worksheets", "search_purchase_orders_by_supplier", "open_purchase_order",
     "extrair_prefixo_nome_po", "fill_receiving_invoice_info", "scrape_po_items", "to_po_lines",
-    "atualizar_invoiced_total_cost",
+    "atualizar_invoiced_total_cost", "limpar_decimais_invoiced_total_cost",
     "fechar_browser", "parar_playwright",
 ]
 
@@ -311,7 +311,11 @@ def _debug_dump(page, tag: str) -> None:
 # fazia — pode voltar vários PO 'Ordered' do mesmo fornecedor, um por invoice
 # em aberto. Quem chama (`crawler/flow/reconcile_erp_flow.py::_buscar_po`)
 # desempata comparando os itens de cada candidato contra os da invoice
-# (`conciliacao/reconcile_erp.py::escolher_po_por_itens`).
+# (`conciliacao/reconcile_erp.py::escolher_po_por_itens`). A grade vem SEMPRE
+# ordenada por 'Date Created' descendente (mais recente primeiro) —
+# `_ordenar_por_data_criacao`, spec-ordenar-po-por-data-criacao — pra quem
+# chama poder cortar nos N mais recentes quando vier candidato demais (ex.
+# FreshPoint, já chegou a 306 PO 'Ordered' num store só) em vez de desistir.
 #
 # A grade de itens não dá id por célula (é um "smart-grid" genérico); os ids
 # abaixo (`gwt-debug-*`) são dos controles de busca/filtro, que esses sim têm
@@ -409,7 +413,12 @@ def search_purchase_orders_by_supplier(
 
     Pode vir mais de um PO pro mesmo fornecedor (um por invoice em aberto) —
     quem chama desempata pelos itens da invoice, ver
-    `conciliacao/reconcile_erp.py::escolher_po_por_itens`.
+    `conciliacao/reconcile_erp.py::escolher_po_por_itens`. Vem SEMPRE ordenado
+    por 'Date Created' descendente (mais recente primeiro) —
+    `_ordenar_por_data_criacao`, spec-ordenar-po-por-data-criacao — pra quem
+    chama poder cortar nos N mais recentes quando vier candidato demais pra
+    desempatar abrindo um por um (`crawler/flow/reconcile_erp_flow.py::
+    _desempatar_por_itens`).
 
     `match_type='Contains'` por padrão, não 'Begins with' (o padrão da
     tela): mesmo motivo já confirmado pra 'Invoice Reference' — nome digitado
@@ -486,8 +495,31 @@ def _buscar_worksheets_por_fornecedor(
             f"grade de resultados da busca por {supplier_name!r} não respondeu: {exc}"
         ) from exc
 
+    _ordenar_por_data_criacao(page, timeout)
     resultado = _ler_resultados(page)
     return _conferir_filtro_aplicado(page, resultado, supplier_name, match_type, nomes_alternativos)
+
+
+def _ordenar_por_data_criacao(page, timeout: int) -> None:
+    """Clica no cabeçalho 'Date Created' da grade de resultados da busca por
+    fornecedor — SEMPRE, mesmo com poucos candidatos (spec-ordenar-po-por-
+    data-criacao). Confirmado ao vivo (Fresh Poin, 25 PO 'Ordered'): sem
+    clique a ordem é ascendente (mais antigo primeiro); 1 clique ordena
+    descendente (mais recente primeiro); 2 cliques volta a ascendente — por
+    isso é SEMPRE 1 clique, nunca alternado ou verificado depois.
+
+    Seleciona por `role="button"` + texto exato, não pelo atributo
+    `__gwt_column`/`__gwt_header` (uid gerado pelo GWT a cada carga de
+    página — não é estável entre sessões, só serve pra inspecionar o DOM
+    numa sessão específica)."""
+    try:
+        page.get_by_role("button", name="Date Created", exact=True).first.click(timeout=timeout)
+        page.wait_for_selector(_SEL_RESULT_LINKS, timeout=timeout)
+    except PwError as exc:
+        _debug_dump(page, "catapult_ordenar_data_criacao")
+        raise IntegracaoException(
+            f"cabeçalho 'Date Created' da grade de resultados não respondeu: {exc}"
+        ) from exc
 
 
 def search_purchase_orders_by_invoice(
@@ -839,6 +871,49 @@ def _descartar_edicoes(page) -> None:
     _esperar_rede(page, 10_000)
 
 
+def _arredondar_se_excede_2_casas(valor: Decimal | None) -> Decimal | None:
+    """`None` se `valor` ja tem 2 casas decimais ou menos; senao o mesmo valor
+    arredondado pra 2 (`ROUND_HALF_UP`)."""
+    if valor is None:
+        return None
+    expoente = valor.as_tuple().exponent
+    if not isinstance(expoente, int) or expoente >= -2:
+        return None
+    novo = valor.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return novo if novo != valor else None
+
+
+def limpar_decimais_invoiced_total_cost(
+    po_lines: list[POLine],
+) -> tuple[list[POLine], list[dict]]:
+    """Arredonda pra 2 casas o `Invoiced Total Cost` de cada linha do PO que vier
+    com mais (achado real: 4 casas, `479.9952` - `spec-dif-valor-erp-nao-multiplica`).
+
+    Roda ANTES da conciliacao (`spec-limpar-decimais-invoiced-total-cost`): decide
+    so pelo proprio valor scrapeado do PO, sem depender de casar com a invoice -
+    por isso resolve, sem ciclo, o que `_valor_a_gravar` (tolerancia de $1,
+    dentro da conciliacao) nao pode decidir antes dela rodar.
+
+    Devolve as linhas com o valor JA limpo (a comparacao usa o valor arredondado
+    mesmo que a escrita no Catapult, abaixo, nao va acontecer - PO `Committed`)
+    e os `ajustes` no mesmo formato de `resultado["ajustes_po"]`, pra gravar com
+    `atualizar_invoiced_total_cost` sem mudar a assinatura dela."""
+    limpas: list[POLine] = []
+    ajustes: list[dict] = []
+    for po in po_lines:
+        novo = _arredondar_se_excede_2_casas(po.invoiced_total_cost)
+        if novo is None:
+            limpas.append(po)
+            continue
+        limpas.append(po._replace(invoiced_total_cost=novo))
+        ajustes.append({
+            "po_key": po.key, "valor_catapult": po.invoiced_total_cost, "valor_invoice": novo,
+            "supplier_unit_id": po.supplier_unit_id, "scancode": po.scancode,
+            "receipt_alias": po.receipt_alias, "item_name": po.item_name,
+        })
+    return limpas, ajustes
+
+
 def atualizar_invoiced_total_cost(page, ajustes: list[dict], timeout: int = 20_000) -> int:
     """Grava o `Invoiced Total Cost` ajustado na grade Items do PO aberto e clica Save.
 
@@ -975,7 +1050,8 @@ def to_po_lines(raw_rows: list[dict]) -> list[POLine]:
             received=_parse_qty(row.get("Received")),
             invoiced_total_cost=_parse_money(row.get("Invoiced Total Cost")),
             receipt_alias=row.get("Receipt Alias") or None,
-            unit=row.get("Unit") or None,
+            invoiced_unit_cost=_parse_money(row.get("Invoiced Unit Cost")),
+            ordered_unit_cost=_parse_money(row.get("Ordered Unit Cost")),
         )
         for i, row in enumerate(raw_rows)
     ]

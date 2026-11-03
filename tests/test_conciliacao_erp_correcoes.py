@@ -137,7 +137,7 @@ def test_leitura_com_erro_do_driver_vira_data_access(fn):
 # R6
 def test_qty_invoice_coerente_em_grupo_com_cases_misto():
     po = [_po(1, "Chicken Breast", supplier_unit_id="X1", ordered="5", received="5",
-              invoiced_total_cost="100", unit="Case")]
+              invoiced_total_cost="100")]
     itens = [
         _item(1, "Chicken Breast", "20", "2.5", "50", item_code="X1", cases="2"),
         _item(2, "Chicken Breast", "20", "2.5", "50", item_code="X1"),
@@ -174,9 +174,9 @@ def test_fill_receiving_so_com_numero_e_data(monkeypatch, numero, data, chamou):
 def test_leblon_pack_multiplicado_confere_com_po_single_unit():
     po = [
         _po(1, "Queijo Fresc Minas", supplier_unit_id="1", ordered="12", received="12",
-            invoiced_total_cost="53.90", unit="Single Unit"),
+            invoiced_total_cost="53.90"),
         _po(2, "Queijo Coalho 2LB", supplier_unit_id="381", ordered="6", received="6",
-            invoiced_total_cost="65.70", unit="Single Unit"),
+            invoiced_total_cost="65.70"),
     ]
     itens = [
         _item(1, "MIMOSO MINAS FRESCAL CHEESE 12oz", "12", "53.90", "53.90", item_code="1", cases="1"),
@@ -192,11 +192,11 @@ def test_leblon_pack_multiplicado_confere_com_po_single_unit():
 def _po_gominas():
     return [
         _po(0, "Bala de Gelatina Amoras", supplier_unit_id="2314", ordered="12", received="12",
-            invoiced_total_cost="24.90", unit="Single Unit"),
+            invoiced_total_cost="24.90"),
         _po(1, "Bala de Gelatina Ovos Fritos", supplier_unit_id="2914", ordered="24",
-            received="0", invoiced_total_cost="0", unit="Single Unit"),
+            received="0", invoiced_total_cost="0"),
         _po(2, "Fini Fried Eggs", supplier_unit_id="fini4", ordered="0", received="24",
-            invoiced_total_cost="43.98", unit="Single Unit"),
+            invoiced_total_cost="43.98"),
     ]
 
 
@@ -208,12 +208,16 @@ def _itens_gominas():
 
 
 def test_linha_zerada_casa_por_codigo_como_ultimo_recurso():
+    """O valor ja diverge (Invoiced Total Cost=$0 x invoice $34.00), entao
+    PRICE_MISMATCH_PO acusa a linha zerada. QTY_MISMATCH_PO nao aparece mais
+    aqui (spec-qtd-mismatch-custo-unitario: o passo 2 da cascata so roda
+    quando o passo 1 bate) -- perda cosmetica, a divergencia real continua
+    visivel pelo preco."""
     resultado = reconcile_items_against_po(_itens_gominas(), _po_gominas())
     amora, ovo = resultado["items"]
     assert amora["issue_codes"] == []
     assert ovo["match_level"] == "codigo" and ovo["item_name_po"] == "Bala de Gelatina Ovos Fritos"
     assert IssueCode.PRICE_MISMATCH_PO in ovo["issue_codes"]
-    assert IssueCode.QTY_MISMATCH_PO in ovo["issue_codes"]
     assert IssueCode.NO_PO_FOR_ITEM not in ovo["issue_codes"]
     assert ovo["price_diff"] == Decimal("34.00")
 
@@ -224,7 +228,7 @@ def test_linha_zerada_ja_reclamada_nao_casa_de_novo():
         _item(2, "Outro item", "1", "5.00", "5.00", item_code="2914"),
     ]
     po = [_po(1, "Bala de Gelatina Ovos Fritos", supplier_unit_id="2914", ordered="24",
-              received="0", invoiced_total_cost="0", unit="Single Unit")]
+              received="0", invoiced_total_cost="0")]
     resultado = reconcile_items_against_po(itens, po)
     assert [l["match_level"] for l in resultado["items"]].count("unmatched") == 1
 
@@ -232,9 +236,9 @@ def test_linha_zerada_ja_reclamada_nao_casa_de_novo():
 def test_linha_ativa_por_nome_ganha_da_zerada():
     po = [
         _po(0, "Agua Pure Life", supplier_unit_id="111", ordered="160", received="0",
-            invoiced_total_cost="0", unit="Single Unit"),
+            invoiced_total_cost="0"),
         _po(1, "Pack Nestle Pure Life Purified Water 40 0.5L", supplier_unit_id="222", ordered="4",
-            received="4", invoiced_total_cost="21.80", unit="Single Unit"),
+            received="4", invoiced_total_cost="21.80"),
     ]
     itens = [_item(1, "Nestle Pure Life - Purified Water - 40/0.5L", "4", "5.45", "21.80",
                    item_code="111")]

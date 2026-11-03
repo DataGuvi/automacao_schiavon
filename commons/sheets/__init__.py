@@ -19,7 +19,10 @@ from googleapiclient.errors import HttpError
 
 from commons.paths import GOOGLE_SERVICE_ACCOUNT_PATH
 
-__all__ = ["read_values", "append_values", "update_values", "garantir_checkbox", "SheetsError"]
+__all__ = [
+    "read_values", "append_values", "update_values", "garantir_checkbox",
+    "inserir_coluna", "set_basic_filter", "SheetsError",
+]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -70,26 +73,83 @@ def update_values(spreadsheet_id: str, range_: str, rows: list[list[str]]) -> No
         raise SheetsError(f"falha atualizando '{range_}' de {spreadsheet_id}: {exc}") from exc
 
 
-def garantir_checkbox(spreadsheet_id: str, aba: str, coluna: int) -> None:
-    """Checkbox na coluna `coluna` (0 = A) da `aba`, da linha 2 em diante. Idempotente."""
+def _sheet_id_da_aba(svc, spreadsheet_id: str, aba: str) -> int:
+    """`sheetId` numérico (interno do Sheets) de uma aba pelo título dela."""
+    meta = svc.get(
+        spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)",
+    ).execute()
+    ids = [s["properties"]["sheetId"] for s in meta.get("sheets", [])
+           if s["properties"]["title"] == aba]
+    if not ids:
+        raise SheetsError(f"aba '{aba}' nao encontrada em {spreadsheet_id}")
+    return ids[0]
+
+
+def garantir_checkbox(spreadsheet_id: str, aba: str, coluna: int, total_linhas: int) -> None:
+    """Checkbox na coluna `coluna` (0 = A) da `aba`, da linha 2 até `total_linhas`
+    (1-indexed, inclusive — normalmente cabeçalho + quantidade de dados).
+    Idempotente.
+
+    `total_linhas` é OBRIGATÓRIO: uma faixa sem limite de linha (omitir
+    `endRowIndex`) faz o Sheets preencher toda linha em branco abaixo dos
+    dados com `False` de verdade (não é só validação "visual" — vira
+    conteúdo real da célula), o que infla a planilha com milhares de linhas
+    fantasma e quebra a detecção de "última linha" que `append_values` usa
+    (achado real, 2026-10-30: 274 linhas de dado viraram 1274 na planilha
+    Conferência Manual). Quem chama sempre sabe o tamanho atual da tabela
+    (acabou de ler ou de gravar nela), então não há motivo para "sem limite".
+    """
     try:
         svc = _service().spreadsheets()
-        meta = svc.get(
-            spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)",
-        ).execute()
-        ids = [s["properties"]["sheetId"] for s in meta.get("sheets", [])
-               if s["properties"]["title"] == aba]
-        if not ids:
-            raise SheetsError(f"aba '{aba}' nao encontrada em {spreadsheet_id}")
+        sheet_id = _sheet_id_da_aba(svc, spreadsheet_id, aba)
         svc.batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": [{
             "setDataValidation": {
-                "range": {"sheetId": ids[0], "startRowIndex": 1,
+                "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": total_linhas,
                           "startColumnIndex": coluna, "endColumnIndex": coluna + 1},
                 "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
             },
         }]}).execute()
     except HttpError as exc:
         raise SheetsError(f"falha criando checkbox em '{aba}' de {spreadsheet_id}: {exc}") from exc
+
+
+def inserir_coluna(spreadsheet_id: str, aba: str, indice: int) -> None:
+    """Insere uma coluna em branco na `aba`, na posição `indice` (0 = A),
+    empurrando as colunas existentes (e os dados delas) para a direita.
+
+    Uso pontual (migração estrutural de planilha já existente) — nunca
+    chamado pelo sync de rotina.
+    """
+    try:
+        svc = _service().spreadsheets()
+        sheet_id = _sheet_id_da_aba(svc, spreadsheet_id, aba)
+        svc.batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": [{
+            "insertDimension": {
+                "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                          "startIndex": indice, "endIndex": indice + 1},
+                "inheritFromBefore": False,
+            },
+        }]}).execute()
+    except HttpError as exc:
+        raise SheetsError(f"falha inserindo coluna em '{aba}' de {spreadsheet_id}: {exc}") from exc
+
+
+def set_basic_filter(spreadsheet_id: str, aba: str, n_colunas: int) -> None:
+    """Liga o filtro básico do Sheets na `aba` inteira (cabeçalho + todas as
+    linhas), cobrindo as `n_colunas` primeiras colunas — dá pra filtrar por
+    qualquer coluna direto na UI do Sheets. Idempotente (substitui o filtro
+    anterior, se havia algum)."""
+    try:
+        svc = _service().spreadsheets()
+        sheet_id = _sheet_id_da_aba(svc, spreadsheet_id, aba)
+        svc.batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": [{
+            "setBasicFilter": {
+                "filter": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
+                                      "startColumnIndex": 0, "endColumnIndex": n_colunas}},
+            },
+        }]}).execute()
+    except HttpError as exc:
+        raise SheetsError(f"falha ligando filtro em '{aba}' de {spreadsheet_id}: {exc}") from exc
 
 
 def append_values(spreadsheet_id: str, range_: str, rows: list[list[str | bool]]) -> None:

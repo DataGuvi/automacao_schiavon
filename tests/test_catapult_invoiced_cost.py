@@ -2,9 +2,10 @@ from decimal import Decimal
 
 from commons.catapult import (
     _SEL_CANCEL_BUTTON, _SEL_SAVE_BUTTON, PwError, _localizar_linhas,
-    atualizar_invoiced_total_cost,
+    atualizar_invoiced_total_cost, limpar_decimais_invoiced_total_cost,
 )
 from commons.exception import IntegracaoException
+from commons.matcher import POLine
 import pytest
 
 
@@ -188,3 +189,49 @@ def test_sucesso_nao_clica_cancel():
 
 def test_sem_ajustes_nao_toca_na_pagina():
     assert atualizar_invoiced_total_cost(None, []) == 0
+
+
+# --- limpar_decimais_invoiced_total_cost (spec-limpar-decimais-invoiced-total-cost) ---
+
+def _po(custo, uid="U1", scan="1", alias="a", nome="Item"):
+    return POLine(1, uid, scan, nome, None, None, custo, alias)
+
+
+def test_arredonda_valor_com_mais_de_2_casas():
+    po = _po(Decimal("479.9952"))
+    limpas, ajustes = limpar_decimais_invoiced_total_cost([po])
+    assert limpas[0].invoiced_total_cost == Decimal("480.00")
+    assert ajustes == [{
+        "po_key": 1, "valor_catapult": Decimal("479.9952"), "valor_invoice": Decimal("480.00"),
+        "supplier_unit_id": "U1", "scancode": "1", "receipt_alias": "a", "item_name": "Item",
+    }]
+
+
+def test_valor_com_2_casas_nao_gera_ajuste():
+    po = _po(Decimal("39.96"))
+    limpas, ajustes = limpar_decimais_invoiced_total_cost([po])
+    assert limpas == [po] and ajustes == []
+
+
+def test_valor_ausente_nao_gera_ajuste():
+    po = _po(None)
+    limpas, ajustes = limpar_decimais_invoiced_total_cost([po])
+    assert limpas == [po] and ajustes == []
+
+
+def test_so_as_linhas_com_excesso_entram_nos_ajustes():
+    limpa, suja = _po(Decimal("10.00"), uid="U1"), _po(Decimal("10.4567"), uid="U2")
+    limpas, ajustes = limpar_decimais_invoiced_total_cost([limpa, suja])
+    assert limpas[0] == limpa
+    assert limpas[1].invoiced_total_cost == Decimal("10.46")
+    assert len(ajustes) == 1 and ajustes[0]["supplier_unit_id"] == "U2"
+
+
+def test_ajuste_gravavel_direto_com_atualizar_invoiced_total_cost():
+    """O formato do ajuste tem que bater com o que `_localizar_linhas` espera."""
+    po = _po(Decimal("479.9952"))
+    _, ajustes = limpar_decimais_invoiced_total_cost([po])
+    grade = [_linha("U1", "479.9952")]
+    campos, salvar = [_Campo("x")], _Botao()
+    n = atualizar_invoiced_total_cost(_Page(campos, salvar, grade), ajustes)
+    assert n == 1 and campos[0].preenchido == "480.00"

@@ -6,7 +6,8 @@ chama a fachada do módulo. O que cada fluxo faz mora na sua fachada; aqui só a
 ordem.
 
     FLUXO 1/6  Sincroniza o de-para de sinônimos de item (planilha -> banco)
-    FLUXO 2/6  Coleta e leitura de invoices (SharePoint -> Vision -> banco)
+    FLUXO 2/6  Conferência manual — lê o checkbox "Conferido" da planilha (planilha -> banco)
+    FLUXO 2b/6 Coleta e leitura de invoices (SharePoint -> Vision -> banco)
     FLUXO 3/6  Cotação semanal de carnes (um passo do ciclo)
     FLUXO 4/6  Conciliação invoice x PO do Catapult (ERP) — toda nota
     FLUXO 5/6  Monitor — consolida status dos sistemas e alerta a operação
@@ -28,6 +29,7 @@ from commons.logging_config import get_logger
 # não removidos — se um dia a comparação por cotação voltar a ser necessária,
 # está guardada aqui. Ver domain/categorias.py.
 # from crawler.flow.conciliacao_flow import conciliacao_flow
+from crawler.flow.conferencia_manual_flow import conferencia_manual_flow
 from crawler.flow.cotacao_flow import cotacao_flow
 from crawler.flow.invoices_flow import invoices_flow
 from crawler.flow.monitor_flow import monitor_flow
@@ -78,7 +80,18 @@ def _rodar_fluxos(config: Config, pipeline: Pipeline) -> None:
     pipeline.rodar(1, "Sinônimos", lambda: sinonimos_flow(config))
 
     # ------------------------------------------------------------------
-    # FLUXO 2/6 -- Coleta e leitura de invoices
+    # FLUXO 2/6 -- Conferência manual
+    # Lê a coluna "Conferido" da planilha do Google Sheets
+    # (CONFERENCIA_MANUAL_SHEET_ID) e grava fat_invoice.conferido_manual_em
+    # para quem foi marcado — tira a invoice da tela "Conferências manuais"
+    # e leva para "Invoices sem divergência" (spec-conferencia-manual-planilha).
+    # CONFERENCIA_MANUAL_SHEET_ID ausente ou Sheets fora do ar -> pula e
+    # retoma na próxima execução.
+    # ------------------------------------------------------------------
+    pipeline.rodar(2, "Conferência Manual", lambda: conferencia_manual_flow(config))
+
+    # ------------------------------------------------------------------
+    # FLUXO 2b/6 -- Coleta e leitura de invoices
     # Baixa os PDFs da semana no SharePoint, manda o Claude Vision ler e
     # grava em fat_invoice / fat_invoice_item.
     # ------------------------------------------------------------------

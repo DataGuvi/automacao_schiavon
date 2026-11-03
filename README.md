@@ -28,9 +28,10 @@ Uma execução de `python main.py` faz **uma passada** e termina, nesta ordem
 | # | Fluxo | O que faz |
 |---|---|---|
 | 1 | Sinônimos | Planilha De-Para (Google Sheets) → `dim_item_sinonimo` |
-| 2 | Invoices | SharePoint → Claude Vision → `fat_invoice` / `fat_invoice_item` |
+| 2 | Conferência Manual | Planilha Conferência Manual (Google Sheets) → `fat_invoice.conferido_manual_em` |
+| 2b | Invoices | SharePoint → Claude Vision → `fat_invoice` / `fat_invoice_item` |
 | — | ~~Cotação~~ | **Desativado por enquanto** (comentado no controller) |
-| 3 | Conciliação ERP | Invoice × PO do Catapult → `fat_conciliacao`, relatórios `.docx`, e-mail ao cliente |
+| 3 | Conciliação ERP | Invoice × PO do Catapult → `fat_conciliacao`, relatórios `.docx`, e-mail ao cliente; ao fim, publica o backlog de conferência manual na planilha |
 | 4 | Monitor | Consolida acesso por sistema e abre/fecha alertas à operação |
 | — | ~~Painel~~ | **Desativado**: `painel_operacao.xlsx` não é mais gerado (comentado no controller) |
 
@@ -83,7 +84,8 @@ Arquivos de credencial, também fora do git: `resources/google/service_account.j
 flowchart TD
     A[cron a cada 30 min, com flock] --> B[main.py<br/>fuso + profile]
     B --> F1[1. Sinonimos<br/>Google Sheets para banco]
-    F1 --> F2[2. Invoices<br/>SharePoint + Claude Vision]
+    F1 --> F1B[2. Conferencia Manual<br/>le o checkbox Conferido]
+    F1B --> F2[2b. Invoices<br/>SharePoint + Claude Vision]
     F2 --> F3[3. Conciliacao ERP<br/>Invoice x PO do Catapult]
     F3 --> F4[4. Monitor<br/>acesso por sistema e alertas]
     F4 --> H[Heartbeat do agendamento]
@@ -163,6 +165,24 @@ flowchart TD
 - DE e PARA podem ter várias palavras; a frase inteira é traduzida antes do token.
 - `python -m manutencao.preparar_pendentes --aplicar` refaz o checkbox da coluna E.
 
+**Conferência Manual (Google Sheets)**
+- Invoice com confiança de leitura baixa, PO não encontrado no Catapult ou
+  produto não identificado vira linha na aba `Conferência Manual`
+  (Loja, Fornecedor, Nº Invoice, Divergência, checkbox `Conferido`), gravada
+  ao fim da Conciliação ERP (`CONFERENCIA_MANUAL_SHEET_ID`). A aba tem filtro
+  básico ligado (ícone de filtro em cada cabeçalho) — dá pra filtrar por Loja
+  direto no Sheets.
+- Quem confere a invoice marca `Conferido`. No início da próxima execução, o
+  robô grava `fat_invoice.conferido_manual_em` — a invoice some da tela
+  "Conferências manuais" do Grafana e passa a aparecer em "Invoices sem
+  divergência". Desmarcar depois não reabre o caso.
+- Casamento por `(fornecedor, nº invoice, loja)`.
+- **Atenção ao mexer em `commons/sheets.garantir_checkbox`:** a faixa da
+  validação de checkbox é sempre limitada (`total_linhas`), nunca "sem fim" —
+  um `endRowIndex` ausente faz o Sheets gravar `False` de verdade em toda
+  linha em branco abaixo dos dados (achado real: inflou esta aba de 274 para
+  1274 linhas numa única chamada).
+
 **Falhas e reprocesso**
 - Falha esperada de negócio (`BusinessException`) não derruba o monitoramento;
   falha técnica sim. Status nunca é escolhido à mão: sai de `domain/enums.py`.
@@ -204,6 +224,9 @@ RPA_ENV=prod
   de `CLOUDFLARE_ACCESS_EMAIL`. Erro *"That account does not have access"* é
   política do Cloudflare, não do código.
 - **Reprocesso:** casos com `cod_status` 50–59 caem sozinhos na fila.
+- **Migração única (Conferência Manual):**
+  `python -m manutencao.migrar_add_coluna_conferido_manual --aplicar` cria
+  `fat_invoice.conferido_manual_em`, antes de ligar `CONFERENCIA_MANUAL_SHEET_ID`.
 - **Cadastrar fornecedor no Catapult** (`dim_fornecedor_alias`, único lugar de
   cadastro). O nome do fornecedor no Catapult é o texto do `Name` do PO antes
   do primeiro `-` (`Perdomo-036998-HQ-RS2` -> `Perdomo`). Basta **uma linha**

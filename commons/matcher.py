@@ -258,6 +258,9 @@ linha e uma referencia a secao.
    PO com Ordered=24/Received=0/$0.00 e invoice cobrando $34.00 no mesmo codigo).
    Aqui a linha ja reclamada JA conta: uma PO zerada so e dada pra uma linha, e a
    segunda que pedir o mesmo codigo fica sem par.
+   Etapa 2c - valor (spec-casamento-por-valor). Sem codigo nem nome: linha de PO
+   livre com `invoiced_total_cost` igual ao valor da invoice; varias, desempata por
+   `valor / received` x `ordered_unit_cost`; empate fica sem par.
    Etapa 3 - o que sobrou fica 'unmatched'.
    O "reverse check" do fluxograma (item recebido/pedido mas nao faturado) e
    `po_items_sem_invoice`.
@@ -266,21 +269,18 @@ linha e uma referencia a secao.
    `receipt_alias` vem na PROPRIA linha do PO (coluna "Receipt Alias" da grade) -
    confirmado contra o ambiente real, nao precisa de ponte por
    `dim_item_catapult`. `invoiced_total_cost` e o valor TOTAL da linha, nao preco
-   unitario.
+   unitario. `invoiced_unit_cost` e o custo por UNIDADE que o proprio Catapult
+   carrega na grade (coluna "Invoiced Unit Cost") - usado so na secao 13.
+   `ordered_unit_cost` (coluna "Ordered Unit Cost") e o mesmo papel, mas pra
+   carne: essa categoria nao tem a coluna "Invoiced Unit Cost" na grade real
+   (confirmado ao vivo, PO Eastern-008922-RS2) - a secao 13 usa este campo no
+   lugar daquele so quando `categoria_fornecedor == "carne"`.
    `ordered` e `received` NAO estao sempre na mesma unidade um do outro: pra item
    de peso variavel (acougue) o Catapult registra `ordered` em caixas (o que se
    pede) e `received` em peso (o que se pesa na doca) - confirmado contra o
-   Catapult real, caso Cheney Brothers.
-   `unit` e a coluna "Unit" da grade Items: "Single Unit" quando `ordered`/
-   `invoiced_total_cost` estao em UNIDADES INDIVIDUAIS, "Case" ou equivalente
-   quando estao em CAIXA/PACOTE. E o sinal de verdade pra decidir qual dos dois
-   (achado do cliente: item de mercearia com pack embutido na descricao, "24x200g"
-   - o mesmo formato de descricao vale pro PO em "Single Unit", que exige
-   multiplicar a quantidade da invoice pelo N do pacote, e pro PO em "Case", onde
-   a quantidade IMPRESSA ja bate e multiplicar quebraria a comparacao). `None`
-   quando a coluna nao veio raspada (PO antigo, celula vazia): quem usa cai pro
-   fallback antigo, a categoria do fornecedor. Ver
-   `conciliacao/reconcile_erp.py::_comparar_grupo`.
+   Catapult real, caso Cheney Brothers. Essa diferenca de unidade nao importa mais
+   pra quantidade (secao 13 nao usa `received`), so fica registrada aqui porque os
+   dois campos continuam saindo em `qty_po`/`qty_po_received` (auditoria).
    `_po_zerado` exige os DOIS campos (`received` e `invoiced_total_cost`)
    CONHECIDOS e zero. `ordered` sozinho nao prova atividade real - e so o que foi
    pedido, nao o que chegou/foi cobrado. E quando os campos faltam (fixture de
@@ -289,16 +289,38 @@ linha e uma referencia a secao.
    `handwritten_code` e candidato de codigo igual a `item_code`/`upc`, nao um
    terceiro tipo - ver secao 11.
 
-13. QUANTIDADE (`qty_matches_po`, `qty_matches_po_cases`)
-   Regra do acougue (item de peso variavel, confirmada com o cliente): no pedido o
-   que se sabe com exatidao e a CAIXA; o peso so e conhecido na conferencia,
-   porque varia por natureza do produto (fresco x congelado, que carrega agua a
-   mais). Por isso `qty_matches_po_cases` compara caixa contra caixa
-   (`invoice_cases` x `ordered`) e deixa `received` de fora: pra item catch-weight
-   `Received` e o peso realmente pesado na doca, nao uma contagem de caixas - nao
-   e comparavel a `Ordered` nem a `invoice_cases`. O peso continua validado do
-   lado do VALOR da linha (`compare_price`), nao aqui. `qty_matches_po` (os tres
-   valores par a par) vale pro resto.
+13. QUANTIDADE, CASCATA DE CUSTO (spec-qtd-mismatch-custo-unitario)
+   (Substitui a comparacao three-way `invoice x Ordered x Received` e todo o
+   roteamento caixa/peca por `POLine.unit` - removidos.) O Catapult e a fonte de
+   verdade; a LEITURA da invoice (quantidade/pecas) e o lado que mais erra
+   (Vision, pack embutido na descricao, fornecedor sem PO previo), por isso a
+   checagem nunca olha pra `quantity`/`cases` sozinha, so pro VALOR faturado.
+   Os dois passos moram em `conciliacao/reconcile_erp.py::_comparar_grupo` e
+   usam so `compare_price` e `within_tolerance` daqui - nao ha funcao propria:
+   1. Valor total faturado do grupo x `po.invoiced_total_cost`. Se nao bate,
+      PRICE_MISMATCH_PO ja acusa e o passo 2 nem roda - sem isso, duas issues
+      nasceriam do MESMO numero errado.
+   2. So se o passo 1 bateu: `valor_total / po.received` x
+      `po.invoiced_unit_cost` (carne: `po.ordered_unit_cost` - ver abaixo).
+      Dado ausente pula o passo sem marcar nada. `Received`, nao `Ordered` -
+      medido ao vivo (PO Rest Depot-037333-HQ-RS2) que `Invoiced Unit Cost`
+      do proprio Catapult E `Invoiced Total Cost / Received` (confirmado
+      pelas linhas com `Ordered=0`, onde a divisao por `Ordered` e impossivel
+      e o numero so pode vir de `Received`).
+   Risco aceito: como `po.invoiced_unit_cost` e, por definicao do Catapult,
+   `po.invoiced_total_cost / po.received`, o passo 2 NUNCA discorda de si mesmo
+   quando o passo 1 ja bateu - fica inerte na pratica, nunca gera
+   QTY_MISMATCH_PO sozinho. Decisao do usuario: aceitar, porque a leitura de
+   quantidade da invoice e menos confiavel que o dado do Catapult.
+   Carne (`categoria_fornecedor == "carne"`) nao tem a coluna "Invoiced Unit
+   Cost" na grade (confirmado ao vivo, PO Eastern-008922-RS2) - o passo 2 usa
+   `po.ordered_unit_cost` ("Ordered Unit Cost") no lugar, medido igual a
+   `Invoiced Total Cost / Received` nas linhas reais (Cupim, Coxao Duro,
+   Costelinha). Mesma formula, mesmo fail-safe quando ausente - MAS com a
+   tolerancia PADRAO do motor (nao a tolerancia zero de preco de carne):
+   "Ordered Unit Cost" nao e identidade matematica exata como "Invoiced Unit
+   Cost", carrega ruido de arredondamento real (medido: diff de 0.000065 no
+   Coxao Duro) que zero tolerancia reprovaria sempre.
 """
 
 from __future__ import annotations
@@ -399,13 +421,33 @@ def norm_supplier(value: str | None) -> str:
 
 def norm_item(value: str | None, sinonimos: Mapping[str, str] | None = None) -> str:
     """Normaliza descricao de item para COMPARACAO entre os dois lados: corta a
-    cauda de catalogo e aplica o de-para de vocabulario (secao 3)."""
+    cauda de catalogo e aplica o de-para de vocabulario (secao 3).
+
+    A frase do De-Para (DE com 2+ palavras) casa em QUALQUER posicao da
+    descricao, nao so quando e a descricao inteira (spec-depara-frase-no-meio-
+    da-descricao): em cada posicao, tenta o candidato de MAIS palavras
+    primeiro, descendo até 1 palavra. Casou uma frase de N palavras, avanca N
+    tokens — o resultado nao reencadeia com outra entrada do De-Para."""
     de_para = sinonimos or {}
     sem_cauda = _CAUDA_INVOICE_RE.sub("", value or "")
     normalizado = norm_text(_CAUDA_COTACAO_RE.sub("", sem_cauda))
-    if normalizado in de_para:
-        return de_para[normalizado]
-    return " ".join(de_para.get(token, token) for token in normalizado.split())
+    tokens = normalizado.split()
+    if not tokens:
+        return normalizado
+    max_palavras = max((len(chave.split()) for chave in de_para), default=1)
+    resultado = []
+    i, n = 0, len(tokens)
+    while i < n:
+        for tamanho in range(min(max_palavras, n - i), 0, -1):
+            candidato = " ".join(tokens[i:i + tamanho])
+            if candidato in de_para:
+                resultado.append(de_para[candidato])
+                i += tamanho
+                break
+        else:
+            resultado.append(tokens[i])
+            i += 1
+    return " ".join(resultado)
 
 
 def is_header_row(item_name: str | None) -> bool:
@@ -654,7 +696,8 @@ class POLine(NamedTuple):
     received: Decimal | None = None
     invoiced_total_cost: Decimal | None = None   # valor TOTAL da linha
     receipt_alias: str | None = None
-    unit: str | None = None                      # 'Single Unit' | 'Case' | None
+    invoiced_unit_cost: Decimal | None = None    # custo por unidade (secao 13)
+    ordered_unit_cost: Decimal | None = None     # custo por unidade, so carne (secao 13)
 
 
 class InvoiceCodeLine(NamedTuple):
@@ -666,6 +709,7 @@ class InvoiceCodeLine(NamedTuple):
     item_code: str | None
     upc: str | None
     handwritten_code: str | None = None   # mais um candidato de codigo (secao 11)
+    valor: Decimal | None = None          # total da linha, p/ casar por valor (Etapa 2c)
 
 
 class POMatch(NamedTuple):
@@ -924,6 +968,29 @@ def _po_por_codigo(
     return None
 
 
+def _po_por_valor(valor: Decimal | None, livres: Sequence[POLine]) -> POLine | None:
+    """Linha do PO cujo `invoiced_total_cost` iguala `valor` ao centavo; com varias,
+    a de `valor / received` mais perto de `ordered_unit_cost`. Empate: None."""
+    if valor is None or valor <= 0:
+        return None
+    candidatas = [
+        po for po in livres
+        if po.invoiced_total_cost is not None
+        and within_tolerance(valor, po.invoiced_total_cost, ABS_TOL, Decimal("0"))
+    ]
+    if len(candidatas) <= 1:
+        return candidatas[0] if candidatas else None
+    proximas = sorted(
+        (abs(valor / po.received - po.ordered_unit_cost), idx, po)
+        for idx, po in enumerate(candidatas)
+        if po.received and po.ordered_unit_cost is not None
+        and within_tolerance(valor / po.received, po.ordered_unit_cost)
+    )
+    if not proximas or (len(proximas) > 1 and proximas[0][0] == proximas[1][0]):
+        return None
+    return proximas[0][2]
+
+
 def _pontuar_pares_nome(
     residual: Sequence[InvoiceCodeLine], disponiveis: Sequence[POLine],
     sinonimos: Mapping[str, str] | None, fuzzy_threshold: float,
@@ -1010,6 +1077,16 @@ def match_items_po(
             matches[linha.key] = POMatch(linha.key, po.key, "codigo", None)
             reclamados.add(po.key)
 
+    # --- Etapa 2c: valor, ultimo recurso (spec-casamento-por-valor) -------
+    for linha in invoice_lines:
+        if linha.key in matches:
+            continue
+        livres = [po for po in po_lines if po.key not in reclamados and not _po_zerado(po)]
+        po = _po_por_valor(linha.valor, livres)
+        if po is not None:
+            matches[linha.key] = POMatch(linha.key, po.key, "valor", None)
+            reclamados.add(po.key)
+
     # --- Etapa 3: o que sobrou --------------------------------------------
     return [
         matches.get(linha.key, POMatch(linha.key, None, "unmatched", None))
@@ -1029,51 +1106,3 @@ def po_items_sem_invoice(
     """
     reclamados = {match.po_key for match in matches if match.po_key is not None}
     return [po.key for po in po_lines if po.key not in reclamados]
-
-
-# ---------------------------------------------------------------------------
-# Quantidade (secao 13)
-# ---------------------------------------------------------------------------
-
-def qty_matches_po(
-    invoice_qty: Decimal | float | None,
-    po_ordered: Decimal | float | None,
-    po_received: Decimal | float | None,
-    abs_tol: Decimal = ABS_TOL,
-    pct_tol: Decimal = PCT_TOL,
-) -> bool:
-    """True se invoice.qtd, PO.Ordered e PO.Received batem entre si, par a par,
-    dentro da tolerancia. Faltar um dos tres nao "bate" (secoes 1 e 13)."""
-    if invoice_qty is None or po_ordered is None or po_received is None:
-        return False
-    return (within_tolerance(invoice_qty, po_ordered, abs_tol, pct_tol)
-            and within_tolerance(invoice_qty, po_received, abs_tol, pct_tol)
-            and within_tolerance(po_ordered, po_received, abs_tol, pct_tol))
-
-
-def qty_matches_po_cases(
-    invoice_cases: Decimal | float | None,
-    po_ordered: Decimal | float | None,
-    abs_tol: Decimal = ABS_TOL,
-    pct_tol: Decimal = PCT_TOL,
-) -> bool:
-    """True se a contagem de CAIXAS da invoice bate com `Ordered` do PO - regra do
-    acougue, `Received` fica de fora de proposito (secao 13)."""
-    if invoice_cases is None or po_ordered is None:
-        return False
-    return within_tolerance(invoice_cases, po_ordered, abs_tol, pct_tol)
-
-
-def qty_matches_po_received(
-    invoice_qty: Decimal | float | None,
-    po_received: Decimal | float | None,
-    abs_tol: Decimal = ABS_TOL,
-    pct_tol: Decimal = PCT_TOL,
-) -> bool:
-    """True se a quantidade da invoice bate com `Received` do PO - espelho de
-    `qty_matches_po_cases`: aqui quem fica de fora de proposito e `Ordered`
-    (spec-caixa-letra-florida-distributing, escopado por fornecedor - `Ordered`
-    furado em quase toda linha da PO real, so `Received` e confiavel)."""
-    if invoice_qty is None or po_received is None:
-        return False
-    return within_tolerance(invoice_qty, po_received, abs_tol, pct_tol)

@@ -34,7 +34,7 @@ from psycopg2.extras import RealDictCursor
 
 from commons.db import reverter
 from commons.exception import DataAccessException
-from commons.matcher import match_supplier, norm_supplier
+from commons.matcher import match_supplier, norm_supplier, norm_text
 from domain.conciliacao_codes import MARCAS_REVISAO, IssueCode
 from domain.enums import Etapa, StatusConciliacao as Veredito, StatusExecucao
 from domain.service.processo_service import SCHEMA
@@ -64,7 +64,7 @@ def _status_conciliacao(codes: list[str] | None) -> Veredito:
     if IssueCode.SKIPPED_INSUMO_ANNOTATION in codes:
         return Veredito.NAO_COMPARADO
     if (IssueCode.NO_QUOTE_FOR_ITEM in codes or IssueCode.NO_PO_FOR_ITEM in codes
-            or IssueCode.PO_NAO_ENCONTRADA in codes):
+            or IssueCode.PO_NAO_ENCONTRADA in codes or IssueCode.PEDIDO_ZERADO in codes):
         return Veredito.SEM_REFERENCIA_ITEM
     if (IssueCode.QTY_MISMATCH_PO in codes or IssueCode.PRICE_MISMATCH_PO in codes
             or IssueCode.UNIT_MISMATCH in codes or IssueCode.PRICE_ABOVE_QUOTE in codes
@@ -338,6 +338,7 @@ _NAO_RECONCILIA = (
     int(StatusExecucao.FINALIZADO_COM_ALERTA),
     int(StatusExecucao.ENCERRADO_SEM_ARQUIVO),
     int(StatusExecucao.REVISAR_INSUMO),
+    int(StatusExecucao.PO_NAO_ENCONTRADA)
 )
 
 
@@ -998,3 +999,137 @@ def fetch_divergencias(conn, inicio, fim) -> list[dict]:
         raise DataAccessException(
             "painel - falha ao consultar divergencias cotacao x invoice"
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Conferência manual (planilha Conferência Manual) — spec-conferencia-manual-planilha
+#
+# "Conferências manuais" no Grafana (grafana/gerar_painel_cliente.py,
+# SQL_K_MANUAIS) junta 3 categorias: confianca < 70, PO nao encontrado, ou
+# produto nao identificado/nota nao conciliada. As duas funcoes abaixo
+# espelham essa mesma condicao do lado do banco: uma pra alimentar a
+# planilha (conciliacao/conferencia_manual.py), outra pra ler o checkbox de
+# volta e fechar o caso.
+# ---------------------------------------------------------------------------
+
+def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
+    """Invoices que ainda precisam de conferência manual: confiança de leitura
+    baixa, PO não encontrado no Catapult, ou produto não identificado/nota não
+    conciliada (mesmas 3 categorias da tela "Conferências manuais" do Grafana).
+    Já exclui quem tem `conferido_manual_em` preenchido. Um registro por
+    invoice (não por item) — `loja` vem de `dim_loja.nome`; `motivo` resume a
+    razão, na ordem de prioridade confiança > PO não encontrado > produto não
+    identificado > sem conciliação. Produto não identificado mostra o(s)
+    código(s) do item que não casou (`item_code`, senão `upc`, senão a
+    descrição — "Cod. Item 2530, 4015"), não a descrição completa (pedido do
+    usuário, 2026-10-30).
+    """
+    sql = f"""
+        SELECT
+            dl.nome            AS loja,
+            fi.nome_fornecedor AS fornecedor,
+            fi.numero_invoice  AS numero_invoice,
+            CASE
+                WHEN fi.confianca < 70
+                    THEN 'Confianca de leitura baixa (' || fi.confianca || '%)'
+                WHEN po.achou IS NOT NULL
+                    THEN 'PO nao encontrado no Catapult'
+                WHEN pz.achou IS NOT NULL
+                    THEN 'Pedido zerado com quantidade recebida'
+                WHEN ni.codigos IS NOT NULL
+                    THEN 'Cod. Item ' || ni.codigos
+                ELSE 'Nota nao conciliada'
+            END AS motivo
+          FROM {SCHEMA}.fat_invoice fi
+          JOIN {SCHEMA}.dim_loja dl ON dl.id = fi.id_loja
+          LEFT JOIN LATERAL (
+              SELECT 1 AS achou
+                FROM {SCHEMA}.fat_conciliacao fc
+                JOIN {SCHEMA}.fat_conciliacao_item x ON x.id_conciliacao = fc.id
+               WHERE fc.id_invoice = fi.id AND fc.comparacao = 'erp'
+                 AND 'po_nao_encontrada' = ANY(x.issue_codes)
+               LIMIT 1
+          ) po ON true
+          LEFT JOIN LATERAL (
+              SELECT 1 AS achou
+                FROM {SCHEMA}.fat_conciliacao fc
+                JOIN {SCHEMA}.fat_conciliacao_item x ON x.id_conciliacao = fc.id
+               WHERE fc.id_invoice = fi.id AND fc.comparacao = 'erp'
+                 AND 'pedido_zerado' = ANY(x.issue_codes)
+               LIMIT 1
+          ) pz ON true
+          LEFT JOIN LATERAL (
+              -- Codigo do item que nao casou (item_code, senao UPC, senao a
+              -- descricao da invoice quando a linha nao tem nenhum codigo
+              -- lido) - pedido do usuario (2026-10-30): a coluna Divergencia
+              -- mostra o codigo, nao a descricao completa do produto.
+              SELECT string_agg(
+                         COALESCE(fii2.item_code, fii2.upc, x.descricao_invoice), ', '
+                     ) AS codigos
+                FROM {SCHEMA}.fat_conciliacao fc
+                JOIN {SCHEMA}.fat_conciliacao_item x   ON x.id_conciliacao = fc.id
+                JOIN {SCHEMA}.fat_invoice_item   fii2  ON fii2.id = x.id_invoice_item
+               WHERE fc.id_invoice = fi.id AND fc.comparacao = 'erp'
+                 AND x.issue_codes && ARRAY['no_po_for_item','no_quote_for_item']::text[]
+          ) ni ON true
+         WHERE fi.conferido_manual_em IS NULL
+           AND (
+               fi.confianca < 70
+               OR po.achou IS NOT NULL
+               OR pz.achou IS NOT NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM {SCHEMA}.fat_conciliacao fc
+                    WHERE fc.id_invoice = fi.id AND fc.comparacao = 'erp')
+               OR ni.codigos IS NOT NULL
+           )
+         ORDER BY fi.criado_em DESC
+    """
+    return _ler(conn, sql, None, "invoices para conferencia manual")
+
+
+def marcar_conferido_manual(conn, conferidas: set[tuple[str, str, str]]) -> int:
+    """Grava `fat_invoice.conferido_manual_em` para as invoices cuja chave
+    `(norm_supplier(nome_fornecedor), norm_text(numero_invoice),
+    norm_text(loja))` está em `conferidas` (lida da planilha Conferência
+    Manual, ver `conciliacao/conferencia_manual.py::invoices_conferidas`).
+    `loja` entra na chave (pedido do usuário, 2026-10-30) para duas lojas com
+    o mesmo fornecedor e mesmo número de invoice não se confundirem.
+    Idempotente: invoice já marcada não entra na busca de novo, preserva o
+    horário da primeira confirmação. Retorna quantas foram marcadas nesta
+    chamada.
+    """
+    if not conferidas:
+        return 0
+    candidatas = _ler(
+        conn,
+        f"""
+        SELECT fi.id, fi.nome_fornecedor, fi.numero_invoice, dl.nome AS loja
+          FROM {SCHEMA}.fat_invoice fi
+          JOIN {SCHEMA}.dim_loja dl ON dl.id = fi.id_loja
+         WHERE fi.conferido_manual_em IS NULL
+        """,
+        None, "invoices pendentes de conferencia manual",
+    )
+    ids = [
+        c["id"] for c in candidatas
+        if (norm_supplier(c["nome_fornecedor"]), norm_text(str(c["numero_invoice"])),
+            norm_text(str(c["loja"]))) in conferidas
+    ]
+    if not ids:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {SCHEMA}.fat_invoice
+                   SET conferido_manual_em = now() AT TIME ZONE 'America/Sao_Paulo'
+                 WHERE id = ANY(%s)
+                """,
+                (ids,),
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n
+    except psycopg2.Error as exc:
+        reverter(conn)
+        raise DataAccessException("falha ao marcar conferencia manual") from exc
