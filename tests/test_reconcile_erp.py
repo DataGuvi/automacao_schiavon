@@ -450,6 +450,15 @@ def test_escolher_po_por_itens_none_quando_nenhum_candidato_casa():
     assert escolher_po_por_itens(items, candidatos) is None
 
 
+def test_escolher_po_por_itens_sem_codigo_nem_nome_escolhe_pelo_valor():
+    items = [_item(100, "XYZ SEM NOME PARECIDO", "3", "10.00", "30.00")]
+    candidatos = [
+        [_po(1, "Outra Coisa", invoiced_total_cost="99.00")],
+        [_po(2, "Nada A Ver", invoiced_total_cost="30.00")],
+    ]
+    assert escolher_po_por_itens(items, candidatos) == 1
+
+
 def test_escolher_po_por_itens_empate_desempata_por_valor():
     """Caso real (MENA/11131, 2026-09): item recorrente do fornecedor
     ('Massa Pastel Recortada', código 00130) tinha atividade real em 3 PO's

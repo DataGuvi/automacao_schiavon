@@ -210,6 +210,9 @@ def _resolver_tolerancia_preco(
 # completamente diferentes.
 _DESEMPATE_DIVERGENCIA_MAX = Decimal("0.10")
 
+# Niveis de `match_items_po` que contam como item casado na escolha da PO.
+_NIVEIS_CASADOS = ("codigo", "nome", "valor")
+
 
 def escolher_po_por_itens(
     items: list[dict],
@@ -223,7 +226,7 @@ def escolher_po_por_itens(
 
     Reaproveita `match_items_po` (mesmo motor de `reconcile_items_against_po`)
     contra cada candidato e mede a fração de itens da invoice que casaram por
-    código ou nome — o candidato com a maior fração vence, SE for único.
+    código, nome ou valor (spec-casamento-por-valor R7) — o candidato com a maior fração vence, SE for único.
     Quando mais de um candidato empata na mesma fração (item recorrente do
     fornecedor, mesmo código em pedidos diferentes — ver
     `_DESEMPATE_DIVERGENCIA_MAX`), desempata pelo valor: soma o faturado dos
@@ -236,11 +239,7 @@ def escolher_po_por_itens(
     confiança (nenhum candidato empatado tem valor comparável dentro da
     tolerância) — situação ambígua, quem chama decide o que fazer (hoje:
     `crawler/flow/reconcile_erp_flow.py::_buscar_po` trata como sem PO)."""
-    invoice_refs = [
-        InvoiceCodeLine(i["id"], i.get("description"), i.get("item_code"), i.get("upc"),
-                        i.get("handwritten_code"))
-        for i in items
-    ]
+    invoice_refs = _invoice_refs(items)
     if not invoice_refs:
         return None
 
@@ -256,13 +255,23 @@ def escolher_po_por_itens(
     return _desempatar_por_valor(items, invoice_refs, candidatos, empatados, sinonimos)
 
 
+def _invoice_refs(items: list[dict]) -> list[InvoiceCodeLine]:
+    return [
+        InvoiceCodeLine(i["id"], i.get("description"), i.get("item_code"), i.get("upc"),
+                        i.get("handwritten_code"),
+                        invoice_line_total(i.get("quantity"), i.get("unit_price"),
+                                           i.get("total_price")))
+        for i in items
+    ]
+
+
 def _fracao_casada(
     invoice_refs: list[InvoiceCodeLine],
     po_lines: Sequence[POLine],
     sinonimos: dict | None,
 ) -> float:
     matches = match_items_po(invoice_refs, po_lines, sinonimos=sinonimos)
-    casados = sum(1 for m in matches if m.match_level in ("codigo", "nome"))
+    casados = sum(1 for m in matches if m.match_level in _NIVEIS_CASADOS)
     return casados / len(invoice_refs)
 
 
@@ -304,7 +313,7 @@ def _dif_valor_candidato(
     valor_invoice = Decimal("0")
     po_keys_casados: set[Any] = set()
     for m in matches:
-        if m.match_level not in ("codigo", "nome") or m.po_key is None:
+        if m.match_level not in _NIVEIS_CASADOS or m.po_key is None:
             continue
         item = items_by_id[m.invoice_key]
         valor_linha = invoice_line_total(
@@ -380,13 +389,7 @@ def reconcile_items_against_po(
     nenhum item da invoice reclamou — pedido/recebido mas não faturado nesta
     nota; ainda sem onde persistir (ver docstring de `po_items_sem_invoice`).
     """
-    invoice_refs = [
-        InvoiceCodeLine(i["id"], i.get("description"), i.get("item_code"), i.get("upc"),
-                        i.get("handwritten_code"),
-                        invoice_line_total(i.get("quantity"), i.get("unit_price"),
-                                           i.get("total_price")))
-        for i in items
-    ]
+    invoice_refs = _invoice_refs(items)
     matches = match_items_po(invoice_refs, po_lines, sinonimos=sinonimos)
     matches = _herdar_po_de_variante_de_estado(items, matches, sinonimos)
     matches_by_item = {m.invoice_key: m for m in matches}
