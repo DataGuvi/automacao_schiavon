@@ -100,6 +100,10 @@ log = get_logger(__name__)
 # escala — ver `_buscar_po`.
 _MAX_CANDIDATOS_DESEMPATE = 20
 
+# `_buscar_po` devolve isto quando a invoice so aparece com o historico marcado
+# (PO Committed): status final, nada a conciliar (spec-invoice-ja-lancada).
+JA_LANCADA = object()
+
 
 def reconcile_erp_flow(
     config: Config,
@@ -147,7 +151,7 @@ def reconcile_erp_flow(
         totais = {
             "headers_total": 0, "headers_issue": 0,
             "items_total": 0, "items_issue": 0,
-            "sem_po": 0, "aguardando_po": 0, "po_fechado_manual": 0,
+            "sem_po": 0, "aguardando_po": 0, "po_fechado_manual": 0, "ja_lancada": 0,
             "lojas_puladas": 0, "puladas_insumo": 0, "insumo_incerto": 0,
             "relatorios_gerados": 0, "relatorios_erro": 0, "notas_erro": 0,
             "sucessos_gerados": 0, "sucessos_erro": 0,
@@ -177,6 +181,7 @@ def reconcile_erp_flow(
         log.info("Sem PO no Catapult : %s", totais['sem_po'])
         log.info("Aguardando PO Ordered : %s", totais['aguardando_po'])
         log.info("PO fechado a mao : %s", totais['po_fechado_manual'])
+        log.info("Invoice ja lancada : %s", totais['ja_lancada'])
         log.info("Nao enviadas (insumo) : %s", totais['puladas_insumo'])
         log.info("Insumo incerto (revisar) : %s", totais['insumo_incerto'])
         log.info(
@@ -364,6 +369,15 @@ def _processar_invoice(
 
     po_lines = _buscar_po(page, url, header, items, sinonimos, resolver_fornecedor, conn=conn)
 
+    if po_lines is JA_LANCADA:
+        proc.falhar_etapa(
+            conn, header["id_processo"], Etapa.CONCILIAR_ERP, Status.INVOICE_JA_LANCADA,
+            "Invoice ja lancada no Catapult (PO Committed).",
+        )
+        totais["ja_lancada"] += 1
+        log.info("nota %s: invoice ja lancada no Catapult", header.get("invoice_number"))
+        return
+
     # `None` (busca não achou PO nenhum pro fornecedor) e `[]` (achou
     # candidato(s), mas não deu pra desempatar) chegam iguais em
     # `reconcile_items_against_po`: nota inteira sem PO pra comparar —
@@ -464,6 +478,9 @@ def _buscar_po(
 ) -> list[POLine] | None:
     """Acha o PO desta invoice no Catapult e devolve os itens já convertidos.
 
+    `JA_LANCADA` (sentinela): nada 'Ordered' pela Invoice Reference, mas ela
+    aparece com o histórico marcado — PO já Committed, não há o que conciliar.
+
     `None` é resultado normal — a busca por fornecedor não devolveu PO
     nenhum. Lista VAZIA (`[]`) também é normal, mas por outro motivo — achou
     candidato(s), só não deu pra desempatar (candidatos demais, ou nenhum
@@ -492,14 +509,13 @@ def _buscar_po(
     # Busca prioritaria: 'Invoice Reference' + 'Equals' com o numero da nota.
     # So se nao achar PO que case pelos itens cai na busca por nome (abaixo).
     if invoice_number:
-        # TEMPORARIO (reprocessamento manual 2026-10-28, reverter depois): historico
-        # marcado primeiro (PO ja Committed, invoice antiga); sem resultado, o PO
-        # pode ainda nao ter sido baixado/Committed - tenta de novo desmarcado
-        # (os dois modos sao mutuamente exclusivos no Catapult).
-        achados = search_purchase_orders_by_invoice(page, invoice_number, mostrar_historico=True)
+        achados = search_purchase_orders_by_invoice(page, invoice_number, mostrar_historico=False)
         if not achados:
-            log.info("nota %s: nada com historico marcado, tentando desmarcado", invoice_number)
-            achados = search_purchase_orders_by_invoice(page, invoice_number, mostrar_historico=False)
+            # Nada 'Ordered': com o historico marcado, achar a invoice prova que
+            # a PO ja foi lancada (Committed) - status final (spec-invoice-ja-lancada).
+            log.info("nota %s: nada em Ordered, conferindo o historico", invoice_number)
+            if search_purchase_orders_by_invoice(page, invoice_number, mostrar_historico=True):
+                return JA_LANCADA
         escolha = _desempatar_por_itens(
             page, achados, items, sinonimos, f"invoice {invoice_number!r}",
         )
@@ -517,16 +533,9 @@ def _buscar_po(
     # invoice.
     fornecedor = resolver_fornecedor(supplier_name)
     termo_busca = (fornecedor or {}).get("nome_catapult") or supplier_name
-    # TEMPORARIO (reprocessamento manual 2026-10-28, reverter depois): mesmo
-    # fallback de historico da busca por invoice acima.
     achados = search_purchase_orders_by_supplier(
-        page, termo_busca, nomes_alternativos=(supplier_name,), mostrar_historico=True,
+        page, termo_busca, nomes_alternativos=(supplier_name,), mostrar_historico=False,
     )
-    if not achados:
-        log.info("%r: nada com historico marcado, tentando desmarcado", termo_busca)
-        achados = search_purchase_orders_by_supplier(
-            page, termo_busca, nomes_alternativos=(supplier_name,), mostrar_historico=False,
-        )
     if not achados:
         return None
     _aprender_nome_catapult(conn, fornecedor, supplier_name, achados)

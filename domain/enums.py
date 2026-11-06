@@ -128,10 +128,11 @@ class StatusExecucao(IntEnum):
 
     FINALIZADO = 0, "Todas as etapas concluídas."
     FINALIZADO_COM_ALERTA = 1, "Concluído, mas há item marcado para revisão."
+    INVOICE_JA_LANCADA = 2, "Invoice já lançada no Catapult (PO Committed); nada a conciliar."
     PENDENTE = 10, "Criado, nenhuma etapa executada ainda."
     EM_ANDAMENTO = 11, "Alguma etapa concluída, faltam outras."
     AGUARDANDO_RESPOSTA = 12, "Planilha enviada, fornecedor não preencheu."
-    PO_NAO_ENCONTRADA = 13, "PO sem status Ordered no Catapult; pesquisar de novo na próxima execução."
+    PO_NAO_ENCONTRADA = 13, "PO não encontrada no Catapult; pesquisar de novo na próxima execução."
     ENCERRADO_SEM_ARQUIVO = 21, "Pasta da semana encontrada, mas vazia."
     REVISAR_INSUMO = 22, "Anotação manual pode ser insumo, mas não dá para confirmar; revisar a invoice."
     ERRO_LOGIN = 50, "Falha de autenticação na origem."

@@ -110,14 +110,19 @@ def test_lista_vazia_nao_usa_a_retentativa(monkeypatch):
 
 # --- _buscar_po: prioridade da invoice ----------------------------------------
 
-def _preparar_buscas(monkeypatch, por_invoice, por_nome):
+def _preparar_buscas(monkeypatch, por_invoice, por_nome, por_historico=()):
     chamadas = []
     po = _po(1, "Chicken Breast", supplier_unit_id="X1", ordered="5")
     monkeypatch.setattr(flow, "open_worksheets", lambda *a: None)
-    monkeypatch.setattr(
-        flow, "search_purchase_orders_by_invoice",
-        lambda *a, **k: chamadas.append("invoice") or por_invoice,
-    )
+
+    def _invoice(*a, **k):
+        if k.get("mostrar_historico"):
+            chamadas.append("invoice_hist")
+            return list(por_historico)
+        chamadas.append("invoice")
+        return por_invoice
+
+    monkeypatch.setattr(flow, "search_purchase_orders_by_invoice", _invoice)
     monkeypatch.setattr(
         flow, "search_purchase_orders_by_supplier",
         lambda *a, **k: chamadas.append("nome") or por_nome,
@@ -145,10 +150,39 @@ def test_invoice_reference_achada_nao_busca_pelo_nome(monkeypatch):
 def test_invoice_nao_localizada_aciona_busca_pelo_nome(monkeypatch):
     chamadas, po = _preparar_buscas(monkeypatch, [], [{"href": "h"}])
     assert flow._buscar_po(None, "u", HEADER, [], {}, lambda n: None) == [po]
-    # 2x "invoice": fallback TEMPORARIO de historico (spec-historico-po-catapult R6,
-    # reprocessamento manual 2026-10-28) tenta de novo sem o historico marcado
-    # antes de cair pro nome, quando a 1a tentativa nao acha nada.
-    assert chamadas == ["invoice", "invoice", "nome"]
+    assert chamadas == ["invoice", "invoice_hist", "nome"]
+
+
+def test_invoice_so_no_historico_devolve_ja_lancada_sem_buscar_nome(monkeypatch):
+    chamadas, _ = _preparar_buscas(monkeypatch, [], [{"href": "h"}], por_historico=[{"href": "c"}])
+    assert flow._buscar_po(None, "u", HEADER, [], {}, lambda n: None) is flow.JA_LANCADA
+    assert chamadas == ["invoice", "invoice_hist"]
+
+
+def test_busca_por_nome_e_uma_so_sem_historico(monkeypatch):
+    chamadas, _ = _preparar_buscas(monkeypatch, [], [])
+    kwargs = []
+    monkeypatch.setattr(
+        flow, "search_purchase_orders_by_supplier",
+        lambda *a, **k: kwargs.append(k.get("mostrar_historico")) or [],
+    )
+    assert flow._buscar_po(None, "u", HEADER, [], {}, lambda n: None) is None
+    assert kwargs == [False]
+
+
+def test_ja_lancada_grava_status_final_sem_conciliar(monkeypatch):
+    gravou = []
+    monkeypatch.setattr(flow, "_buscar_po", lambda *a, **k: flow.JA_LANCADA)
+    monkeypatch.setattr(flow.proc, "falhar_etapa", lambda *a: gravou.append(a[3]))
+    monkeypatch.setattr(
+        flow, "reconcile_items_against_po",
+        lambda *a, **k: pytest.fail("nao deve conciliar"),
+    )
+    totais = {"ja_lancada": 0}
+    header = {"id": 1, "id_processo": 9, "invoice_number": "N1", "supplier_name": "Acme"}
+    items = [_item(1, "Chicken Breast", "20", "2.5", "50", item_code="X1")]
+    flow._processar_invoice(None, "u", None, header, items, {}, lambda n: None, {}, None, totais)
+    assert gravou == [StatusExecucao.INVOICE_JA_LANCADA] and totais["ja_lancada"] == 1
 
 
 def test_invoice_sem_pos_que_casem_pelos_itens_cai_no_nome(monkeypatch):

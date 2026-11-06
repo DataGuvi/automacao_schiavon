@@ -336,6 +336,7 @@ _HEADER_COLS = f"""
 _NAO_RECONCILIA = (
     int(StatusExecucao.FINALIZADO),
     int(StatusExecucao.FINALIZADO_COM_ALERTA),
+    int(StatusExecucao.INVOICE_JA_LANCADA),
     int(StatusExecucao.ENCERRADO_SEM_ARQUIVO),
     int(StatusExecucao.REVISAR_INSUMO),
     int(StatusExecucao.PO_NAO_ENCONTRADA)

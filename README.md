@@ -141,7 +141,7 @@ flowchart TD
   são somadas.
 - Pack impresso em coluna própria ("12/12 oz", "6/2LB"): a Vision multiplica a quantidade pelo N e guarda a impressa em `cases`; a unidade do size não é convertida, a quantidade compara por contagem com o `Ordered` do PO.
 - Insumo e carne por fornecedor: `dim_fornecedor.categoria = 'insumo'` pula a nota (sem relatório); `'carne'` liga a regra de carne. Nota com "insumo" lido pela Vision pula só aquela nota (não classifica o fornecedor); `insumo` fixo só para All Florida Paper, Restaurant Depot e Sysco, os demais ficam `outros`. Classificar os conhecidos: `python -m manutencao.classificar_fornecedores` (simula) e `--aplicar` (grava).
-- Busca da PO: primeiro por `Invoice Reference` (Equals) com o número da nota; sem resultado, por nome do fornecedor (com fuzzy matching).
+- Busca da PO: primeiro por `Invoice Reference` (Equals) com o número da nota; sem resultado, repete com "Show History For" marcado — achou, a invoice já foi lançada (status 2, final); senão, por nome do fornecedor (com fuzzy matching).
 - Sem PO `Ordered`: a nota fica no status 13 (`PO_NAO_ENCONTRADA`) e é pesquisada de novo nas próximas execuções, até 3 vezes; esgotado, fecha com o relatório "nenhum PO Ordered".
 
 **Relatórios e e-mail**
@@ -258,10 +258,11 @@ técnico (reprocessável).
 |---|---|---|
 | 0 | `FINALIZADO` | Todas as etapas concluídas |
 | 1 | `FINALIZADO_COM_ALERTA` | Concluído, há item para conferir |
+| 2 | `INVOICE_JA_LANCADA` | Invoice só aparece no Catapult com o histórico marcado (PO Committed); status final, sem conciliação |
 | 10 | `PENDENTE` | Criado, nenhuma etapa rodou |
 | 11 | `EM_ANDAMENTO` | Alguma etapa concluída, faltam outras |
 | 12 | `AGUARDANDO_RESPOSTA` | Parado à espera do fornecedor |
-| 13 | `PO_NAO_ENCONTRADA` | PO sem status `Ordered` no Catapult; pesquisada de novo a cada execução (`processo.tentativas_po`, até 3 novas execuções) |
+| 13 | `PO_NAO_ENCONTRADA` | PO não encontrada no Catapult (nem `Ordered`, nem histórico); pesquisada de novo a cada execução (`processo.tentativas_po`, até 3 novas execuções) |
 | 21 | `ENCERRADO_SEM_ARQUIVO` | Pasta da semana existe, mas vazia |
 | 50 | `ERRO_LOGIN` | Falha de autenticação na origem |
 | 51 | `ERRO_NAVEGACAO` | Pasta/arquivo não encontrado na origem |
