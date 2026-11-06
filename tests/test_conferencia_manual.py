@@ -257,7 +257,6 @@ class _SelectConn:
 
 def test_fetch_invoices_conferencia_manual_pendente_filtra_pelo_inicio_da_operacao():
     from domain.service.conciliacao_service import INICIO_OPERACAO
-    from domain.enums import StatusExecucao
 
     recebido = []
 
@@ -270,7 +269,7 @@ def test_fetch_invoices_conferencia_manual_pendente_filtra_pelo_inicio_da_operac
             return _Cur(self.rows)
 
     fetch_invoices_conferencia_manual_pendente(_Conn([]))
-    assert recebido == [(INICIO_OPERACAO, (int(StatusExecucao.PO_NAO_ENCONTRADA),))]
+    assert recebido == [(INICIO_OPERACAO,)]
 
 
 def test_linhas_a_remover_poupa_cabecalho_e_invoices_da_operacao():
@@ -293,3 +292,36 @@ def test_fetch_invoices_conferencia_manual_pendente_devolve_as_linhas():
     rows = fetch_invoices_conferencia_manual_pendente(conn)
     assert rows == [{"loja": "Windermere", "fornecedor": "Fini", "numero_invoice": "111",
                       "motivo": "PO nao encontrado"}]
+
+
+# --- _sincronizar_conferencia_manual_pendentes (fim do FLUXO 4) ----------------
+
+def test_sync_conferencia_sem_sheet_id_avisa_e_nao_levanta(caplog):
+    from types import SimpleNamespace
+    from crawler.flow import reconcile_erp_flow as flow
+
+    config = SimpleNamespace(conferencia_manual_sheet_id="")
+    with caplog.at_level("WARNING"):
+        flow._sincronizar_conferencia_manual_pendentes(None, config, {})
+    assert "CONFERENCIA_MANUAL_SHEET_ID ausente" in caplog.text
+
+
+def test_sync_conferencia_roda_mesmo_sem_nota_a_conciliar(monkeypatch):
+    from types import SimpleNamespace
+    from crawler.flow import reconcile_erp_flow as flow
+
+    chamadas = []
+    monkeypatch.setattr(flow, "connect_db", lambda cfg: SimpleNamespace())
+    monkeypatch.setattr(flow, "fechar", lambda c: None)
+    monkeypatch.setattr(flow, "fetch_item_sinonimos", lambda c: {})
+    monkeypatch.setattr(flow, "fetch_supplier_aliases", lambda c, source: {})
+    monkeypatch.setattr(flow, "fetch_fornecedores", lambda c: [])
+    monkeypatch.setattr(flow, "montar_resolvedor_fornecedor", lambda *a: (lambda n: None))
+    monkeypatch.setattr(flow, "fetch_invoice_headers_for_reconciliation", lambda *a, **k: [])
+    monkeypatch.setattr(flow, "fetch_invoice_headers_reprocesso", lambda c: [])
+    monkeypatch.setattr(flow, "fetch_invoice_headers_aguardando_po", lambda c: [])
+    monkeypatch.setattr(flow, "_sincronizar_conferencia_manual_pendentes",
+                        lambda conn, config, totais: chamadas.append(1))
+    config = SimpleNamespace(banco=None)
+    assert flow.reconcile_erp_flow(config) == {"headers_total": 0}
+    assert chamadas == [1]

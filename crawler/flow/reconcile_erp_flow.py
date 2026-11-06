@@ -99,6 +99,8 @@ log = get_logger(__name__)
 # Acima disso, desempatar por itens (abrir + raspar CADA candidato) não
 # escala — ver `_buscar_po`.
 _MAX_CANDIDATOS_DESEMPATE = 20
+# Reaberturas de sessao do Catapult por loja apos falha (cada uma leva ~40s de OTP).
+_MAX_REABERTURAS_SESSAO = 2
 
 # `_buscar_po` devolve isto quando a invoice so aparece com o historico marcado
 # (PO Committed): status final, nada a conciliar (spec-invoice-ja-lancada).
@@ -139,6 +141,9 @@ def reconcile_erp_flow(
 
         if not headers:
             log.info("Nenhuma invoice no periodo.")
+            # Sem nota a conciliar nao pode pular a planilha: pendencia de execucao anterior
+            # (Sheets fora do ar) so seria retentada quando houvesse nota nova.
+            _sincronizar_conferencia_manual_pendentes(conn, config, {})
             return {"headers_total": 0}
 
         items_by_header = fetch_invoice_items_by_headers(conn, [h["id"] for h in headers])
@@ -243,17 +248,29 @@ def _conciliar_loja(
         return
 
     pw = browser = None
+    reaberturas = 0
     try:
         pw, browser, page = open_catapult_session(
             url, access_email, usuario, senha,
             headless=ecrs.headless,
         )
         sistema_service.registrar_acesso(conn, Sistema.ERP_CATAPULT, ok=True)
-        for header in headers:
-            _conciliar_invoice(
+        for i, header in enumerate(headers):
+            falhou = _conciliar_invoice(
                 page, url, conn, header, items_by_header.get(header["id"], []),
                 sinonimos, resolver_fornecedor, aliases_invoice, sheet_id, totais,
             )
+            # Sessao possivelmente caida (403): reabre pras notas seguintes (spec-sessao-catapult-caida R3).
+            if falhou and i < len(headers) - 1 and reaberturas < _MAX_REABERTURAS_SESSAO:
+                reaberturas += 1
+                log.warning("id_loja=%s: reabrindo sessao do Catapult (%s/%s)",
+                            id_loja, reaberturas, _MAX_REABERTURAS_SESSAO)
+                _fechar_navegador(pw, browser)
+                pw = browser = None
+                pw, browser, page = open_catapult_session(
+                    url, access_email, usuario, senha, headless=ecrs.headless,
+                )
+                sistema_service.registrar_acesso(conn, Sistema.ERP_CATAPULT, ok=True)
     except IntegracaoException as exc:
         log.error("id_loja=%s: sessao do Catapult falhou - %s", id_loja, exc)
         notificacao_service.registrar_erro(f"Catapult loja {id_loja}: login/sessao", exc)
@@ -281,9 +298,10 @@ def _conciliar_invoice(
     page, url: str, conn, header: dict, items: list[dict], sinonimos: dict,
     resolver_fornecedor, aliases_invoice: dict[str, dict],
     sheet_id: str | None, totais: dict,
-) -> None:
+) -> bool:
     """Concilia UMA invoice contra o PO dela. Nunca propaga — falha desta nota
-    não derruba a loja nem as seguintes.
+    não derruba a loja nem as seguintes. Devolve `True` se falhou no Catapult
+    (`IntegracaoException`), pra quem chama reabrir a sessão.
 
     `IntegracaoException` (Catapult) e o imprevisto viram `falhar_etapa`
     (`ERRO_NAVEGACAO`, retentado na próxima execução). `DataAccessException`
@@ -301,6 +319,7 @@ def _conciliar_invoice(
         notificacao_service.registrar_erro(f"Catapult nota {nota}: elemento/raspagem", exc)
         totais["notas_erro"] += 1
         _marcar_erro_navegacao(conn, header, str(exc))
+        return True
     except DataAccessException as exc:
         log.exception("nota %s: falha de banco gravando a conciliacao", nota)
         notificacao_service.registrar_erro(f"BD nota {nota}: gravando conciliacao", exc)
@@ -311,6 +330,7 @@ def _conciliar_invoice(
         totais["notas_erro"] += 1
         # Sem isto a nota fica EM_ANDAMENTO para sempre, sem aparecer como erro (spec-invoice-presa-em-andamento).
         _marcar_erro_navegacao(conn, header, f"Erro inesperado: {exc}")
+    return False
 
 
 def _marcar_erro_navegacao(conn, header: dict, mensagem: str) -> None:
@@ -819,6 +839,7 @@ def _sincronizar_conferencia_manual_pendentes(conn, config: Config, totais: dict
     """
     sheet_id = config.conferencia_manual_sheet_id or None
     if not sheet_id:
+        log.warning("CONFERENCIA_MANUAL_SHEET_ID ausente no profile: Conferencia Manual nao sincronizada")
         return
     try:
         pendentes = fetch_invoices_conferencia_manual_pendente(conn)
@@ -826,10 +847,12 @@ def _sincronizar_conferencia_manual_pendentes(conn, config: Config, totais: dict
             ItemConferencia(p["loja"] or "", p["fornecedor"] or "", p["numero_invoice"] or "", p["motivo"])
             for p in pendentes if p.get("fornecedor") and p.get("numero_invoice")
         ]
+        if len(novas) < len(pendentes):
+            log.warning("Conferencia Manual: %s pendente(s) sem fornecedor ou numero, fora da planilha",
+                        len(pendentes) - len(novas))
         n = sincronizar_conferencia_manual(sheet_id, novas)
         totais["sheets_tentativas"] = totais.get("sheets_tentativas", 0) + 1
-        if n:
-            log.info("(%s invoice(s) nova(s) na aba Conferencia Manual)", n)
+        log.info("Conferencia Manual: %s pendente(s) no banco, %s nova(s) na planilha", len(novas), n)
     except (SheetsError, DataAccessException) as exc:
         totais["sheets_tentativas"] = totais.get("sheets_tentativas", 0) + 1
         totais["sheets_erro"] = totais.get("sheets_erro", 0) + 1

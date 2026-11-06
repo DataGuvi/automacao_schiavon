@@ -764,9 +764,15 @@ def _preencher_e_salvar(page, campo_numero, invoice_number, invoice_date, timeou
 
 def _voltar_para_items(page, timeout: int) -> None:
     """Deixa a página de volta na aba Items, como `scrape_po_items` espera."""
+    # O Save redesenha a tela do PO e o 1o clique pode se perder (grid hidden):
+    # reclica ate 5x (spec-sessao-catapult-caida R1).
     try:
-        page.get_by_role("tab", name="Items", exact=True).click()
-        page.wait_for_selector(_SEL_ITEMS_GRID, timeout=timeout)
+        for _ in range(5):
+            page.get_by_role("tab", name="Items", exact=True).click()
+            page.wait_for_timeout(1000)
+            if page.locator(_SEL_ITEMS_GRID).is_visible():
+                break
+        page.wait_for_selector(_SEL_ITEMS_GRID, state="visible", timeout=timeout)
     except PwError as exc:
         _debug_dump(page, "catapult_receiving_back_to_items")
         raise IntegracaoException(

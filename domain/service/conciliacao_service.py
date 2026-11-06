@@ -1018,10 +1018,6 @@ def fetch_divergencias(conn, inicio, fim) -> list[dict]:
 # Conferencia Manual (spec-conferencia-manual-corte-operacao).
 INICIO_OPERACAO = date(2026, 11, 6)
 
-# Fora da planilha (so-acrescenta): PO ainda em tentativa (13) - o contador N/3 mudaria depois de
-# gravado. Esgotadas as tentativas a nota sai de 13 e entra por `po_nao_encontrada`.
-_FORA_DA_PLANILHA = (int(StatusExecucao.PO_NAO_ENCONTRADA),)
-
 
 def fetch_chaves_invoices_desde(conn, desde: date) -> set[tuple[str, str, str]]:
     """Chaves `(norm_supplier(fornecedor), norm_text(nº invoice), norm_text(loja))`
@@ -1064,6 +1060,8 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
                     THEN 'Confianca de leitura baixa (' || fi.confianca || '%%)'
                 WHEN p.cod_status = 2
                     THEN 'PO ja lancada no Catapult'
+                WHEN p.cod_status = 13
+                    THEN 'PO nao encontrada no Catapult'
                 WHEN po.achou IS NOT NULL
                     THEN 'PO nao encontrado no Catapult'
                 WHEN pz.achou IS NOT NULL
@@ -1107,10 +1105,9 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
           ) ni ON true
          WHERE fi.conferido_manual_em IS NULL
            AND fi.criado_em >= %s
-           AND p.cod_status NOT IN %s
            AND (
                fi.confianca < 70
-               OR p.cod_status = 2
+               OR p.cod_status IN (2, 13)
                OR po.achou IS NOT NULL
                OR pz.achou IS NOT NULL
                OR NOT EXISTS (
@@ -1120,7 +1117,7 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
            )
          ORDER BY fi.criado_em DESC
     """
-    return _ler(conn, sql, (INICIO_OPERACAO, _FORA_DA_PLANILHA), "invoices para conferencia manual")
+    return _ler(conn, sql, (INICIO_OPERACAO,), "invoices para conferencia manual")
 
 
 def marcar_conferido_manual(conn, conferidas: set[tuple[str, str, str]]) -> int:
