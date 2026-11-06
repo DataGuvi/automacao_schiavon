@@ -13,7 +13,10 @@ estar compartilhada com o `client_email` da Service Account, como Editor.
 
 from __future__ import annotations
 
+import httplib2
+from google.auth.exceptions import GoogleAuthError
 from google.oauth2.service_account import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -25,6 +28,9 @@ __all__ = [
 ]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+_TIMEOUT_S = 60
+# Falha de API, de rede (OSError inclui timeout de socket) ou de autenticacao: tudo vira SheetsError.
+_ERRO_API = (HttpError, OSError, httplib2.HttpLib2Error, GoogleAuthError)
 
 
 class SheetsError(RuntimeError):
@@ -40,7 +46,8 @@ def _service():
     creds = Credentials.from_service_account_file(
         str(GOOGLE_SERVICE_ACCOUNT_PATH), scopes=SCOPES,
     )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    http = AuthorizedHttp(creds, http=httplib2.Http(timeout=_TIMEOUT_S))
+    return build("sheets", "v4", http=http, cache_discovery=False)
 
 
 def read_values(
@@ -57,7 +64,7 @@ def read_values(
         resp = _service().spreadsheets().values().get(
             spreadsheetId=spreadsheet_id, range=range_, valueRenderOption=render,
         ).execute()
-    except HttpError as exc:
+    except _ERRO_API as exc:
         raise SheetsError(f"falha lendo '{range_}' de {spreadsheet_id}: {exc}") from exc
     return resp.get("values", [])
 
@@ -69,7 +76,7 @@ def update_values(spreadsheet_id: str, range_: str, rows: list[list[str]]) -> No
             spreadsheetId=spreadsheet_id, range=range_,
             valueInputOption="RAW", body={"values": rows},
         ).execute()
-    except HttpError as exc:
+    except _ERRO_API as exc:
         raise SheetsError(f"falha atualizando '{range_}' de {spreadsheet_id}: {exc}") from exc
 
 
@@ -109,7 +116,7 @@ def garantir_checkbox(spreadsheet_id: str, aba: str, coluna: int, total_linhas: 
                 "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
             },
         }]}).execute()
-    except HttpError as exc:
+    except _ERRO_API as exc:
         raise SheetsError(f"falha criando checkbox em '{aba}' de {spreadsheet_id}: {exc}") from exc
 
 
@@ -130,8 +137,27 @@ def inserir_coluna(spreadsheet_id: str, aba: str, indice: int) -> None:
                 "inheritFromBefore": False,
             },
         }]}).execute()
-    except HttpError as exc:
+    except _ERRO_API as exc:
         raise SheetsError(f"falha inserindo coluna em '{aba}' de {spreadsheet_id}: {exc}") from exc
+
+
+def remover_linhas(spreadsheet_id: str, aba: str, indices: list[int]) -> None:
+    """Remove as linhas `indices` (0 = linha 1) da `aba`. Uso pontual (limpeza).
+
+    Do maior indice para o menor, para a remocao de uma nao deslocar as outras.
+    """
+    if not indices:
+        return
+    try:
+        svc = _service().spreadsheets()
+        sheet_id = _sheet_id_da_aba(svc, spreadsheet_id, aba)
+        svc.batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": [
+            {"deleteDimension": {"range": {
+                "sheetId": sheet_id, "dimension": "ROWS", "startIndex": i, "endIndex": i + 1}}}
+            for i in sorted(set(indices), reverse=True)
+        ]}).execute()
+    except _ERRO_API as exc:
+        raise SheetsError(f"falha removendo linhas de '{aba}' de {spreadsheet_id}: {exc}") from exc
 
 
 def set_basic_filter(spreadsheet_id: str, aba: str, n_colunas: int) -> None:
@@ -148,7 +174,7 @@ def set_basic_filter(spreadsheet_id: str, aba: str, n_colunas: int) -> None:
                                       "startColumnIndex": 0, "endColumnIndex": n_colunas}},
             },
         }]}).execute()
-    except HttpError as exc:
+    except _ERRO_API as exc:
         raise SheetsError(f"falha ligando filtro em '{aba}' de {spreadsheet_id}: {exc}") from exc
 
 
@@ -162,5 +188,5 @@ def append_values(spreadsheet_id: str, range_: str, rows: list[list[str | bool]]
             valueInputOption="RAW", insertDataOption="INSERT_ROWS",
             body={"values": rows},
         ).execute()
-    except HttpError as exc:
+    except _ERRO_API as exc:
         raise SheetsError(f"falha gravando em '{range_}' de {spreadsheet_id}: {exc}") from exc

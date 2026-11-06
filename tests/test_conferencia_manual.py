@@ -255,6 +255,38 @@ class _SelectConn:
         return _SelectCursor(self.rows)
 
 
+def test_fetch_invoices_conferencia_manual_pendente_filtra_pelo_inicio_da_operacao():
+    from domain.service.conciliacao_service import INICIO_OPERACAO
+    from domain.enums import StatusExecucao
+
+    recebido = []
+
+    class _Cur(_SelectCursor):
+        def execute(self, sql, params=None):
+            recebido.append(params)
+
+    class _Conn(_SelectConn):
+        def cursor(self, **_kw):
+            return _Cur(self.rows)
+
+    fetch_invoices_conferencia_manual_pendente(_Conn([]))
+    assert recebido == [(INICIO_OPERACAO, (int(StatusExecucao.PO_NAO_ENCONTRADA),))]
+
+
+def test_linhas_a_remover_poupa_cabecalho_e_invoices_da_operacao():
+    from conciliacao.conferencia_manual import _chave
+    from manutencao.limpar_conferencia_manual_antes_operacao import linhas_a_remover
+
+    linhas = [
+        ["Loja", "Fornecedor", "Nº Invoice", "Divergência", "Conferido"],
+        ["Windermere", "Fini", "111", "PO nao encontrado", False],
+        ["Windermere", "Fini", "222", "PO nao encontrado", False],
+        [],
+    ]
+    ficam = {_chave("Windermere", "Fini", "222")}
+    assert linhas_a_remover(linhas, ficam) == [1, 3]
+
+
 def test_fetch_invoices_conferencia_manual_pendente_devolve_as_linhas():
     conn = _SelectConn([{"loja": "Windermere", "fornecedor": "Fini", "numero_invoice": "111",
                           "motivo": "PO nao encontrado"}])

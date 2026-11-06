@@ -285,9 +285,10 @@ def _conciliar_invoice(
     """Concilia UMA invoice contra o PO dela. Nunca propaga — falha desta nota
     não derruba a loja nem as seguintes.
 
-    `IntegracaoException` (Catapult) vira `falhar_etapa`. `DataAccessException`
-    (o service já fez rollback) e o imprevisto só são logados e contados: o
-    banco pode ser justamente o que falhou, então não se tenta gravar status.
+    `IntegracaoException` (Catapult) e o imprevisto viram `falhar_etapa`
+    (`ERRO_NAVEGACAO`, retentado na próxima execução). `DataAccessException`
+    (o service já fez rollback) só é logada e contada: o banco pode ser
+    justamente o que falhou, então não se tenta gravar status.
     """
     nota = header.get("invoice_number")
     try:
@@ -308,6 +309,8 @@ def _conciliar_invoice(
         log.exception("nota %s: erro inesperado na conciliacao", nota)
         notificacao_service.registrar_erro(f"nota {nota}: erro inesperado", exc)
         totais["notas_erro"] += 1
+        # Sem isto a nota fica EM_ANDAMENTO para sempre, sem aparecer como erro (spec-invoice-presa-em-andamento).
+        _marcar_erro_navegacao(conn, header, f"Erro inesperado: {exc}")
 
 
 def _marcar_erro_navegacao(conn, header: dict, mensagem: str) -> None:

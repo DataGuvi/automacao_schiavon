@@ -27,6 +27,7 @@ ainda tem a coluna; no header sobra só `cod_status`/`status_conc` como veredito
 
 from __future__ import annotations
 
+from datetime import date
 from typing import TYPE_CHECKING
 
 import psycopg2
@@ -1013,6 +1014,34 @@ def fetch_divergencias(conn, inicio, fim) -> list[dict]:
 # volta e fechar o caso.
 # ---------------------------------------------------------------------------
 
+# O RPA entrou em operacao em 06/11/2026: nota lida antes disso nao entra na
+# Conferencia Manual (spec-conferencia-manual-corte-operacao).
+INICIO_OPERACAO = date(2026, 11, 6)
+
+# Fora da planilha (so-acrescenta): PO ainda em tentativa (13) - o contador N/3 mudaria depois de
+# gravado. Esgotadas as tentativas a nota sai de 13 e entra por `po_nao_encontrada`.
+_FORA_DA_PLANILHA = (int(StatusExecucao.PO_NAO_ENCONTRADA),)
+
+
+def fetch_chaves_invoices_desde(conn, desde: date) -> set[tuple[str, str, str]]:
+    """Chaves `(norm_supplier(fornecedor), norm_text(nº invoice), norm_text(loja))`
+    das invoices lidas pelo robo (`criado_em`) a partir de `desde`."""
+    rows = _ler(
+        conn,
+        f"""
+        SELECT dl.nome AS loja, fi.nome_fornecedor AS fornecedor, fi.numero_invoice
+          FROM {SCHEMA}.fat_invoice fi
+          JOIN {SCHEMA}.dim_loja dl ON dl.id = fi.id_loja
+         WHERE fi.criado_em >= %s
+        """,
+        (desde,), "invoices desde o inicio da operacao",
+    )
+    return {
+        (norm_supplier(r["fornecedor"]), norm_text(str(r["numero_invoice"])), norm_text(str(r["loja"])))
+        for r in rows
+    }
+
+
 def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
     """Invoices que ainda precisam de conferência manual: confiança de leitura
     baixa, PO não encontrado no Catapult, ou produto não identificado/nota não
@@ -1032,7 +1061,9 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
             fi.numero_invoice  AS numero_invoice,
             CASE
                 WHEN fi.confianca < 70
-                    THEN 'Confianca de leitura baixa (' || fi.confianca || '%)'
+                    THEN 'Confianca de leitura baixa (' || fi.confianca || '%%)'
+                WHEN p.cod_status = 2
+                    THEN 'PO ja lancada no Catapult'
                 WHEN po.achou IS NOT NULL
                     THEN 'PO nao encontrado no Catapult'
                 WHEN pz.achou IS NOT NULL
@@ -1043,6 +1074,7 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
             END AS motivo
           FROM {SCHEMA}.fat_invoice fi
           JOIN {SCHEMA}.dim_loja dl ON dl.id = fi.id_loja
+          JOIN {SCHEMA}.processo p ON p.id = fi.id_processo
           LEFT JOIN LATERAL (
               SELECT 1 AS achou
                 FROM {SCHEMA}.fat_conciliacao fc
@@ -1074,8 +1106,11 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
                  AND x.issue_codes && ARRAY['no_po_for_item','no_quote_for_item']::text[]
           ) ni ON true
          WHERE fi.conferido_manual_em IS NULL
+           AND fi.criado_em >= %s
+           AND p.cod_status NOT IN %s
            AND (
                fi.confianca < 70
+               OR p.cod_status = 2
                OR po.achou IS NOT NULL
                OR pz.achou IS NOT NULL
                OR NOT EXISTS (
@@ -1085,7 +1120,7 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
            )
          ORDER BY fi.criado_em DESC
     """
-    return _ler(conn, sql, None, "invoices para conferencia manual")
+    return _ler(conn, sql, (INICIO_OPERACAO, _FORA_DA_PLANILHA), "invoices para conferencia manual")
 
 
 def marcar_conferido_manual(conn, conferidas: set[tuple[str, str, str]]) -> int:

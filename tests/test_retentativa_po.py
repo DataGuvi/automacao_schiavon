@@ -263,3 +263,19 @@ def test_aguardar_po_ordered_true_quando_a_update_afetou_a_linha():
 def test_aguardar_po_ordered_false_quando_esgotou():
     from domain.enums import Etapa
     assert proc.aguardar_po_ordered(_Conn(None), 9, Etapa.CONCILIAR_ERP) is False
+
+
+# spec-invoice-presa-em-andamento R2
+def test_erro_inesperado_marca_erro_tecnico_e_nao_deixa_em_andamento(monkeypatch):
+    marcadas = []
+
+    def _explode(*a, **k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(flow, "_processar_invoice", _explode)
+    monkeypatch.setattr(flow.proc, "falhar_etapa", lambda conn, id_proc, etapa, status, msg=None: marcadas.append((id_proc, status, msg)))
+    totais = {"notas_erro": 0}
+    header = {"id": 1, "id_processo": 9, "invoice_number": "N1", "supplier_name": "Acme"}
+    flow._conciliar_invoice(None, "u", None, header, [], {}, lambda n: None, {}, None, totais)
+    assert totais["notas_erro"] == 1
+    assert marcadas == [(9, StatusExecucao.ERRO_NAVEGACAO, "Erro inesperado: boom")]

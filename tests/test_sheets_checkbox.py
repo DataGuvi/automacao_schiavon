@@ -51,3 +51,23 @@ def test_append_envia_booleano_cru(monkeypatch):
     kw = svc.spreadsheets.return_value.values.return_value.append.call_args.kwargs
     assert kw["valueInputOption"] == "RAW"
     assert kw["body"]["values"][0][4] is False
+
+
+def test_erro_de_rede_vira_sheets_error(monkeypatch):
+    svc = MagicMock()
+    svc.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = TimeoutError("lento")
+    monkeypatch.setattr(sheets, "_service", lambda: svc)
+    try:
+        sheets.read_values("sheet-1", "Pendentes!A:E")
+    except sheets.SheetsError as exc:
+        assert "lento" in str(exc)
+    else:
+        raise AssertionError("esperava SheetsError")
+
+
+def test_remover_linhas_do_maior_para_o_menor(monkeypatch):
+    svc = _servico({"Conferência Manual": 7})
+    monkeypatch.setattr(sheets, "_service", lambda: svc)
+    sheets.remover_linhas("sheet-1", "Conferência Manual", [1, 5, 3])
+    reqs = svc.spreadsheets.return_value.batchUpdate.call_args.kwargs["body"]["requests"]
+    assert [r["deleteDimension"]["range"]["startIndex"] for r in reqs] == [5, 3, 1]
