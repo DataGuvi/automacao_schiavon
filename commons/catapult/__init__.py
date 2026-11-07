@@ -477,8 +477,8 @@ def _buscar_worksheets_por_fornecedor(
     page, supplier_name: str, match_type: str, timeout: int,
     nomes_alternativos: tuple[str, ...] = (),
 ) -> list[dict]:
-    """Seleciona 'Supplier'/`match_type`, digita e lê a grade de resultados."""
-    _aplicar_filtro_busca(page, "Supplier", supplier_name, match_type)
+    """Seleciona 'Name'/`match_type` (Name do PO começa pelo fornecedor), digita e lê a grade."""
+    _aplicar_filtro_busca(page, "Name", supplier_name, match_type)
 
     try:
         page.wait_for_selector(_SEL_RESULT_LINKS, timeout=timeout)
