@@ -736,14 +736,17 @@ def match_supplier(
     alvo = norm_supplier(name)
     if not alvo or not candidates:
         return None, 0.0
-    melhor, melhor_score = None, 0.0
+    melhor, melhor_score, melhor_comuns = None, 0.0, 0
+    tokens_alvo = set(alvo.split())
     for candidato in candidates:
         candidato_norm = norm_supplier(candidato)
         if len(candidato_norm) < _MIN_CHARS_CANDIDATO_SUPPLIER and candidato_norm != alvo:
             continue
         score = fuzz.token_set_ratio(alvo, candidato_norm)
-        if score > melhor_score:
-            melhor, melhor_score = candidato, score
+        comuns = len(tokens_alvo & set(candidato_norm.split()))
+        # Empate de score: vence quem tem mais palavras em comum com o nome lido.
+        if score > melhor_score or (score == melhor_score and comuns > melhor_comuns):
+            melhor, melhor_score, melhor_comuns = candidato, score, comuns
     return (melhor, melhor_score) if melhor_score >= threshold else (None, melhor_score)
 
 
@@ -968,18 +971,21 @@ def _po_por_codigo(
     return None
 
 
-def _po_por_valor(valor: Decimal | None, livres: Sequence[POLine]) -> POLine | None:
-    """Linha do PO cujo `invoiced_total_cost` iguala `valor` ao centavo; com varias,
-    a de `valor / received` mais perto de `ordered_unit_cost`. Empate: None."""
+def _po_por_valor(
+    valor: Decimal | None, livres: Sequence[POLine],
+) -> tuple[POLine | None, bool]:
+    """`(po, duvida)`: linha do PO cujo `invoiced_total_cost` iguala `valor` ao
+    centavo; com varias, a de `valor / received` mais perto de `ordered_unit_cost`.
+    `duvida=True` quando ha varias e o unitario nao resolve (spec-conciliacao-so-por-valor)."""
     if valor is None or valor <= 0:
-        return None
+        return None, False
     candidatas = [
         po for po in livres
         if po.invoiced_total_cost is not None
         and within_tolerance(valor, po.invoiced_total_cost, ABS_TOL, Decimal("0"))
     ]
     if len(candidatas) <= 1:
-        return candidatas[0] if candidatas else None
+        return (candidatas[0] if candidatas else None), False
     proximas = sorted(
         (abs(valor / po.received - po.ordered_unit_cost), idx, po)
         for idx, po in enumerate(candidatas)
@@ -987,8 +993,8 @@ def _po_por_valor(valor: Decimal | None, livres: Sequence[POLine]) -> POLine | N
         and within_tolerance(valor / po.received, po.ordered_unit_cost)
     )
     if not proximas or (len(proximas) > 1 and proximas[0][0] == proximas[1][0]):
-        return None
-    return proximas[0][2]
+        return None, True
+    return proximas[0][2], False
 
 
 def _pontuar_pares_nome(
@@ -1031,11 +1037,10 @@ def match_items_po(
     *,
     sinonimos: Mapping[str, str] | None = None,
 ) -> list[POMatch]:
-    """Casa itens da invoice com itens do PO, em cascata: codigo, nome sobre o
-    residuo, codigo contra linha zerada como ultimo recurso, resto 'unmatched'.
-
-    Regras e casos reais de cada etapa na secao 11 do topo. A ordem de
-    `invoice_lines` e preservada no retorno.
+    """Casa itens da invoice com itens do PO so pelo valor da linha
+    (spec-conciliacao-so-por-valor); codigo e nome estao comentados abaixo.
+    Item em duvida (varias linhas de mesmo valor, unitario nao resolve) volta
+    'unmatched' com `ambiguous=True`. A ordem de `invoice_lines` e preservada.
     """
     code_index = _indice_por_codigo(po_lines)
 
@@ -1046,50 +1051,65 @@ def match_items_po(
     # --- Etapa 1: codigo, em linha de PO ativa ----------------------------
     # Sem checar `reclamados`: duas linhas da invoice com o MESMO codigo casam as
     # duas com a mesma PO e se somam depois em `_comparar_grupo`.
-    for linha in invoice_lines:
-        po = _po_por_codigo(linha, code_index, set(), permitir_zerado=False)
-        if po is None:
-            residuo.append(linha)
-            continue
-        matches[linha.key] = POMatch(linha.key, po.key, "codigo", None)
-        reclamados.add(po.key)
+    # Desligado (spec-conciliacao-so-por-valor): match por codigo e por nome, so o valor casa.
+    # for linha in invoice_lines:
+    #     po = _po_por_codigo(linha, code_index, set(), permitir_zerado=False)
+    #     if po is None:
+    #         residuo.append(linha)
+    #         continue
+    #     matches[linha.key] = POMatch(linha.key, po.key, "codigo", None)
+    #     reclamados.add(po.key)
+    residuo = list(invoice_lines)
 
-    # --- Etapa 2: nome, sobre o residuo, contra PO livre e nao zerado -----
-    disponiveis = [
-        po for po in po_lines if po.key not in reclamados and not _po_zerado(po)
-    ]
-    if residuo and disponiveis:
-        pares = _pontuar_pares_nome(residuo, disponiveis, sinonimos, fuzzy_threshold)
+    # --- Etapa 1b: valor da linha (spec-conciliacao-so-por-valor) ----------
+    # Varias linhas com o mesmo valor e sem desempate: sem par, em duvida.
+    duvida_valor: set[Any] = set()
+    for linha in residuo:
+        livres = [po for po in po_lines if po.key not in reclamados and not _po_zerado(po)]
+        po, duvida = _po_por_valor(linha.valor, livres)
+        if duvida:
+            duvida_valor.add(linha.key)
+        elif po is not None:
+            matches[linha.key] = POMatch(linha.key, po.key, "valor", None)
+            reclamados.add(po.key)
+    residuo = [l for l in residuo if l.key not in matches and l.key not in duvida_valor]
+
+    def casar_por_nome(zeradas: bool) -> None:
+        sem_par = [l for l in residuo if l.key not in matches]
+        disponiveis = [
+            po for po in po_lines
+            if po.key not in reclamados and _po_zerado(po) == zeradas
+        ]
+        if not sem_par or not disponiveis:
+            return
+        pares = _pontuar_pares_nome(sem_par, disponiveis, sinonimos, fuzzy_threshold)
         for idx_invoice, (score, idx_po, indistinguivel) in _atribuir_guloso(pares).items():
-            matches[residuo[idx_invoice].key] = POMatch(
-                residuo[idx_invoice].key, disponiveis[idx_po].key, "nome", score,
+            matches[sem_par[idx_invoice].key] = POMatch(
+                sem_par[idx_invoice].key, disponiveis[idx_po].key, "nome", score,
                 ambiguous=score < CONFIDENT_SCORE or indistinguivel,
             )
             reclamados.add(disponiveis[idx_po].key)
 
+    # --- Etapa 2: nome, sobre o residuo, contra PO livre e nao zerado -----
+    # casar_por_nome(zeradas=False)
+
     # --- Etapa 2b: codigo contra linha ZERADA, ultimo recurso -------------
     # Aqui `reclamados` JA conta: uma PO zerada so e dada pra uma linha.
-    for linha in invoice_lines:
-        if linha.key in matches:
-            continue
-        po = _po_por_codigo(linha, code_index, reclamados, permitir_zerado=True)
-        if po is not None:
-            matches[linha.key] = POMatch(linha.key, po.key, "codigo", None)
-            reclamados.add(po.key)
+    # for linha in invoice_lines:
+    #     if linha.key in matches:
+    #         continue
+    #     po = _po_por_codigo(linha, code_index, reclamados, permitir_zerado=True)
+    #     if po is not None:
+    #         matches[linha.key] = POMatch(linha.key, po.key, "codigo", None)
+    #         reclamados.add(po.key)
 
-    # --- Etapa 2c: valor, ultimo recurso (spec-casamento-por-valor) -------
-    for linha in invoice_lines:
-        if linha.key in matches:
-            continue
-        livres = [po for po in po_lines if po.key not in reclamados and not _po_zerado(po)]
-        po = _po_por_valor(linha.valor, livres)
-        if po is not None:
-            matches[linha.key] = POMatch(linha.key, po.key, "valor", None)
-            reclamados.add(po.key)
+    # --- Etapa 2c: nome contra linha ZERADA que sobrou, ultimo recurso ----
+    # casar_por_nome(zeradas=True)
 
     # --- Etapa 3: o que sobrou --------------------------------------------
     return [
-        matches.get(linha.key, POMatch(linha.key, None, "unmatched", None))
+        matches.get(linha.key, POMatch(linha.key, None, "unmatched", None,
+                                       ambiguous=linha.key in duvida_valor))
         for linha in invoice_lines
     ]
 

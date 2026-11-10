@@ -1,4 +1,4 @@
-"""Classifica em `dim_fornecedor.categoria` os fornecedores de carne e de insumo.
+"""Classifica em `dim_fornecedor_catapult.categoria` os fornecedores de carne e de insumo.
 
 Carne: a cliente lanca tudo a mao no Catapult (sem codigo de barras), e a regra de
 carne (caixa x Ordered, tolerancia zero) so vale com `categoria='carne'`.

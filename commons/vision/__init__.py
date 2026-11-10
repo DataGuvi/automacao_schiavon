@@ -22,195 +22,59 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _PROMPT = """\
-You are an expert at reading and extracting structured data from vendor invoices,
-including digital PDFs and scanned paper documents.
+You are an expert at reading vendor invoices (digital PDFs and scanned paper).
 
-Extract ALL information visible in this invoice and return ONLY a valid JSON object
-(no markdown, no explanation — raw JSON only).
+Extract ALL visible information and return ONLY a valid JSON object
+(no markdown, no explanation - raw JSON only).
 
-Pay special attention to:
+Rules:
 
-1. HANDWRITTEN ANNOTATIONS — three kinds, captured in DIFFERENT fields:
-   - A short handwritten NUMBER written on or right below the line (e.g.
-     "40102"), on its own, that looks like an item code — not a price, not a
-     quantity correction. Some suppliers' invoices carry a hand-written code
-     that is actually the BUYER's own catalog code for that item, different
-     from whatever code the invoice prints. Capture this in `handwritten_code`
-     (digits only). This is a real, confirmed pattern for some suppliers —
-     don't skip it as noise.
-   - Handwriting clearly next to/below ONE specific line — quantity/price
-     corrections, return notes, approval stamps, checkmarks with initials.
-     Capture as free text in `handwritten_notes` of that item.
-     The word INSUMO written beside a line, or a brace/bracket with INSUMO
-     covering several lines, goes in `handwritten_notes` of EACH covered line
-     (copy it on all N lines). A brace/bracket "}" drawn in the right margin
-     covers EVERY item from the line where it starts (top tip) to the line where
-     it ends (bottom tip), even though the word is written only once, usually
-     at the middle of the brace: set "Insumo" on the first, the last and ALL
-     lines in between (ignore "Substitution" sub-rows, they are not items). A
-     page can have several braces; a brace can continue on the next page, and
-     the word may be repeated beside lines there. Work out the first and last
-     covered line from the brace tips, not from where the word sits. A lone diagonal slash or tick without the word
-     is NOT insumo: leave that line's `handwritten_notes` null.
-   - Handwriting NOT tied to any specific line, written in a margin, below the
-     item table, next to the signature or anywhere else on the page.
-     * (INSUMO tied to specific lines is NOT this case: see above.)
-     * Decide in THIS order, for handwritten WORD text near the signature, in a
-       margin or next to the Open Invoices list:
-       1. You can read the word INSUMO, even split or with a destination ("Insumo",
-          "IN SUMO", "Insumo Burger", "Insumo Confeitaria"): copy the text exactly
-          as read into `general_handwritten_notes`, with NO prefix and NO flag.
-       2. You cannot read INSUMO, but the handwriting looks like a near-miss of it,
-          or it is a word that is not a person's name (e.g. "INS BURGER",
-          "INV BURDER", "INSUM", "IN5UMO"): write
-          `INSUMO_INCERTO: <exactly what you see>` in `general_handwritten_notes`.
-          Do NOT leave it out because it is "not clearly INSUMO": doubt is reported.
-       3. Only a signature scribble, initials, numbers or a stamp: leave
-          `general_handwritten_notes` null.
-       The note may be one word ("Insumo") or two ("Insumo Burger"). NEVER guess,
-       complete or correct the word. Use the INSUMO_INCERTO flag ONLY in case 2;
-       a clearly readable INSUMO / IN SUMO is case 1 and never gets the flag.
-     * Anything else (signature, initials, "DONE", stamps, comments) does NOT go
-       in `general_handwritten_notes`: describe it briefly in `reading_notes`.
+1. HANDWRITING - three kinds, each in a DIFFERENT field:
+   - A short handwritten NUMBER on or right below a line, alone, that looks like an
+     item code (e.g. "40102"; not a price or quantity fix): `handwritten_code` of that
+     item, digits only. It is the buyer's own catalog code - do not skip it as noise.
+   - Handwriting next to ONE specific line (quantity/price corrections, returns,
+     approval stamps, initials): free text in `handwritten_notes` of that item.
+     The word INSUMO beside a line, or a brace/bracket "}" in the right margin with
+     INSUMO, goes in `handwritten_notes` of EVERY covered line: all lines from the
+     brace's top tip to its bottom tip, even though the word is written only once
+     (usually mid-brace). Ignore "Substitution" sub-rows. A page can have several
+     braces, and a brace can continue on the next page. A lone diagonal slash or tick
+     without the word is NOT insumo: leave that line's `handwritten_notes` null.
+   - Handwriting NOT tied to a line (margin, below the item table, near the signature
+     or the Open Invoices list). Decide in THIS order:
+     1. You can read the word INSUMO, even split or with a destination ("Insumo",
+        "IN SUMO", "Insumo Burger", "INSUNO"): copy it exactly as read into
+        `general_handwritten_notes`, with NO prefix and NO flag.
+     2. You cannot read INSUMO, but it looks like a near-miss of it or a word that is
+        not a person's name ("INS BURGER", "INV BURDER", "INSUM", "IN5UMO"): write
+        `INSUMO_INCERTO: <exactly what you see>` in `general_handwritten_notes`.
+        Doubt is reported, not dropped.
+     3. Only a signature scribble, initials, numbers or a stamp: leave
+        `general_handwritten_notes` null.
+     NEVER guess, complete or correct the word. The flag is ONLY for case 2. Anything
+     else (signature, initials, "DONE", stamps, comments) goes briefly in
+     `reading_notes`, never in `general_handwritten_notes`.
 
-2. DATES — ISO 8601 format: YYYY-MM-DD in `invoice_date` / `due_date`.
-   These are US invoices: a printed date like "10/05/26" or "10/05/2026" is
-   MONTH/DAY/YEAR (October 5, 2026), not day/month/year. Also copy each date
-   EXACTLY as printed, character by character, into `invoice_date_raw` /
-   `due_date_raw` (e.g. "10/05/26") — don't reformat it there.
+2. DATES - ISO 8601 (YYYY-MM-DD) in `invoice_date` / `due_date`. These are US
+   invoices: "10/05/26" or "10/05/2026" is MONTH/DAY/YEAR (October 5, 2026). Also copy
+   each date EXACTLY as printed into `invoice_date_raw` / `due_date_raw`.
 
-3. AMOUNTS — separate subtotal, tax, and total.
+3. AMOUNTS - separate `subtotal`, `tax_amount` and `total_amount`.
 
-4. LINE ITEMS — every row, in order.
+4. LINE ITEMS - every row, in order. Copy `quantity`, `unit_price` and `total_price`
+   EXACTLY as printed. Never multiply, convert units or recompute one from another
+   (a pack such as "12x500g" does not change the quantity).
 
-5. ITEM CODE / UPC — some invoices have a separate column for the supplier's own
-   SKU (headers like "Item", "Product", "Product or service", "SKU") — that
-   is `item_code`, NOT the same as `description`. Some also show a UPC/EAN barcode,
-   either in its own column ("UPC", "UPC Item") or printed next to/below the
-   description — that is `upc` (digits only). When the ONLY code on the line is a
-   UPC/barcode (no separate supplier SKU), put it in `upc` and leave `item_code`
-   null — don't copy the same value into both. Leave both null when the invoice
-   has neither.
-   Don't confuse a leading "#" column with `item_code` — "#" is just the printed
-   row/line number (1, 2, 3, ...) and belongs in `item_order`, never in
-   `item_code`. When a line has BOTH a "#" column and a separate "SKU" (or
-   "Item"/"Product") column, `item_code` always comes from the SKU/Item/Product
-   column, not from "#". Example: a row "# 1  SKU 00152  QUALY MARGARINA..." →
-   `item_order`=1, `item_code`="00152".
+5. ITEM CODE / UPC - `item_code` is the supplier's own SKU column (headers like "Item",
+   "Product", "SKU"), not the description. `upc` is the barcode (digits only), in its
+   own column or beside the description. When the ONLY code on the line is a UPC, put
+   it in `upc` and leave `item_code` null; leave both null when there is none. A
+   leading "#" column is the row number (`item_order`), never `item_code`; when a line
+   has both "#" and SKU/Item/Product, `item_code` comes from SKU/Item/Product.
 
-6. READING CONFIDENCE — integer 0-100:
+6. READING CONFIDENCE - integer 0-100:
    90-100: all clear | 70-89: minor issues | 50-69: significant issues | 0-49: major problems
-
-7. CASES vs WEIGHT — meat/protein invoices often print a case-count column
-   (labeled "CASES", "ORDER QTY", "SHIP QTY", "QTY", "CARTONS", ...) separate
-   from a weight column (labeled "WEIGHT", "EXT WEIGHT", "LBS", "N.W", ...),
-   with the unit price applied per pound (variable-weight/catch-weight items — pack/size
-   often shows "AVG", or the case size is itself a weight like "65# CS").
-   When BOTH a case-count and a weight column exist on the same line AND the
-   unit price is applied per unit of weight (weight x unit_price = total_price):
-   put the WEIGHT in `quantity` (so `quantity x unit_price = total_price` still
-   holds) and put the case count in `cases`. If instead the unit price is per
-   case/each (printed qty x unit_price = total_price), the weight column is
-   informational only: never put it in `quantity`. When the invoice has only ONE
-   quantity column (no separate weight, e.g. dry goods sold by the case),
-   leave `cases` null — `quantity` already IS the case count — UNLESS rule 8
-   below applies.
-
-8. QUANTITY x PACK-SIZE MULTIPLIER FROM THE DESCRIPTION — many invoices sell
-   by the case/pack but print the pack size right inside the description
-   itself, right before or attached to a weight/volume unit, as
-   "<N>X<size> <UNIT>" or "<N>X<size><UNIT>" (UNIT being a weight or volume
-   unit — GR, G, KG, ML, LB, OZ, ... — e.g. "12X500 GR", "16x500 GR",
-   "6X7.5 ML", "20X500G" with no space, "90X30g", "10X1 KG") — N is how many
-   individual units are packed into what the Qty column counts, not a
-   separate quantity. Apply this whenever the description carries this
-   "<N>X<size>" pattern: the real quantity is Qty(printed) x N — regardless
-   of what the unit/UN column says, or even if it's blank. That column is
-   unreliable and often empty; don't gate this rule on it. Put the product
-   Qty(printed) x N in `quantity`, and put the ORIGINAL printed Qty in
-   `cases`. Leave `unit_price` and `total_price` exactly as printed — do NOT
-   recompute `total_price` from the new `quantity` here (unlike rule 7):
-   `total_price` must stay the real, literal amount the invoice charges for
-   that line, because whether the multiplied `quantity` or the original
-   `cases` is the one that should match the purchase order is decided later,
-   downstream, against data this reading has no access to (see note below).
-   Example: description "QUALY MARGARINATRAD. C/SAL 12x500 GR" with a
-   printed Qty of 3 → N=12 → `quantity`=36, `cases`=3 (`total_price`
-   untouched, whatever was printed for those 3 printed units).
-   Example: description "LASANHA DONA BENTA 20X500G" with a printed Qty of
-   1 → N=20 → `quantity`=20, `cases`=1 (`total_price` untouched).
-   Example: description "Requeijao Cremoso Copo TRADICIONAL Tirolez
-   12x200g" with a printed Qty of 7 → N=12 → `quantity`=84, `cases`=7.
-   The pack size can also be printed in its OWN column ("Pack Size", "Pack",
-   "Size") with a slash instead of an "x", as "<N>/<size> <UNIT>" — e.g.
-   "12/12 oz", "6/2LB", "6/12 oz". Same rule: N is the first number, the
-   real quantity is Qty(printed) x N, `cases` is the printed Qty, and the
-   unit of the size (oz, lb, g...) is NOT converted — only N matters. Copy
-   that column's text exactly into `pack_size`; leave `pack_size` null when
-   the invoice has no such column.
-   Example: printed Qty 1, Pack Size "12/12 oz", Weight 5.40, unit price
-   53.90, extended 53.90 → `quantity`=12, `cases`=1, `pack_size`="12/12 oz"
-   (the Weight column is NOT used: the price is per case, not per weight).
-   Don't apply this when the description has no "<N>X<size>" pattern and
-   there is no pack column, or when rule 7's weight column already fills
-   `quantity` and `cases`.
-   Why both numbers matter and neither is "the" answer: the same
-   "<N>X<size>" description shows up on invoices whose purchase order
-   tracks the item in individual units (where only the multiplied
-   `quantity` will match what was ordered) AND on invoices whose purchase
-   order tracks it by the case/pack (where only the original, unmultiplied
-   `cases` count will match) — there is no way to tell which one applies
-   from the invoice image alone, since that depends on how the OTHER
-   system (the purchase order) recorded the item, not on anything printed
-   here. Extract both numbers faithfully and let the downstream
-   reconciliation — which does have the purchase order — pick the right
-   one.
-   ONLY when the supplier on this invoice is Florida Distributing, and ONLY
-   for the EXACT literal codes "B24" or "C24" (capital B or C immediately
-   followed by exactly the digits "24", nothing else) written right before
-   the per-unit size — e.g. "HEINEKEN ... B24 12OZ 6P", "AMSTEL LIGHT C24
-   12OZ 12P": the same multiplier pattern above applies, with N=24 (the real
-   case size). Apply the exact same rule: `quantity` = Qty(printed) x 24,
-   `cases` = Qty(printed). Do NOT generalize this to any other
-   letter+number you see on a Florida Distributing invoice — e.g. "C2" in
-   "HEINEKEN C2 5L" is part of that product's own name (a keg/barrel size
-   code), not a case-size indicator, and must NOT be multiplied; only the
-   literal "B24"/"C24" triggers this rule. On any other supplier, a code
-   like "B24"/"C24" is NOT a pack-size multiplier either — leave it alone.
-
-9. QTD_CAIXA — how many individual items are packed into ONE box/case/pack/
-   display of this line, captured from any of these clear commercial
-   notations (capture ONLY the count number, never the weight/volume/size):
-   - "<N>X<size><UNIT>" in the description — same N as rule 8, e.g.
-     "12x400g" -> 12, "90x30g" -> 90.
-   - "<size><UNIT> X <N>" — the reverse order, size first then the count,
-     e.g. "200GR X15" -> 15, "60gr X12" -> 12.
-   - "<N>/<size><UNIT>" — pack column or in the description, e.g.
-     "24/0.5L" -> 24, "12/1 QT" -> 12, "20/1LB" -> 20.
-   - "PK <N>" with nothing after the number, e.g. "PK 100" -> 100,
-     "PK 50" -> 50. NOT "PK <N>/<something>" (e.g. "PK 2/100", "PK 1000/CS")
-     — that's a compound, ambiguous code, leave null.
-   - "<N>-Pk" / "<N>PACK" / "<N> PACK", e.g. "10-Pk" -> 10, "20PACK" -> 20,
-     "4 PACK" -> 4.
-   - "X<N>" on its own, or "BOX X<N>", e.g. "X12" -> 12, "BOX X24" -> 24.
-     Never the "x" that's already part of an "<N>X<size>" pattern above.
-   - "<N> roll(s) per box", e.g. "1 roll per box" -> 1.
-   - "<N> pcs" / "<N> items" standalone at the end of the description (the
-     most common form in practice: "<description> | <weight> | <N> pcs" or
-     "<description> | <N> items"), e.g. "WAFER MIX 270 g | 270 g | 6 pcs"
-     -> 6, "Quickbury Cookie selection in bag | 400 gr | 16 items" -> 16.
-     NOT "1 pc" alone — that is display material (shelf talker, wobbler),
-     not a real box of product; leave it null.
-   Leave `qtd_caixa` null — never guess a number — when none of these exact
-   patterns match, or the code is ambiguous/compound, or it's a stock
-   indicator rather than a pack size: e.g. "B24", "C24", "6P" (unclear
-   commercial code, not confirmed as a count), "CS 0, PC 2" / "CS 1, PC 0"
-   (inventory counters: cases-in-stock and pieces-in-stock, not a pack
-   size), "PK 2/100" and any other "PK <N>/<N>" compound, "4/125", "6X5
-   COSTA RICA (30)", "4/10H" (all ambiguous per the client's own reference
-   sheet — don't interpret them), or a pure weight like "20 Lbs Case" (a
-   total weight, not an item count). `qtd_caixa` is independent of `cases`:
-   never recompute `quantity`, `cases` or `total_price` from it.
 
 Return this exact JSON structure (use null for unknown fields):
 {
@@ -224,26 +88,16 @@ Return this exact JSON structure (use null for unknown fields):
   "tax_amount": null,
   "total_amount": null,
   "supplier_name": null,
-  "supplier_address": null,
-  "supplier_phone": null,
-  "supplier_email": null,
-  "supplier_tax_id": null,
-  "client_name": null,
-  "client_address": null,
-  "client_tax_id": null,
   "items": [
     {
       "item_order": 1,
       "description": null,
       "item_code": null,
       "upc": null,
-      "pack_size": null,
       "quantity": null,
       "unit": null,
       "unit_price": null,
       "total_price": null,
-      "cases": null,
-      "qtd_caixa": null,
       "handwritten_code": null,
       "handwritten_notes": null
     }
@@ -361,6 +215,7 @@ def read_invoice(file_path: Path, api_key: str, model: str = "claude-sonnet-4-6"
     response = client.messages.create(
         model=model,
         **_config_modelo(model),
+        cache_control={"type": "ephemeral"},
         messages=[
             {
                 "role": "user",
@@ -510,6 +365,7 @@ def submit_batch(
             params=MessageCreateParamsNonStreaming(
                 model=model,
                 **_config_modelo(model),
+                cache_control={"type": "ephemeral"},
                 messages=[{
                     "role": "user",
                     "content": [

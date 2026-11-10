@@ -123,31 +123,80 @@ _PISO_APRENDER_NOME_CATAPULT = 95.0
 
 
 def fetch_fornecedores(conn) -> list[dict]:
-    """Todos os fornecedores: `{id, nome, categoria, nome_catapult}`.
+    """Fornecedores oficiais do Catapult: `{id, nome, categoria, nome_catapult}`.
 
-    `nome_catapult` e o nome como o Catapult conhece o fornecedor (prefixo do
-    Name do PO): o alias `origem='erp'` ativo dele em `dim_fornecedor_alias`,
-    ou `None` se ainda nao cadastrado."""
+    `nome_catapult` e o Supplier ID (`cod_catapult`), prefixo do Name do PO."""
     return _ler(
         conn,
         f"""
-        SELECT f.id, f.nome, f.categoria,
-               (SELECT a.alias FROM {SCHEMA}.dim_fornecedor_alias a
-                 WHERE a.id_fornecedor = f.id AND a.origem = 'erp' AND a.ativo
-                 ORDER BY a.id LIMIT 1) AS nome_catapult
-          FROM {SCHEMA}.dim_fornecedor f
+        SELECT id, nome, categoria, cod_catapult AS nome_catapult
+          FROM {SCHEMA}.dim_fornecedor_catapult
+         WHERE ativo
         """,
         None, "fornecedores",
     )
 
 
+def fetch_depara_fornecedor(conn) -> dict[str, dict]:
+    """De-para nome da invoice -> fornecedor oficial, no formato de
+    `fetch_supplier_aliases`: nome_norm -> {canonical_id, canonical_name, categoria}."""
+    rows = _ler(
+        conn,
+        f"""
+        SELECT d.nome_invoice_norm AS alias_norm,
+               d.id_fornecedor_catapult AS canonical_id,
+               f.nome AS canonical_name,
+               f.categoria
+          FROM {SCHEMA}.dim_fornecedor_catapult_depara d
+          JOIN {SCHEMA}.dim_fornecedor_catapult f ON f.id = d.id_fornecedor_catapult
+         WHERE d.ativo
+        """,
+        None, "de-para de fornecedor",
+    )
+    return {r["alias_norm"]: r for r in rows}
+
+
+def fetch_fornecedor_por_cod(conn, cod_catapult: str) -> dict | None:
+    """Fornecedor oficial pelo Supplier ID (sem caixa), ou `None`."""
+    rows = _ler(
+        conn,
+        f"""
+        SELECT id, nome, categoria, cod_catapult AS nome_catapult
+          FROM {SCHEMA}.dim_fornecedor_catapult
+         WHERE ativo AND lower(cod_catapult) = lower(%s)
+        """,
+        (cod_catapult,), "fornecedor por codigo",
+    )
+    return rows[0] if rows else None
+
+
+def gravar_depara_fornecedor(conn, nome_invoice: str, id_fornecedor: int) -> bool:
+    """Grava nome da invoice -> fornecedor. Devolve False quando o nome ja tem
+    de-para (nunca reaponta)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""INSERT INTO {SCHEMA}.dim_fornecedor_catapult_depara
+                        (nome_invoice, nome_invoice_norm, id_fornecedor_catapult)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (nome_invoice_norm) DO NOTHING""",
+                (nome_invoice, norm_supplier(nome_invoice), id_fornecedor),
+            )
+            gravou = cur.rowcount > 0
+        conn.commit()
+        return gravou
+    except psycopg2.Error as exc:
+        reverter(conn)
+        raise DataAccessException("falha ao gravar de-para de fornecedor") from exc
+
+
 def classificar_fornecedor(conn, id_fornecedor: int, categoria: str) -> bool:
-    """Grava `dim_fornecedor.categoria`. Devolve False quando nada mudou.
+    """Grava `dim_fornecedor_catapult.categoria`. Devolve False quando nada mudou.
     Nao mexe em `cotado` (spec-categoria-insumo-carne)."""
     try:
         with conn.cursor() as cur:
             cur.execute(
-                f"UPDATE {SCHEMA}.dim_fornecedor SET categoria = %s WHERE id = %s",
+                f"UPDATE {SCHEMA}.dim_fornecedor_catapult SET categoria = %s WHERE id = %s",
                 (str(categoria), id_fornecedor),
             )
             alterou = cur.rowcount > 0
@@ -161,7 +210,7 @@ def classificar_fornecedor(conn, id_fornecedor: int, categoria: str) -> bool:
 def montar_resolvedor_fornecedor(fornecedores: list[dict], aliases_invoice: dict[str, dict]):
     """Devolve `resolver(nome_invoice) -> dict | None`: a linha de
     `fornecedores` da invoice. Alias `invoice` exato primeiro; senao fuzzy
-    contra `dim_fornecedor.nome`; `None` quando nada casa."""
+    contra `dim_fornecedor_catapult.nome`; `None` quando nada casa."""
     por_id = {f["id"]: f for f in fornecedores}
     por_nome = {f["nome"]: f for f in fornecedores}
 
@@ -178,63 +227,13 @@ def montar_resolvedor_fornecedor(fornecedores: list[dict], aliases_invoice: dict
 
 
 def confirmar_fornecedor_para_aprender(nome_invoice: str, fornecedor: dict) -> bool:
-    """True se o nome da invoice casa a >= 95% com `dim_fornecedor.nome` do
+    """True se o nome da invoice casa a >= 95% com `dim_fornecedor_catapult.nome` do
     fornecedor resolvido. Trava o auto-aprendizado do alias 'erp': o
     fornecedor resolvido pelo piso de 90 ou por alias pode ser outro."""
     achado, _score = match_supplier(
         nome_invoice, [fornecedor["nome"]], threshold=_PISO_APRENDER_NOME_CATAPULT,
     )
     return achado is not None
-
-
-def escolher_nome_catapult(nome_invoice: str, nomes_po: list[str]) -> str | None:
-    """Prefixo de PO do Catapult que casa com o nome da invoice a >= 95%
-    (`match_supplier`), ou `None`. E o criterio pra gravar o alias 'erp'
-    sozinho."""
-    achado, _score = match_supplier(
-        nome_invoice, nomes_po, threshold=_PISO_APRENDER_NOME_CATAPULT,
-    )
-    return achado
-
-
-def gravar_nome_catapult(conn, id_fornecedor: int, nome_catapult: str) -> bool:
-    """Adiciona ou atualiza o alias `origem='erp'` do fornecedor.
-
-    Atualiza o alias 'erp' que ele ja tem; senao insere. Devolve False (sem
-    gravar) quando esse nome ja e alias 'erp' de OUTRO fornecedor - nunca
-    reaponta cadastro alheio."""
-    alias_norm = norm_supplier(nome_catapult)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""SELECT id_fornecedor FROM {SCHEMA}.dim_fornecedor_alias
-                     WHERE alias_norm = %s AND origem = 'erp'""",
-                (alias_norm,),
-            )
-            dono = cur.fetchone()
-            if dono and dono[0] != id_fornecedor:
-                return False
-            cur.execute(
-                f"""UPDATE {SCHEMA}.dim_fornecedor_alias
-                       SET alias = %s, alias_norm = %s, ativo = true
-                     WHERE id = (SELECT id FROM {SCHEMA}.dim_fornecedor_alias
-                                  WHERE id_fornecedor = %s AND origem = 'erp' AND ativo
-                                  ORDER BY id LIMIT 1)""",
-                (nome_catapult, alias_norm, id_fornecedor),
-            )
-            if cur.rowcount == 0:
-                cur.execute(
-                    f"""INSERT INTO {SCHEMA}.dim_fornecedor_alias
-                            (id_fornecedor, alias, alias_norm, origem)
-                        VALUES (%s, %s, %s, 'erp')
-                        ON CONFLICT (alias_norm, origem) DO UPDATE SET ativo = true""",
-                    (id_fornecedor, nome_catapult, alias_norm),
-                )
-        conn.commit()
-        return True
-    except psycopg2.Error as exc:
-        reverter(conn)
-        raise DataAccessException("falha ao gravar alias erp do fornecedor") from exc
 
 
 def save_supplier_alias(
@@ -318,7 +317,7 @@ def upsert_item_sinonimos(conn, rows: list[Sinonimo]) -> int:
 
 # Colunas que reconcile_one_invoice espera no header. `fat_invoice.id_fornecedor`
 # não existe mais (removida do banco em produção) — o fornecedor é resolvido em
-# memória a cada conciliação via `dim_fornecedor_alias` (fetch_supplier_aliases),
+# memória a cada conciliação via `dim_fornecedor_catapult_depara` (fetch_depara_fornecedor),
 # não lido daqui. Qualificadas com `i.` porque a query da janela junta `processo`.
 _HEADER_COLS = f"""
     i.id, i.id_processo, i.id_loja,
@@ -580,7 +579,7 @@ def save_reconciliation_header(conn, data: dict) -> int:
     existem mais nesta tabela (removidas do banco em produção). `id_fornecedor`
     também foi removida de `fat_invoice` — não tem mais FK para fornecedor em
     lugar nenhum; quem precisa dele resolve em memória via
-    `fetch_supplier_aliases`/`dim_fornecedor_alias`, a cada conciliação.
+    `fetch_depara_fornecedor`/`dim_fornecedor_catapult_depara`, a cada conciliação.
     `revisar`, `match_nivel` e `match_score` sobrevivem em
     `fat_conciliacao_item`. `id_ciclo` só fazia sentido para a frente 'cotacao'
     (hoje desativada, ver módulo) e não tem substituto — se a frente 'cotacao'
@@ -918,8 +917,8 @@ _DIVERGENCIA = _DIVERGENTE + _SEM_COMPARACAO
 # `fornecedor` vem direto de `fat_invoice.nome_fornecedor` (o nome como a
 # invoice foi lida) — `fat_invoice.id_fornecedor` não existe mais (removida do
 # banco em produção), então não dá mais para enriquecer com o nome canônico de
-# `dim_fornecedor` aqui; quem precisa do fornecedor resolvido usa
-# `fetch_supplier_aliases`/`dim_fornecedor_alias` em memória, não este join.
+# `dim_fornecedor_catapult` aqui; quem precisa do fornecedor resolvido usa
+# `fetch_depara_fornecedor`/`dim_fornecedor_catapult_depara` em memória, não este join.
 _COLS_RELATORIO = """
                        fi.arquivo,
                        fi.nome_fornecedor                    AS fornecedor,
@@ -1058,8 +1057,6 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
             CASE
                 WHEN fi.confianca < 70
                     THEN 'Confianca de leitura baixa (' || fi.confianca || '%%)'
-                WHEN p.cod_status = 2
-                    THEN 'PO ja lancada no Catapult'
                 WHEN p.cod_status = 13
                     THEN 'PO nao encontrada no Catapult'
                 WHEN po.achou IS NOT NULL
@@ -1105,9 +1102,10 @@ def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
           ) ni ON true
          WHERE fi.conferido_manual_em IS NULL
            AND fi.criado_em >= %s
+           AND (p.cod_status <> 2 OR fi.confianca < 70)
            AND (
                fi.confianca < 70
-               OR p.cod_status IN (2, 13)
+               OR p.cod_status = 13
                OR po.achou IS NOT NULL
                OR pz.achou IS NOT NULL
                OR NOT EXISTS (

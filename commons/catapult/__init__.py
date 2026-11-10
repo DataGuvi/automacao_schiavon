@@ -405,9 +405,9 @@ def search_purchase_orders_by_supplier(
     page, supplier_name: str, match_type: str = "Contains", timeout: int = 20_000,
     nomes_alternativos: tuple[str, ...] = (), mostrar_historico: bool = False,
 ) -> list[dict]:
-    """Busca PO pelo nome do fornecedor (filtro 'Supplier' da tela
-    Worksheets, categoria 'Purchase Order', Status='Ordered', 'Show History
-    For' desmarcado por padrão — testado contra o ambiente real). Retorna uma
+    """Busca PO pelo nome do fornecedor (filtro 'Name' da tela Worksheets e,
+    se vier vazio, 'Supplier'; categoria 'Purchase Order', Status='Ordered',
+    'Show History For' desmarcado por padrão). Retorna uma
     linha por PO encontrado: `{'name': ..., 'href': ...}` — lista vazia é
     resultado normal (fornecedor sem PO 'Ordered' no momento), não erro.
 
@@ -425,15 +425,21 @@ def search_purchase_orders_by_supplier(
     pode não ser um prefixo exato do nome cadastrado no Catapult.
 
     `nomes_alternativos`: outros nomes do mesmo fornecedor (ex. o nome cru da
-    invoice quando `supplier_name` já é o termo do de-para `dim_fornecedor_alias`)
+    invoice quando `supplier_name` já é o Supplier ID de `dim_fornecedor_catapult`)
     aceitos na conferência do filtro — ver `_conferir_filtro_aplicado`.
 
     `mostrar_historico`: `True` busca PO já 'Committed' (fora do universo
     'Ordered') — invoice antiga reprocessada, `spec-historico-po-catapult`.
     """
     _preparar_filtros_po(page, timeout, mostrar_historico)
+    achados = _buscar_worksheets_por_fornecedor(
+        page, supplier_name, match_type, timeout, nomes_alternativos, "Name",
+    )
+    if achados:
+        return achados
+    log.info("catapult: nada por Name, tentando o campo Supplier")
     return _buscar_worksheets_por_fornecedor(
-        page, supplier_name, match_type, timeout, nomes_alternativos,
+        page, supplier_name, match_type, timeout, nomes_alternativos, "Supplier",
     )
 
 
@@ -475,10 +481,10 @@ def _preparar_filtros_po(page, timeout: int, mostrar_historico: bool = False) ->
 
 def _buscar_worksheets_por_fornecedor(
     page, supplier_name: str, match_type: str, timeout: int,
-    nomes_alternativos: tuple[str, ...] = (),
+    nomes_alternativos: tuple[str, ...] = (), campo: str = "Name",
 ) -> list[dict]:
-    """Seleciona 'Name'/`match_type` (Name do PO começa pelo fornecedor), digita e lê a grade."""
-    _aplicar_filtro_busca(page, "Name", supplier_name, match_type)
+    """Seleciona `campo` ('Name' ou 'Supplier')/`match_type`, digita e lê a grade."""
+    _aplicar_filtro_busca(page, campo, supplier_name, match_type)
 
     try:
         page.wait_for_selector(_SEL_RESULT_LINKS, timeout=timeout)
@@ -626,7 +632,7 @@ def _conferir_filtro_aplicado(
     # Catapult conhece ('Perdomo-036998-HQ-RS2' para a invoice 'Perdomo
     # Distributor'; 'Fresh Poin-008668-RS2' para 'Freshpoint Central FL'). Por
     # isso compara o PREFIXO do Name (antes do '-') por aproximação com o nome
-    # buscado e, não achando, cai nos nomes alternativos (de-para `dim_fornecedor_alias`).
+    # buscado e, não achando, cai nos nomes alternativos (nomes de `dim_fornecedor_catapult` e da invoice).
     if not resultado or not supplier_name.strip():
         return resultado
     prefixos = [extrair_prefixo_nome_po(r["name"]) for r in resultado]

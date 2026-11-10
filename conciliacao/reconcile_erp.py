@@ -1,37 +1,15 @@
 """Conciliação Invoice × PO (Catapult) — comparação item a item, `comparacao='erp'`.
 
-Implementa a cascata do fluxograma da Etapa 3: casa cada item da invoice com
-um item do PO por código primeiro (`item_code`/`upc` x `Supplier Unit ID`/
-`scancode`), cai para nome por aproximação no resíduo (contra `item_name` OU
-`receipt_alias` do PO — as duas colunas já vêm na própria linha, confirmado
-contra o Catapult real), e só então compara quantidade e valor da linha do
-par achado. O motor puro mora em `commons/matcher.py` (`match_items_po`,
-`compare_price`, `within_tolerance`); aqui é só a regra de uma invoice.
+Casa cada item da invoice com um item do PO só pelo valor total da linha
+(spec-conciliacao-so-por-valor; código e nome estão desligados em
+`commons/matcher.py::match_items_po`) e compara o total do par: bateu,
+conciliado; não bateu, `PRICE_MISMATCH_PO`. Item sem linha de mesmo valor
+também é `PRICE_MISMATCH_PO`; em dúvida entre várias linhas, `NO_PO_FOR_ITEM`
+(conferência manual). Ordered x Received é informativo (`QTY_MISMATCH_PO` só
+junto de `PRICE_MISMATCH_PO`); `Ordered=0` com `Received>0` vira
+`PEDIDO_ZERADO` (spec-quantidade-informativa-pedido-zerado).
 
-Quantidade (spec-qtd-mismatch-custo-unitario — substitui a comparação
-three-way `invoice x Ordered x Received` e todo o roteamento caixa/peça por
-`POLine.unit`, removidos): cascata de CUSTO, não de contagem, porque o
-Catapult é tratado como fonte de verdade e a leitura de quantidade da
-invoice (Vision, pack embutido na descrição, fornecedor sem PO prévio) é o
-lado que mais erra. Passo 1 — valor total faturado do grupo x
-`Invoiced Total Cost` do PO (`compare_price`, como sempre); só se bater,
-passo 2 — `valor_total / Received` (custo por unidade implícito na invoice)
-x `Invoiced Unit Cost` do PO (`within_tolerance`) — `Received`, não
-`Ordered`, porque é assim que o próprio Catapult calcula `Invoiced Unit
-Cost` (medido ao vivo: `Invoiced Total Cost / Received`, inclusive em
-linhas com `Ordered=0`). Carne (`categoria_fornecedor == "carne"`) não tem
-essa coluna na grade real (confirmado ao vivo, PO Eastern-008922-RS2) — usa
-`Ordered Unit Cost` no lugar, mesma fórmula. Consequência aceita: o passo 2
-nunca discorda de si mesmo quando o passo 1 já bateu, então na prática fica
-inerte — nunca gera `QTY_MISMATCH_PO` sozinho (ver "Limites conhecidos" do
-spec). `Received` ausente/zero ou a coluna de custo (conforme a categoria)
-ausente pula o passo 2 sem marcar divergência (ver `_comparar_grupo`).
-Revisão 2026-11-03 (spec-quantidade-informativa-pedido-zerado): o passo 2 só
-roda em carne; fora dela o valor decide e Ordered x Received é informativo
-(`QTY_MISMATCH_PO` só junto de `PRICE_MISMATCH_PO`). `Ordered=0` com
-`Received>0` vira `PEDIDO_ZERADO` (conferência manual).
-
-Depois do casamento por código/nome, `_herdar_po_de_variante_de_estado`
+Depois do casamento, `_herdar_po_de_variante_de_estado`
 resgata a linha que ficou sem PO por ser a mesma carne entregue em estado
 diferente (fresco x congelado — o casamento por nome é guloso e 1-para-1,
 então só uma das duas reclama o PO). Ela herda o `po_key` da irmã já
@@ -66,7 +44,6 @@ from commons.matcher import (
     norm_supplier,
     norm_text,
     po_items_sem_invoice,
-    within_tolerance,
 )
 from commons.logging_config import get_logger
 from domain.conciliacao_codes import IssueCode
@@ -95,7 +72,7 @@ _TOLERANCIA_SUBCENTAVO = (Decimal("0.001"), Decimal("0"))
 
 # Chave = trecho do nome do fornecedor LIDO na invoice (`nome_fornecedor`),
 # normalizado (`norm_supplier` — maiúsculas, sem pontuação/sufixo societário)
-# — não o nome truncado do Catapult (`dim_fornecedor_alias(origem='erp')`),
+# — não o nome truncado do Catapult (`dim_fornecedor_catapult.cod_catapult`),
 # que corta no meio da palavra ('Fresh Poin') e não bate por substring com
 # o nome cheio. Comparação por substring de propósito, pra não depender de
 # casar a razão social inteira ('Triunfo' cobre 'TRIUNFO FOODS IMPORT
@@ -180,8 +157,8 @@ def _resolver_tolerancia_preco(
 ) -> tuple[Decimal, Decimal]:
     """Decide `(abs_tol, pct_tol)` pra `compare_price` desta invoice.
 
-    `categoria_fornecedor` vem de `dim_fornecedor.categoria`
-    (`domain.service.conciliacao_service.fetch_supplier_aliases`, resolvido
+    `categoria_fornecedor` vem de `dim_fornecedor_catapult.categoria`
+    (`domain.service.conciliacao_service.fetch_depara_fornecedor`, resolvido
     por `crawler/flow/reconcile_erp_flow.py` antes de chamar
     `reconcile_items_against_po`) — carne tem regra própria independente de
     QUAL fornecedor de carne é. Fora carne, casa por nome contra
@@ -408,7 +385,6 @@ def reconcile_items_against_po(
         po_key: _comparar_grupo(
             grupo, po_by_key[po_key], abs_tol, pct_tol,
             _grupo_isento(grupo, supplier_name, categoria_fornecedor) or not aplicar_ajustes,
-            is_carne,
         )
         for po_key, grupo in grupos.items()
     }
@@ -449,7 +425,9 @@ def reconcile_items_against_po(
                 row.update({"issue_codes": issues, "has_issue": True,
                             "needs_review": needs_review})
             else:
-                issues.append(NO_PO_FOR_ITEM)
+                # spec-conciliacao-so-por-valor: em duvida vai a Conferencia Manual;
+                # sem linha de mesmo valor no PO e divergencia de valor.
+                issues.append(NO_PO_FOR_ITEM if match.ambiguous else PRICE_MISMATCH_PO)
                 row.update({"issue_codes": issues, "has_issue": True,
                             "needs_review": needs_review})
             linhas.append(row)
@@ -469,26 +447,13 @@ def reconcile_items_against_po(
             "total_po": veredito["total_po"],
         })
 
-        # R11 (spec-qtd-mismatch-custo-unitario, 2026-10-30): o passo 2
-        # (qty_ok), quando RODOU de verdade (qty_avaliado), decide o veredito
-        # sozinho - bateu, sem issue, mesmo com o passo 1 (price_ok) tendo
-        # divergido. Sem dado pra rodar o passo 2 (qty_avaliado=False), o
-        # veredito cai no passo 1 sozinho (nunca mascara uma divergencia de
-        # preco so por falta de dado - spec-po-zerado-ultimo-recurso).
-        # Carne segue a cascata de custo; fora dela o valor decide e a
-        # quantidade (Ordered x Received) so acompanha a divergencia de valor.
-        if veredito["qty_avaliado"]:
-            divergente = not veredito["qty_ok"]
-            if divergente:
+        # So o total decide (spec-conciliacao-so-por-valor R5); a quantidade
+        # (Ordered x Received) so acompanha a divergencia de valor.
+        divergente = not veredito["price_ok"]
+        if divergente:
+            issues.append(PRICE_MISMATCH_PO)
+            if veredito["qty_difere"] and not is_carne:
                 issues.append(QTY_MISMATCH_PO)
-                if not veredito["price_ok"]:
-                    issues.append(PRICE_MISMATCH_PO)
-        else:
-            divergente = not veredito["price_ok"]
-            if divergente:
-                issues.append(PRICE_MISMATCH_PO)
-                if veredito["qty_difere"] and not is_carne:
-                    issues.append(QTY_MISMATCH_PO)
 
         pedido_zerado = veredito["pedido_zerado"]
         if pedido_zerado:
@@ -565,56 +530,20 @@ def _herdar_po_de_variante_de_estado(
 
 def _comparar_grupo(
     grupo: list[dict], po: POLine, abs_tol: Decimal, pct_tol: Decimal, isento: bool,
-    is_carne: bool = False,
 ) -> dict:
     """Compara a SOMA de um grupo de linhas da invoice (todas casadas com o
-    mesmo item do PO) contra `po.invoiced_total_cost`/`invoiced_unit_cost`.
-    Com 1 item só no grupo, é a mesma coisa de comparar a linha sozinha.
+    mesmo item do PO) contra `po.invoiced_total_cost`. Com 1 item só no
+    grupo, é a mesma coisa de comparar a linha sozinha.
 
     `abs_tol`/`pct_tol`: tolerância de preço já resolvida por fornecedor
     (`_resolver_tolerancia_preco`) — passada pra `compare_price` no lugar do
-    padrão do motor.
+    padrão do motor. Só o total decide o veredito (`price_ok`,
+    spec-conciliacao-so-por-valor R5).
 
-    Quantidade (spec-qtd-mismatch-custo-unitario): cascata de CUSTO, não de
-    contagem — o Catapult é a fonte de verdade, a leitura de quantidade da
-    invoice é o lado que mais erra. Passo 1, `price_ok` (valor total faturado
-    x `Invoiced Total Cost`, de sempre). Passo 2 (R11, 2026-10-30: roda
-    SEMPRE, não mais só quando o passo 1 bateu): `valor_total / po.received`
-    (custo por unidade implícito na invoice) x `po.invoiced_unit_cost`, via
-    `within_tolerance` — `Received` porque é assim que o próprio Catapult
-    calcula `Invoiced Unit Cost` (medido ao vivo), não `Ordered`.
-    `is_carne=True` usa `po.ordered_unit_cost` no lugar de
-    `po.invoiced_unit_cost` — carne não tem essa coluna na grade real
-    (confirmado ao vivo, PO Eastern-008922-RS2), só "Ordered Unit Cost".
-    `po.received` ausente/zero, ou a coluna de custo (conforme `is_carne`)
-    ausente, pulam o passo 2: `qty_ok=True` e `qty_avaliado=False` — nunca
-    marca divergência de quantidade por falta de dado, e quem chama
-    (`reconcile_items_against_po`) sabe que o passo 2 NÃO confirmou nem
-    desmentiu nada (cai no veredito do passo 1 sozinho, não suprime
-    `PRICE_MISMATCH_PO` por falta de dado — ver spec-po-zerado-ultimo-recurso).
-    Quando o passo 2 roda de verdade (`qty_avaliado=True`), o VEREDITO final
-    do grupo passa a ser decidido só por ele (R11): `qty_ok=True` -> sem
-    issue, mesmo com `price_ok=False`; `qty_ok=False` -> `QTY_MISMATCH_PO`,
-    e `PRICE_MISMATCH_PO` só entra junto se `price_ok` também for `False`.
-    Fora de carne, isso raramente muda o resultado na prática — como
-    `po.invoiced_unit_cost` É `po.invoiced_total_cost / po.received` por
-    definição do Catapult, o passo 2 quase nunca discorda do passo 1 (só por
-    ruído de arredondamento na borda da tolerância). Em carne,
-    `po.ordered_unit_cost` é um número genuinamente independente (catálogo),
-    então a diferença é real: total ainda não bate com o faturado mas o
-    custo por unidade já confere com o catálogo -> considerado OK.
-
-    Carne usa a tolerância PADRÃO do motor (`ABS_TOL`/`PCT_TOL`) no passo 2,
-    nunca `abs_tol`/`pct_tol` resolvida por fornecedor (carne é zero — política
-    do passo 1, bater exato com o valor faturado). "Ordered Unit Cost" não é
-    identidade matemática exata como "Invoiced Unit Cost" — carrega ruído de
-    arredondamento real (medido ao vivo: Coxão Duro, `305.24/76.5=3.990065` x
-    `Ordered Unit Cost=3.99`, diff `0.000065`) que zero tolerância reprovaria.
-
-    Fora de carne o passo 2 não roda (spec-quantidade-informativa-pedido-zerado):
-    o valor decide, e `qty_diff` = `Received - Ordered` é só informativo.
-    `qty_difere` sinaliza Ordered != Received; `pedido_zerado` (Ordered=0 e
-    Received>0) manda a nota para conferência manual."""
+    `qty_diff` = `Received - Ordered` é só informativo
+    (spec-quantidade-informativa-pedido-zerado). `qty_difere` sinaliza
+    Ordered != Received; `pedido_zerado` (Ordered=0 e Received>0) manda a nota
+    para conferência manual."""
     valor_total = _soma_ou_none(
         invoice_line_total(i.get("quantity"), i.get("unit_price"), i.get("total_price"))
         for i in grupo
@@ -626,33 +555,12 @@ def _comparar_grupo(
     verdict = compare_price(valor_total, total_po, abs_tol=abs_tol, pct_tol=pct_tol)
     price_ok = verdict.status == "ok"
 
-    unit_cost_ref = po.ordered_unit_cost if is_carne else po.invoiced_unit_cost
-    # Carne usa a tolerancia PADRAO do motor aqui, nao a `abs_tol`/`pct_tol`
-    # resolvida por fornecedor (carne = zero, politica do passo 1 - bater
-    # exato com o valor faturado). "Ordered Unit Cost" nao e identidade
-    # matematica exata como "Invoiced Unit Cost" - tem ruido de
-    # arredondamento real (medido ao vivo: Coxao Duro, 305.24/76.5=3.990065
-    # x Ordered Unit Cost=3.99, diff 0.000065) que zero tolerancia reprova.
-    tol_abs, tol_pct = (ABS_TOL, PCT_TOL) if is_carne else (abs_tol, pct_tol)
-    # R11 (2026-10-30): o passo 2 roda SEMPRE agora, mesmo com `price_ok=False`
-    # (nao e mais gatilhado por ele) - so as condicoes de dado ausente seguem
-    # pulando. `qty_avaliado` distingue "bateu de verdade" de "nao deu pra
-    # checar" (R3, fail-safe) - sem isso, falta de dado (ex. linha zerada,
-    # spec-po-zerado-ultimo-recurso) mascararia uma divergencia real de preco.
-    qty_ok, qty_avaliado = True, False
-    if is_carne and po.received and unit_cost_ref is not None and valor_total is not None:
-        unit_value = valor_total / po.received
-        qty_ok = within_tolerance(unit_value, unit_cost_ref, tol_abs, tol_pct)
-        qty_avaliado = True
-
     # Quantidade informativa (spec-quantidade-informativa-pedido-zerado):
     # Received - Ordered do proprio Catapult, negativo = faltando pecas.
     ambos = po.ordered is not None and po.received is not None
     qty_diff = (po.received - po.ordered) if ambos else None
     pedido_zerado = bool(ambos and po.ordered == 0 and po.received > 0)
     return {
-        "qty_ok": qty_ok,
-        "qty_avaliado": qty_avaliado,
         "qty_difere": bool(qty_diff),
         "pedido_zerado": pedido_zerado,
         "price_ok": price_ok,

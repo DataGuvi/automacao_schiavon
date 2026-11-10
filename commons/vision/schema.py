@@ -237,62 +237,65 @@ class InvoiceItem(BaseModel):
         ),
     )
 
-    @model_validator(mode="after")
-    def _aplicar_multiplicador_de_pack_faltante(self) -> "InvoiceItem":
-        """Rede de segurança pra regra 8 do prompt de extração
-        (`commons/vision/__init__.py`): se a Vision não preencheu `cases`
-        (não aplicou o multiplicador — ou porque não achou o padrão, ou
-        porque simplesmente esqueceu nessa linha, o caso comum em notas com
-        muitos itens) mas a descrição carrega "<N>X<size>" (ou a coluna de
-        pack, `pack_size`, traz "<N>/<size>"), aplica aqui do mesmo jeito: `cases` = quantidade impressa original, `quantity` =
-        impressa x N. Não mexe quando `cases` já veio preenchido (regra 7 ou
-        regra 8 já aplicadas pela Vision) nem quando não há esse padrão."""
-        if self.cases is not None or self.quantity is None:
-            return self
-        if self.quantity % 1:
-            return self  # quantidade fracionada e peso, nao contagem de caixas
-        n = _n_do_pack(self.pack_size, self.description)
-        if n <= 1:
-            return self
-        self.cases = self.quantity
-        self.quantity = self.quantity * n
-        return self
+    # desativado: regra nao multiplica/converte (spec-vision-prompt-enxuto)
+    # @model_validator(mode="after")
+    # def _aplicar_multiplicador_de_pack_faltante(self) -> "InvoiceItem":
+    #     """Rede de segurança pra regra 8 do prompt de extração
+    #     (`commons/vision/__init__.py`): se a Vision não preencheu `cases`
+    #     (não aplicou o multiplicador — ou porque não achou o padrão, ou
+    #     porque simplesmente esqueceu nessa linha, o caso comum em notas com
+    #     muitos itens) mas a descrição carrega "<N>X<size>" (ou a coluna de
+    #     pack, `pack_size`, traz "<N>/<size>"), aplica aqui do mesmo jeito: `cases` = quantidade impressa original, `quantity` =
+    #     impressa x N. Não mexe quando `cases` já veio preenchido (regra 7 ou
+    #     regra 8 já aplicadas pela Vision) nem quando não há esse padrão."""
+    #     if self.cases is not None or self.quantity is None:
+    #         return self
+    #     if self.quantity % 1:
+    #         return self  # quantidade fracionada e peso, nao contagem de caixas
+    #     n = _n_do_pack(self.pack_size, self.description)
+    #     if n <= 1:
+    #         return self
+    #     self.cases = self.quantity
+    #     self.quantity = self.quantity * n
+    #     return self
 
-    @model_validator(mode="after")
-    def _aplicar_qtd_caixa_faltante(self) -> "InvoiceItem":
-        """Rede de segurança determinística pra `qtd_caixa` (spec-qtd-caixa): se a
-        Vision deixou null mas a descrição/`pack_size` bate um dos formatos claros
-        de contagem (`_n_qtd_caixa`), preenche aqui do mesmo jeito que
-        `_aplicar_multiplicador_de_pack_faltante` faz pra `cases` — mesma lição: o
-        LLM é inconsistente aplicando regra mecânica em nota com muitas linhas.
-        Campo isolado: nunca toca `quantity`, `cases` ou `total_price`."""
-        if self.qtd_caixa is not None:
-            return self
-        n = _n_qtd_caixa(self.pack_size, self.description)
-        if n < 1:
-            return self
-        self.qtd_caixa = float(n)
-        return self
+    # desativado: regra nao multiplica/converte (spec-vision-prompt-enxuto)
+    # @model_validator(mode="after")
+    # def _aplicar_qtd_caixa_faltante(self) -> "InvoiceItem":
+    #     """Rede de segurança determinística pra `qtd_caixa` (spec-qtd-caixa): se a
+    #     Vision deixou null mas a descrição/`pack_size` bate um dos formatos claros
+    #     de contagem (`_n_qtd_caixa`), preenche aqui do mesmo jeito que
+    #     `_aplicar_multiplicador_de_pack_faltante` faz pra `cases` — mesma lição: o
+    #     LLM é inconsistente aplicando regra mecânica em nota com muitas linhas.
+    #     Campo isolado: nunca toca `quantity`, `cases` ou `total_price`."""
+    #     if self.qtd_caixa is not None:
+    #         return self
+    #     n = _n_qtd_caixa(self.pack_size, self.description)
+    #     if n < 1:
+    #         return self
+    #     self.qtd_caixa = float(n)
+    #     return self
 
-    @model_validator(mode="after")
-    def _derivar_cases_de_qtd_caixa(self) -> "InvoiceItem":
-        """`cases` (spec-cases-derivado-qtd-caixa): quando a regra 8/açougue não
-        preencheu `cases` mas `quantity` e `qtd_caixa` vieram preenchidos e a
-        divisão é EXATA (`quantity / qtd_caixa`), deriva `cases` daqui — é o
-        número de caixas, o mesmo dado que a conciliação ERP já sabe comparar
-        contra `Ordered` quando o PO está em "Case" (`_comparar_grupo`, guiado
-        por `po.unit`, nunca por este campo). Divisão não-exata nunca arredonda:
-        fica `None`, cai no fallback de hoje (`quantity` direto). `qtd_caixa<=1`
-        também fica de fora — mesmo caso degenerado que a regra 8 já trata como
-        "não é multiplicador de verdade" (ex. "1x500g" não é um pack real):
-        dividir por 1 só copiaria `quantity` para `cases` sem informação nova.
-        `quantity` nunca muda — diferente da regra 8, que multiplica."""
-        if self.cases is not None or self.quantity is None or self.qtd_caixa is None:
-            return self
-        if self.qtd_caixa <= 1 or self.quantity % self.qtd_caixa:
-            return self
-        self.cases = self.quantity / self.qtd_caixa
-        return self
+    # desativado: regra nao multiplica/converte (spec-vision-prompt-enxuto)
+    # @model_validator(mode="after")
+    # def _derivar_cases_de_qtd_caixa(self) -> "InvoiceItem":
+    #     """`cases` (spec-cases-derivado-qtd-caixa): quando a regra 8/açougue não
+    #     preencheu `cases` mas `quantity` e `qtd_caixa` vieram preenchidos e a
+    #     divisão é EXATA (`quantity / qtd_caixa`), deriva `cases` daqui — é o
+    #     número de caixas, o mesmo dado que a conciliação ERP já sabe comparar
+    #     contra `Ordered` quando o PO está em "Case" (`_comparar_grupo`, guiado
+    #     por `po.unit`, nunca por este campo). Divisão não-exata nunca arredonda:
+    #     fica `None`, cai no fallback de hoje (`quantity` direto). `qtd_caixa<=1`
+    #     também fica de fora — mesmo caso degenerado que a regra 8 já trata como
+    #     "não é multiplicador de verdade" (ex. "1x500g" não é um pack real):
+    #     dividir por 1 só copiaria `quantity` para `cases` sem informação nova.
+    #     `quantity` nunca muda — diferente da regra 8, que multiplica."""
+    #     if self.cases is not None or self.quantity is None or self.qtd_caixa is None:
+    #         return self
+    #     if self.qtd_caixa <= 1 or self.quantity % self.qtd_caixa:
+    #         return self
+    #     self.cases = self.quantity / self.qtd_caixa
+    #     return self
 
 
 class InvoiceData(BaseModel):
@@ -388,26 +391,27 @@ class InvoiceData(BaseModel):
         self.due_date = _converter_data_impressa(self.due_date_raw) or self.due_date
         return self
 
-    @model_validator(mode="after")
-    def _aplicar_multiplicador_pack_letra_fornecedor(self) -> "InvoiceData":
-        """"B24"/"C24" = tamanho real da caixa, SO pra Florida Distributing
-        (spec-caixa-letra-florida-distributing) - mesma formula da regra 8
-        (`_aplicar_multiplicador_de_pack_faltante`: `cases` = quantidade
-        impressa, `quantity` = impressa x N), so que o N vem de letra+numero
-        em vez de "NxSIZE". Escopado por fornecedor de proposito: a mesma
-        letra+numero noutro fornecedor pode ser so indicador de estoque
-        ambiguo (`spec-qtd-caixa` R3), entao nunca roda fora daqui."""
-        if not _fornecedor_bate(self.supplier_name, _FORNECEDORES_PACK_LETRA):
-            return self
-        for item in self.items:
-            if item.cases is not None or item.quantity is None or item.quantity % 1:
-                continue
-            achado = _PACK_SIZE_LETRA_RE.search(item.description or "")
-            if not achado:
-                continue
-            n = int(achado.group(1))
-            if n <= 1:
-                continue
-            item.cases = item.quantity
-            item.quantity = item.quantity * n
-        return self
+    # desativado: regra nao multiplica/converte (spec-vision-prompt-enxuto)
+    # @model_validator(mode="after")
+    # def _aplicar_multiplicador_pack_letra_fornecedor(self) -> "InvoiceData":
+    #     """"B24"/"C24" = tamanho real da caixa, SO pra Florida Distributing
+    #     (spec-caixa-letra-florida-distributing) - mesma formula da regra 8
+    #     (`_aplicar_multiplicador_de_pack_faltante`: `cases` = quantidade
+    #     impressa, `quantity` = impressa x N), so que o N vem de letra+numero
+    #     em vez de "NxSIZE". Escopado por fornecedor de proposito: a mesma
+    #     letra+numero noutro fornecedor pode ser so indicador de estoque
+    #     ambiguo (`spec-qtd-caixa` R3), entao nunca roda fora daqui."""
+    #     if not _fornecedor_bate(self.supplier_name, _FORNECEDORES_PACK_LETRA):
+    #         return self
+    #     for item in self.items:
+    #         if item.cases is not None or item.quantity is None or item.quantity % 1:
+    #             continue
+    #         achado = _PACK_SIZE_LETRA_RE.search(item.description or "")
+    #         if not achado:
+    #             continue
+    #         n = int(achado.group(1))
+    #         if n <= 1:
+    #             continue
+    #         item.cases = item.quantity
+    #         item.quantity = item.quantity * n
+    #     return self

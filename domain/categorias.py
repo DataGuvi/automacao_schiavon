@@ -1,7 +1,7 @@
 """Categoria de fornecedor — a fonte da verdade, em código.
 
 Mesmo arranjo de `status_exec.py`: o banco guarda o valor, o significado mora
-aqui. A coluna é `dim_fornecedor.categoria`.
+aqui. A coluna é `dim_fornecedor_catapult.categoria`.
 
 POR QUE ESTA COLUNA EXISTE
 
@@ -51,7 +51,7 @@ __all__ = ["CategoriaFornecedor", "CATEGORIAS_COTADAS", "eh_cotavel"]
 
 
 class CategoriaFornecedor(StrEnum):
-    """O que o fornecedor vende. Gravado em `dim_fornecedor.categoria`.
+    """O que o fornecedor vende. Gravado em `dim_fornecedor_catapult.categoria`.
 
     É um fato sobre o fornecedor, não uma chave de operação — `cotado` continua
     sendo o interruptor de "participa do ciclo desta semana". Misturar os dois

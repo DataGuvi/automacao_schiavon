@@ -76,9 +76,10 @@ from domain.service import processo_service as proc
 from domain.service import sistema_service
 from domain.service.conciliacao_service import (
     confirmar_fornecedor_para_aprender,
-    escolher_nome_catapult,
+    fetch_depara_fornecedor,
+    fetch_fornecedor_por_cod,
     fetch_fornecedores,
-    gravar_nome_catapult,
+    gravar_depara_fornecedor,
     montar_resolvedor_fornecedor,
     fetch_invoice_headers_aguardando_po,
     fetch_invoice_headers_for_reconciliation,
@@ -86,7 +87,6 @@ from domain.service.conciliacao_service import (
     fetch_invoice_items_by_headers,
     fetch_invoices_conferencia_manual_pendente,
     fetch_item_sinonimos,
-    fetch_supplier_aliases,
     ja_conciliada_erp,
     marcar_itens_po_fechado,
     save_reconciliation_header,
@@ -123,7 +123,7 @@ def reconcile_erp_flow(
         log.info("Conciliacao Invoice x Catapult (ERP) - %s a %s", date_from, date_to)
 
         sinonimos = fetch_item_sinonimos(conn)
-        aliases_invoice = fetch_supplier_aliases(conn, source="invoice")
+        aliases_invoice = fetch_depara_fornecedor(conn)
         resolver_fornecedor = montar_resolvedor_fornecedor(
             fetch_fornecedores(conn), aliases_invoice,
         )
@@ -470,29 +470,21 @@ def _categoria_do_fornecedor(
     return categoria
 
 
-def _aprender_nome_catapult(
-    conn, fornecedor: dict | None, supplier_name: str, achados: list[dict],
-) -> None:
-    """Grava o alias 'erp' do fornecedor quando o fornecedor resolvido E um
-    prefixo de PO da grade casam a >= 95% com o nome da invoice. Nunca levanta: aprender e secundario."""
-    if conn is None or fornecedor is None:
+def _aprender_depara(conn, supplier_name: str, resolvido: dict | None, name_po: str) -> None:
+    """PO achada pela Invoice Reference prova o fornecedor: se o prefixo do Name
+    nao e o do fornecedor resolvido, grava nome da invoice -> dono do prefixo.
+    Nunca levanta: aprender e secundario."""
+    prefixo = extrair_prefixo_nome_po(name_po) if name_po else ""
+    if conn is None or not supplier_name or not prefixo:
         return
-    if not confirmar_fornecedor_para_aprender(supplier_name, fornecedor):
+    if resolvido and (resolvido.get("nome_catapult") or "").lower() == prefixo.lower():
         return
     try:
-        prefixos = sorted({extrair_prefixo_nome_po(a["name"]) for a in achados})
-        nome = escolher_nome_catapult(supplier_name, prefixos)
-        if nome and nome != fornecedor.get("nome_catapult"):
-            if gravar_nome_catapult(conn, fornecedor["id"], nome):
-                log.info("fornecedor %s: alias erp=%s", fornecedor["id"], nome)
-                fornecedor["nome_catapult"] = nome
-            else:
-                log.warning(
-                    "fornecedor %s: alias erp %r ja e de outro fornecedor",
-                    fornecedor["id"], nome,
-                )
+        dono = fetch_fornecedor_por_cod(conn, prefixo)
+        if dono and gravar_depara_fornecedor(conn, supplier_name, dono["id"]):
+            log.info("de-para fornecedor: %r -> %s", supplier_name, dono["nome"])
     except DataAccessException:
-        log.exception("fornecedor %s: falha gravando alias erp", fornecedor.get("id"))
+        log.exception("falha gravando de-para do fornecedor %r", supplier_name)
 
 
 def _buscar_po(
@@ -540,28 +532,30 @@ def _buscar_po(
             if search_purchase_orders_by_invoice(page, invoice_number, mostrar_historico=True):
                 return JA_LANCADA
         escolha = _desempatar_por_itens(
-            page, achados, items, sinonimos, f"invoice {invoice_number!r}",
+            page, achados, items, sinonimos, f"invoice {invoice_number!r}", aceitar_unico=True,
         )
         if escolha is not None:
             indice, candidatos, achados_usados = escolha
+            _aprender_depara(
+                conn, supplier_name, resolver_fornecedor(supplier_name),
+                achados_usados[indice].get("name", ""),
+            )
             return _abrir_po_escolhido(page, header, achados_usados, indice, candidatos)
         if 0 < len(achados) <= _MAX_CANDIDATOS_DESEMPATE:
             open_worksheets(page, url)  # os POs abertos tiraram a tela da busca
         log.info("nota %s: sem PO pela Invoice Reference, buscando pelo nome", invoice_number)
 
-    # O nome lido da invoice frequentemente diverge do nome que o Catapult
-    # conhece (ele trunca/abrevia, ex. 'Freshpoint Central FL' -> 'Fresh
-    # Poin') — busca pelo alias 'erp' (`dim_fornecedor_alias`) do fornecedor
-    # resolvido (alias invoice ou fuzzy); sem cadastro, cai pro nome cru da
-    # invoice.
+    # O nome lido da invoice diverge do que o Catapult conhece: busca pelo
+    # Supplier ID (`cod_catapult`) do fornecedor resolvido (de-para ou fuzzy);
+    # sem cadastro, cai pro nome cru da invoice.
     fornecedor = resolver_fornecedor(supplier_name)
     termo_busca = (fornecedor or {}).get("nome_catapult") or supplier_name
+    alternativos = (supplier_name, *([fornecedor["nome"]] if fornecedor else []))
     achados = search_purchase_orders_by_supplier(
-        page, termo_busca, nomes_alternativos=(supplier_name,), mostrar_historico=False,
+        page, termo_busca, nomes_alternativos=alternativos, mostrar_historico=False,
     )
     if not achados:
         return None
-    _aprender_nome_catapult(conn, fornecedor, supplier_name, achados)
 
     escolha = _desempatar_por_itens(
         page, achados, items, sinonimos, f"{termo_busca!r} (fornecedor lido: {supplier_name!r})",
@@ -575,7 +569,7 @@ def _buscar_po(
 
 def _desempatar_por_itens(
     page, achados: list[dict], items: list[dict], sinonimos: dict, busca: str,
-    cortar_mais_recentes: bool = False,
+    cortar_mais_recentes: bool = False, aceitar_unico: bool = False,
 ) -> tuple[int, list[list[POLine]], list[dict]] | None:
     """Abre cada PO candidato, raspa os itens e escolhe o que casa com a nota.
 
@@ -596,6 +590,10 @@ def _desempatar_por_itens(
     desistir. `cortar_mais_recentes=False` (busca por Invoice Reference, sem
     ordenação): comportamento de sempre — candidatos demais é ambíguo
     demais, desiste.
+
+    `aceitar_unico=True` (só a busca por Invoice Reference, spec-po-unica-
+    invoice-reference): um PO só é aceito mesmo sem item casar — o número
+    da nota já prova que é dele, e a comparação acusa a divergência.
     """
     if not achados:
         return None
@@ -623,6 +621,9 @@ def _desempatar_por_itens(
         open_purchase_order(page, achado["href"])
         candidatos.append(to_po_lines(scrape_po_items(page)))
     indice = escolher_po_por_itens(items, candidatos, sinonimos)
+    if indice is None and aceitar_unico and len(candidatos) == 1:
+        log.info("PO unico para %s, aceito mesmo sem item casar", busca)
+        indice = 0
     if indice is None:
         log.warning(
             "%s PO(s) 'Ordered' para %s, nenhum casou com os itens desta nota - tratando como sem PO",
