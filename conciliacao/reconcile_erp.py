@@ -3,9 +3,8 @@
 Casa cada item da invoice com um item do PO só pelo valor total da linha
 (spec-conciliacao-so-por-valor; código e nome estão desligados em
 `commons/matcher.py::match_items_po`) e compara o total do par: bateu,
-conciliado; não bateu, `PRICE_MISMATCH_PO`. Item sem linha de mesmo valor
-também é `PRICE_MISMATCH_PO`; em dúvida entre várias linhas, `NO_PO_FOR_ITEM`
-(conferência manual). Ordered x Received é informativo (`QTY_MISMATCH_PO` só
+conciliado; não bateu, `PRICE_MISMATCH_PO`. Item sem par (nenhuma linha de
+mesmo valor, ou dúvida entre várias) é `NO_PO_FOR_ITEM`: conferência manual. Ordered x Received é informativo (`QTY_MISMATCH_PO` só
 junto de `PRICE_MISMATCH_PO`); `Ordered=0` com `Received>0` vira
 `PEDIDO_ZERADO` (spec-quantidade-informativa-pedido-zerado).
 
@@ -425,9 +424,8 @@ def reconcile_items_against_po(
                 row.update({"issue_codes": issues, "has_issue": True,
                             "needs_review": needs_review})
             else:
-                # spec-conciliacao-so-por-valor: em duvida vai a Conferencia Manual;
-                # sem linha de mesmo valor no PO e divergencia de valor.
-                issues.append(NO_PO_FOR_ITEM if match.ambiguous else PRICE_MISMATCH_PO)
+                # Sem par por valor vai para a Conferencia Manual (spec-conciliacao-so-por-valor R3).
+                issues.append(NO_PO_FOR_ITEM)
                 row.update({"issue_codes": issues, "has_issue": True,
                             "needs_review": needs_review})
             linhas.append(row)
