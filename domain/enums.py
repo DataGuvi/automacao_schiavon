@@ -135,6 +135,7 @@ class StatusExecucao(IntEnum):
     PO_NAO_ENCONTRADA = 13, "PO não encontrada no Catapult; pesquisar de novo na próxima execução."
     ENCERRADO_SEM_ARQUIVO = 21, "Pasta da semana encontrada, mas vazia."
     REVISAR_INSUMO = 22, "Anotação manual pode ser insumo, mas não dá para confirmar; revisar a invoice."
+    CONFERENCIA_MANUAL = 23, "Leitura abaixo do piso de confiança; conferir manualmente."
     ERRO_LOGIN = 50, "Falha de autenticação na origem."
     ERRO_NAVEGACAO = 51, "Pasta ou arquivo não encontrado na origem."
     ERRO_LEITURA = 52, "A IA não conseguiu extrair o documento."

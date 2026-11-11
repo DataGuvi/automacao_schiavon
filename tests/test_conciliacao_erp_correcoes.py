@@ -247,19 +247,39 @@ def test_linha_ativa_por_nome_ganha_da_zerada():
 
 
 # spec-categoria-insumo-carne
-def _processar(monkeypatch, categoria=None, insumo_na_nota=False, aliases=None, conn=object(), items=None, nota_geral=None):
-    chamadas = {"busca": 0, "skip": 0, "incerto": 0}
+def _processar(monkeypatch, categoria=None, insumo_na_nota=False, aliases=None, conn=object(), items=None, nota_geral=None,
+               confianca=None):
+    chamadas = {"busca": 0, "skip": 0, "incerto": 0, "status": None}
+    monkeypatch.setattr(flow.proc, "falhar_etapa", lambda c, idp, etapa, status, msg: chamadas.__setitem__("status", status))
     monkeypatch.setattr(flow, "_gravar_insumo_incerto", lambda *a: chamadas.__setitem__("incerto", chamadas["incerto"] + 1))
     monkeypatch.setattr(flow, "_buscar_po", lambda *a, **k: chamadas.__setitem__("busca", chamadas["busca"] + 1) or [])
     monkeypatch.setattr(flow, "_gravar_skip_insumo", lambda *a: chamadas.__setitem__("skip", chamadas["skip"] + 1))
     monkeypatch.setattr(flow, "_gravar_resultado", lambda *a, **k: None)
     forn = {"id": 7, "nome": "IDO Imports", "categoria": categoria}
     header = {"id": 1, "id_processo": 9, "invoice_number": "N1", "supplier_name": "IDO Imports",
-              "general_handwritten_notes": "Insumo" if insumo_na_nota else nota_geral}
+              "general_handwritten_notes": "Insumo" if insumo_na_nota else nota_geral,
+              "reading_confidence": confianca}
     items = items or [_item(1, "Item", "1", "5.00", "5.00", item_code="X1")]
     totais = {"aguardando_po": 0, "sem_po": 0}
     flow._processar_invoice(None, "u", conn, header, items, {}, lambda n: forn, aliases or {}, None, totais)
     return chamadas, forn
+
+
+# spec-confianca-baixa-conferencia-manual
+def test_confianca_baixa_vai_a_conferencia_manual_sem_catapult(monkeypatch):
+    chamadas, _ = _processar(monkeypatch, categoria="insumo", confianca=65)
+    assert chamadas["status"] == StatusExecucao.CONFERENCIA_MANUAL
+    assert chamadas["busca"] == 0 and chamadas["skip"] == 0
+
+
+@pytest.mark.parametrize("confianca", [70, None])
+def test_confianca_no_piso_ou_ausente_segue_o_fluxo(monkeypatch, confianca):
+    chamadas, _ = _processar(monkeypatch, confianca=confianca)
+    assert chamadas["busca"] == 1 and chamadas["status"] is None
+
+
+def test_conferencia_manual_nao_volta_sozinha():
+    assert int(StatusExecucao.CONFERENCIA_MANUAL) in svc._NAO_RECONCILIA
 
 
 def test_fornecedor_insumo_resolvido_por_aproximacao_pula_sem_buscar_po(monkeypatch):

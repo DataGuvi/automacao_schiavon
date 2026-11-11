@@ -61,6 +61,7 @@ from conciliacao.reconcile_erp import (
 from conciliacao.relatorio_divergencia import NOME_LOJA, gerar_relatorio_divergencia_erp
 from conciliacao.relatorio_sucesso import gerar_relatorio_sucesso_erp
 from domain.service import notificacao_service
+from domain.service.invoice_service import CONFIANCA_MINIMA_PAINEL
 from domain.service.insumo_service import (
     INSUMO_INCERTO,
     INSUMO_NAO,
@@ -157,7 +158,7 @@ def reconcile_erp_flow(
             "headers_total": 0, "headers_issue": 0,
             "items_total": 0, "items_issue": 0,
             "sem_po": 0, "aguardando_po": 0, "po_fechado_manual": 0, "ja_lancada": 0,
-            "lojas_puladas": 0, "puladas_insumo": 0, "insumo_incerto": 0,
+            "lojas_puladas": 0, "puladas_insumo": 0, "insumo_incerto": 0, "baixa_confianca": 0,
             "relatorios_gerados": 0, "relatorios_erro": 0, "notas_erro": 0,
             "sucessos_gerados": 0, "sucessos_erro": 0,
             "relatorios_cliente": [],
@@ -189,6 +190,7 @@ def reconcile_erp_flow(
         log.info("Invoice ja lancada : %s", totais['ja_lancada'])
         log.info("Nao enviadas (insumo) : %s", totais['puladas_insumo'])
         log.info("Insumo incerto (revisar) : %s", totais['insumo_incerto'])
+        log.info("Baixa confianca (conf. manual) : %s", totais['baixa_confianca'])
         log.info(
             "Relatorios divergencia : %s (%s falha(s))",
             totais['relatorios_gerados'], totais['relatorios_erro'],
@@ -355,6 +357,18 @@ def _processar_invoice(
     resolver_fornecedor, aliases_invoice: dict[str, dict],
     sheet_id: str | None, totais: dict,
 ) -> None:
+    confianca = header.get("reading_confidence")
+    if confianca is not None and float(confianca) < CONFIANCA_MINIMA_PAINEL:
+        # Fluxograma: leitura fraca vai a Conferencia Manual e para (spec-confianca-baixa-conferencia-manual).
+        proc.falhar_etapa(
+            conn, header["id_processo"], Etapa.CONCILIAR_ERP, Status.CONFERENCIA_MANUAL,
+            "Confianca de leitura %s%%" % confianca,
+        )
+        totais["baixa_confianca"] = totais.get("baixa_confianca", 0) + 1
+        log.info("nota %s: confianca %s - conferencia manual, nao vai ao Catapult",
+                 header.get("invoice_number"), confianca)
+        return
+
     if not items:
         # Nota sem linha de mercadoria: nada a comparar. Encerra o caso, senão
         # ela volta a cada execucao e prende a loja na semana anterior.

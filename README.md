@@ -94,7 +94,9 @@ flowchart TD
 
     F2 -.-> COT[Cotacao semanal<br/>desativada]
 
-    F3 --> N0{Nota sem item<br/>de mercadoria?}
+    F3 --> NC{Confianca da<br/>leitura < 70?}
+    NC -->|sim| NCA[Conferencia Manual<br/>CONFERENCIA_MANUAL 23]
+    NC -->|nao| N0{Nota sem item<br/>de mercadoria?}
     N0 -->|sim| N0A[Encerra sem conciliar<br/>ENCERRADO_SEM_ARQUIVO]
     N0 -->|nao| N1{Fornecedor de<br/>categoria insumo?}
     N1 -->|sim| NSKIP[Pula a nota<br/>NAO_COMPARADO, sem .docx]
@@ -264,6 +266,7 @@ técnico (reprocessável).
 | 12 | `AGUARDANDO_RESPOSTA` | Parado à espera do fornecedor |
 | 13 | `PO_NAO_ENCONTRADA` | PO não encontrada no Catapult (nem `Ordered`, nem histórico); pesquisada de novo a cada execução (`processo.tentativas_po`, até 3 novas execuções) |
 | 21 | `ENCERRADO_SEM_ARQUIVO` | Pasta da semana existe, mas vazia |
+| 23 | `CONFERENCIA_MANUAL` | Leitura com confiança < 70; não vai ao Catapult, fica na planilha Conferência Manual |
 | 50 | `ERRO_LOGIN` | Falha de autenticação na origem |
 | 51 | `ERRO_NAVEGACAO` | Pasta/arquivo não encontrado na origem |
 | 52 | `ERRO_LEITURA` | A IA não conseguiu extrair o documento |

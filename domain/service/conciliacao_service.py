@@ -339,6 +339,7 @@ _NAO_RECONCILIA = (
     int(StatusExecucao.INVOICE_JA_LANCADA),
     int(StatusExecucao.ENCERRADO_SEM_ARQUIVO),
     int(StatusExecucao.REVISAR_INSUMO),
+    int(StatusExecucao.CONFERENCIA_MANUAL),
     int(StatusExecucao.PO_NAO_ENCONTRADA)
 )
 
