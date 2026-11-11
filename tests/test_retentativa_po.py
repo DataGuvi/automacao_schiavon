@@ -132,7 +132,7 @@ def _preparar_buscas(monkeypatch, por_invoice, por_nome, por_historico=()):
     monkeypatch.setattr(flow, "to_po_lines", lambda *a: [po])
     monkeypatch.setattr(flow, "escolher_po_por_itens", lambda *a: 0)
     monkeypatch.setattr(flow, "fill_receiving_invoice_info", lambda *a: None)
-    monkeypatch.setattr(flow, "_aprender_nome_catapult", lambda *a, **k: None)
+    monkeypatch.setattr(flow, "_aprender_depara", lambda *a, **k: None)
     return chamadas, po
 
 
@@ -185,12 +185,39 @@ def test_ja_lancada_grava_status_final_sem_conciliar(monkeypatch):
     assert gravou == [StatusExecucao.INVOICE_JA_LANCADA] and totais["ja_lancada"] == 1
 
 
-def test_invoice_sem_pos_que_casem_pelos_itens_cai_no_nome(monkeypatch):
-    chamadas, po = _preparar_buscas(monkeypatch, [{"href": "a"}], [{"href": "h"}])
+# spec-fornecedor-po-ja-lancado
+def test_fresh_point_vai_direto_para_ja_lancada(monkeypatch):
+    gravou = []
+    monkeypatch.setattr(flow, "_buscar_po", lambda *a, **k: pytest.fail("nao deve ir ao Catapult"))
+    monkeypatch.setattr(flow.proc, "falhar_etapa", lambda *a: gravou.append(a[3]))
+    totais = {"ja_lancada": 0}
+    header = {"id": 1, "id_processo": 9, "invoice_number": "N1", "supplier_name": "Freshpoint Central FL"}
+    items = [_item(1, "Tomato", "1", "20", "20", item_code="X1")]
+    fornecedor = {"id": 7, "nome": "Fresh Point", "nome_catapult": "Fresh Poin"}
+    flow._processar_invoice(None, "u", None, header, items, {}, lambda n: fornecedor, {}, None, totais)
+    assert gravou == [StatusExecucao.INVOICE_JA_LANCADA] and totais["ja_lancada"] == 1
+
+
+def test_invoice_com_varias_pos_sem_item_casando_cai_no_nome(monkeypatch):
+    chamadas, po = _preparar_buscas(monkeypatch, [{"href": "a"}, {"href": "b"}], [{"href": "h"}])
     respostas = iter([None, 0])
     monkeypatch.setattr(flow, "escolher_po_por_itens", lambda *a: next(respostas))
     assert flow._buscar_po(None, "u", HEADER, [], {}, lambda n: None) == [po]
     assert chamadas == ["invoice", "nome"]
+
+
+# spec-po-unica-invoice-reference
+def test_invoice_com_po_unica_e_aceita_sem_item_casar(monkeypatch):
+    chamadas, po = _preparar_buscas(monkeypatch, [{"href": "a"}], [{"href": "h"}])
+    monkeypatch.setattr(flow, "escolher_po_por_itens", lambda *a: None)
+    assert flow._buscar_po(None, "u", HEADER, [], {}, lambda n: None) == [po]
+    assert chamadas == ["invoice"]
+
+
+def test_busca_por_nome_com_po_unica_sem_item_casar_fica_sem_po(monkeypatch):
+    _preparar_buscas(monkeypatch, [], [{"href": "h"}])
+    monkeypatch.setattr(flow, "escolher_po_por_itens", lambda *a: None)
+    assert flow._buscar_po(None, "u", HEADER, [], {}, lambda n: None) == []
 
 
 def test_nenhuma_po_em_nenhuma_busca_devolve_none(monkeypatch):

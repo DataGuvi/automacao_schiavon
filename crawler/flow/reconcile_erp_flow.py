@@ -106,6 +106,8 @@ _MAX_REABERTURAS_SESSAO = 2
 # `_buscar_po` devolve isto quando a invoice so aparece com o historico marcado
 # (PO Committed): status final, nada a conciliar (spec-invoice-ja-lancada).
 JA_LANCADA = object()
+# cod_catapult cujas notas ja chegam lancadas: status 2 sem ir ao Catapult (spec-fornecedor-po-ja-lancado).
+_FORNECEDORES_PO_JA_LANCADO = {"fresh poin"}
 
 
 def reconcile_erp_flow(
@@ -381,6 +383,9 @@ def _processar_invoice(
 
     supplier_name = header.get("supplier_name")
     fornecedor = resolver_fornecedor(supplier_name or "")
+    if ((fornecedor or {}).get("nome_catapult") or "").strip().lower() in _FORNECEDORES_PO_JA_LANCADO:
+        _gravar_ja_lancada(conn, header, totais)
+        return
     categoria_fornecedor = _categoria_do_fornecedor(supplier_name, aliases_invoice, fornecedor)
 
     if categoria_fornecedor == CategoriaFornecedor.INSUMO:
@@ -407,12 +412,7 @@ def _processar_invoice(
     po_lines = _buscar_po(page, url, header, items, sinonimos, resolver_fornecedor, conn=conn)
 
     if po_lines is JA_LANCADA:
-        proc.falhar_etapa(
-            conn, header["id_processo"], Etapa.CONCILIAR_ERP, Status.INVOICE_JA_LANCADA,
-            "Invoice ja lancada no Catapult (PO Committed).",
-        )
-        totais["ja_lancada"] += 1
-        log.info("nota %s: invoice ja lancada no Catapult", header.get("invoice_number"))
+        _gravar_ja_lancada(conn, header, totais)
         return
 
     # `None` (busca não achou PO nenhum pro fornecedor) e `[]` (achou
@@ -451,6 +451,15 @@ def _processar_invoice(
                 categoria_fornecedor=categoria_fornecedor, aplicar_ajustes=False,
             )
     _gravar_resultado(conn, header, resultado, sheet_id, totais)
+
+
+def _gravar_ja_lancada(conn, header: dict, totais: dict) -> None:
+    proc.falhar_etapa(
+        conn, header["id_processo"], Etapa.CONCILIAR_ERP, Status.INVOICE_JA_LANCADA,
+        "Invoice ja lancada no Catapult (PO Committed).",
+    )
+    totais["ja_lancada"] += 1
+    log.info("nota %s: invoice ja lancada no Catapult", header.get("invoice_number"))
 
 
 def _finalizar_po_fechado_manual(conn, header: dict, totais: dict) -> bool:
