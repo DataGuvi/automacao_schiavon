@@ -106,8 +106,6 @@ _MAX_REABERTURAS_SESSAO = 2
 # `_buscar_po` devolve isto quando a invoice so aparece com o historico marcado
 # (PO Committed): status final, nada a conciliar (spec-invoice-ja-lancada).
 JA_LANCADA = object()
-# cod_catapult cujas notas ja chegam lancadas: status 2 sem ir ao Catapult (spec-fornecedor-po-ja-lancado).
-_FORNECEDORES_PO_JA_LANCADO = {"fresh poin"}
 
 
 def reconcile_erp_flow(
@@ -383,9 +381,6 @@ def _processar_invoice(
 
     supplier_name = header.get("supplier_name")
     fornecedor = resolver_fornecedor(supplier_name or "")
-    if ((fornecedor or {}).get("nome_catapult") or "").strip().lower() in _FORNECEDORES_PO_JA_LANCADO:
-        _gravar_ja_lancada(conn, header, totais)
-        return
     categoria_fornecedor = _categoria_do_fornecedor(supplier_name, aliases_invoice, fornecedor)
 
     if categoria_fornecedor == CategoriaFornecedor.INSUMO:

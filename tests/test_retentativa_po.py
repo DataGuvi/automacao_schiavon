@@ -185,19 +185,6 @@ def test_ja_lancada_grava_status_final_sem_conciliar(monkeypatch):
     assert gravou == [StatusExecucao.INVOICE_JA_LANCADA] and totais["ja_lancada"] == 1
 
 
-# spec-fornecedor-po-ja-lancado
-def test_fresh_point_vai_direto_para_ja_lancada(monkeypatch):
-    gravou = []
-    monkeypatch.setattr(flow, "_buscar_po", lambda *a, **k: pytest.fail("nao deve ir ao Catapult"))
-    monkeypatch.setattr(flow.proc, "falhar_etapa", lambda *a: gravou.append(a[3]))
-    totais = {"ja_lancada": 0}
-    header = {"id": 1, "id_processo": 9, "invoice_number": "N1", "supplier_name": "Freshpoint Central FL"}
-    items = [_item(1, "Tomato", "1", "20", "20", item_code="X1")]
-    fornecedor = {"id": 7, "nome": "Fresh Point", "nome_catapult": "Fresh Poin"}
-    flow._processar_invoice(None, "u", None, header, items, {}, lambda n: fornecedor, {}, None, totais)
-    assert gravou == [StatusExecucao.INVOICE_JA_LANCADA] and totais["ja_lancada"] == 1
-
-
 def test_invoice_com_varias_pos_sem_item_casando_cai_no_nome(monkeypatch):
     chamadas, po = _preparar_buscas(monkeypatch, [{"href": "a"}, {"href": "b"}], [{"href": "h"}])
     respostas = iter([None, 0])
