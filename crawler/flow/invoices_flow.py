@@ -146,6 +146,7 @@ def _coletar(config: Config) -> None:
                 "final_path": final_path,
                 "entries":    r["entries"],
                 "downloaded": r.get("downloaded", []),
+                "referencia": referencia,
                 "id_coleta":  id_coleta,
             })
 
@@ -173,7 +174,7 @@ def _coletar(config: Config) -> None:
         output_file = ROOT / "resultado.json"
         output_file.write_text(
             json.dumps(
-                [{k: v for k, v in r.items() if k != "id_coleta"} for r in all_output],
+                [{k: v for k, v in r.items() if k not in ("id_coleta", "referencia")} for r in all_output],
                 indent=2,
                 ensure_ascii=False,
             ),

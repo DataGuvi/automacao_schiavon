@@ -187,6 +187,7 @@ def save_invoice(
     file_path: Path,
     data: "InvoiceData",
     custo: float | None = None,
+    semana_referencia: date | None = None,
 ) -> tuple[int, int]:
     """Persiste a nota e suas linhas. Retorna (id_da_nota, linhas_inseridas).
 
@@ -216,8 +217,8 @@ def save_invoice(
                 dt_vencimento, moeda, subtotal, imposto, total, arquivo,
                 confianca, modelo_ia, custo_usd, observacao_ia,
                 anotacao_manual_geral,
-                soma_itens, fecha, revisar, motivo_revisao
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                soma_itens, fecha, revisar, motivo_revisao, semana_referencia
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (id_processo) DO UPDATE SET
                 nome_fornecedor        = EXCLUDED.nome_fornecedor,
                 numero_invoice          = EXCLUDED.numero_invoice,
@@ -245,7 +246,7 @@ def save_invoice(
                 custo if custo is not None else getattr(data, "cost_read", None),
                 data.reading_notes,
                 data.general_handwritten_notes,
-                soma_itens, fecha, revisar, motivo_revisao,
+                soma_itens, fecha, revisar, motivo_revisao, semana_referencia,
             ),
         )
         id_invoice = cur.fetchone()[0]
@@ -365,3 +366,27 @@ def config_from_filename(filename: str) -> tuple[int, str] | None:
         if filename.lower().startswith(prefixo + "_"):
             return info
     return None
+
+
+def fetch_semanas_invoice(conn) -> list[dict]:
+    """id, loja, arquivo e semana gravada de toda nota (spec-painel-semana-pasta R5)."""
+    sql = f"SELECT id, id_loja, arquivo, semana_referencia FROM {SCHEMA}.fat_invoice ORDER BY id"
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql)
+            return [dict(r) for r in cur.fetchall()]
+    except psycopg2.Error as exc:
+        conn.rollback()
+        raise DataAccessException("falha ao ler a semana das invoices") from exc
+
+
+def atualizar_semana_referencia(conn, semanas: dict[int, date]) -> None:
+    """Grava a semana da pasta do SharePoint por id de nota, numa transacao so."""
+    sql = f"UPDATE {SCHEMA}.fat_invoice SET semana_referencia = %s WHERE id = %s"
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(sql, [(semana, id_invoice) for id_invoice, semana in semanas.items()])
+        conn.commit()
+    except psycopg2.Error as exc:
+        conn.rollback()
+        raise DataAccessException("falha ao gravar a semana das invoices") from exc

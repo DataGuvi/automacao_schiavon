@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import base64
 import json
 import re
@@ -308,6 +310,7 @@ class BatchItem(NamedTuple):
     file_path: Path
     config_id: int          # id da loja em dim_loja
     config_name: str
+    semana_referencia: date | None = None  # segunda-feira da pasta do SharePoint
 
 
 def _build_content_block(file_path: Path) -> dict:

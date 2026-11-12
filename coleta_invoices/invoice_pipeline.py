@@ -6,6 +6,7 @@ from datetime import date
 from pathlib import Path
 
 from commons.logging_config import get_logger
+from commons.sharepoint import semanas_da_coleta
 from domain.service.invoice_service import config_from_filename, save_invoice
 from commons.vision import (
     BatchItem,
@@ -43,6 +44,7 @@ def collect_items(conn, results: list[dict], download_dir: Path) -> list[BatchIt
                 file_path=fp,
                 config_id=record["id"],
                 config_name=record["name"],
+                semana_referencia=r.get("referencia"),
             ))
 
     extensions = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -56,10 +58,12 @@ def collect_items(conn, results: list[dict], download_dir: Path) -> list[BatchIt
         config_id, config_name = cfg
         # Sem dependencia de execution_log: o proprio arquivo vira um caso.
         log.info("+ Orfao incluido: %s", fp.name)
+        # Orfao perdeu a pasta de origem: assume a semana anterior, a que a coleta mais le.
         items.append(BatchItem(
             file_path=fp,
             config_id=config_id,
             config_name=config_name,
+            semana_referencia=semanas_da_coleta(date.today())[0],
         ))
 
     return items
@@ -137,6 +141,7 @@ def _persist_and_move(conn, item: BatchItem, invoice_data, read_dir: Path) -> fl
         file_path=item.file_path,
         data=invoice_data,
         custo=invoice_data.cost_read,
+        semana_referencia=item.semana_referencia,
     )
     log.info("header_id=%s itens=%s custo=$%.4f", header_id, n_items, invoice_data.cost_read)
     day_dir = read_dir / f"invoice_{date.today().strftime('%d-%m-%Y')}"
