@@ -1038,6 +1038,23 @@ def fetch_chaves_invoices_desde(conn, desde: date) -> set[tuple[str, str, str]]:
     }
 
 
+def fetch_invoices_insumo(conn) -> list[dict]:
+    """Notas de insumo (veredito NAO_COMPARADO, mesmo filtro do card "Invoices de insumo") lidas
+    desde o inicio da operacao, para a aba `Conferência Insumo` (spec-conferencia-insumo)."""
+    sql = f"""
+        SELECT dl.nome AS loja, fi.nome_fornecedor AS fornecedor, fi.numero_invoice AS numero_invoice
+          FROM {SCHEMA}.fat_invoice fi
+          JOIN {SCHEMA}.fat_conciliacao fc ON fc.id_invoice = fi.id AND fc.comparacao = 'erp'
+          JOIN {SCHEMA}.dim_loja dl ON dl.id = fi.id_loja
+         WHERE fc.cod_status = %s
+           AND (fi.confianca IS NULL OR fi.confianca >= 70)
+           AND fi.criado_em >= %s
+         ORDER BY fi.criado_em DESC
+    """
+    return _ler(conn, sql, (int(Veredito.NAO_COMPARADO), INICIO_OPERACAO),
+                "invoices para conferencia de insumo")
+
+
 def fetch_invoices_conferencia_manual_pendente(conn) -> list[dict]:
     """Invoices que ainda precisam de conferência manual: confiança de leitura
     baixa, PO não encontrado no Catapult, ou produto não identificado/nota não

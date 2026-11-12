@@ -50,7 +50,7 @@ from commons.exception import BusinessException, DataAccessException, Integracao
 from commons.logging_config import get_logger
 from commons.matcher import POLine, norm_supplier
 from commons.sheets import SheetsError
-from conciliacao.conferencia_manual import ItemConferencia
+from conciliacao.conferencia_manual import ItemConferencia, sincronizar_insumo
 from conciliacao.conferencia_manual import sincronizar_pendentes as sincronizar_conferencia_manual
 from conciliacao.pendentes_sinonimo import extrair_pendentes, sincronizar_pendentes
 from conciliacao.reconcile_erp import (
@@ -87,6 +87,7 @@ from domain.service.conciliacao_service import (
     fetch_invoice_headers_reprocesso,
     fetch_invoice_items_by_headers,
     fetch_invoices_conferencia_manual_pendente,
+    fetch_invoices_insumo,
     fetch_item_sinonimos,
     ja_conciliada_erp,
     marcar_itens_po_fechado,
@@ -872,6 +873,11 @@ def _sincronizar_conferencia_manual_pendentes(conn, config: Config, totais: dict
         n = sincronizar_conferencia_manual(sheet_id, novas)
         totais["sheets_tentativas"] = totais.get("sheets_tentativas", 0) + 1
         log.info("Conferencia Manual: %s pendente(s) no banco, %s nova(s) na planilha", len(novas), n)
+        insumo = [
+            ItemConferencia(p["loja"] or "", p["fornecedor"], p["numero_invoice"], "")
+            for p in fetch_invoices_insumo(conn) if p.get("fornecedor") and p.get("numero_invoice")
+        ]
+        log.info("Conferencia Insumo: %s nova(s) na planilha", sincronizar_insumo(sheet_id, insumo))
     except (SheetsError, DataAccessException) as exc:
         totais["sheets_tentativas"] = totais.get("sheets_tentativas", 0) + 1
         totais["sheets_erro"] = totais.get("sheets_erro", 0) + 1

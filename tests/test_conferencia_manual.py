@@ -325,3 +325,41 @@ def test_sync_conferencia_roda_mesmo_sem_nota_a_conciliar(monkeypatch):
     config = SimpleNamespace(banco=None)
     assert flow.reconcile_erp_flow(config) == {"headers_total": 0}
     assert chamadas == [1]
+
+
+# --- sincronizar_insumo (spec-conferencia-insumo) ------------------------------
+
+def test_insumo_aba_vazia_ganha_cabecalho_e_sem_divergencia(monkeypatch):
+    fake = _FakeSheet()
+    fake.existentes = []
+    _instalar_fake(monkeypatch, fake)
+    novas = [ItemConferencia("Windermere", "Sysco", "777", "")]
+    assert mod.sincronizar_insumo("sheet-1", novas) == 1
+    assert fake.gravados == [["Loja", "Fornecedor", "Nº Invoice", "Conferido"],
+                             ["Windermere", "Sysco", "777", False]]
+    assert fake.checkboxes == [("Conferência Insumo", 3, 2)]
+
+
+def test_insumo_ja_na_aba_nao_duplica(monkeypatch):
+    fake = _FakeSheet(existentes=[["Loja", "Fornecedor", "Nº Invoice", "Conferido"],
+                                  ["Windermere", "Sysco", "777", False]])
+    _instalar_fake(monkeypatch, fake)
+    assert mod.sincronizar_insumo("sheet-1", [ItemConferencia("windermere", "SYSCO", "777", "")]) == 0
+    assert fake.gravados == []
+
+
+def test_fetch_invoices_insumo_filtra_veredito_21_e_inicio_operacao():
+    from domain.service.conciliacao_service import INICIO_OPERACAO, fetch_invoices_insumo
+
+    recebido = []
+
+    class _Cur(_SelectCursor):
+        def execute(self, sql, params=None):
+            recebido.append(params)
+
+    class _Conn(_SelectConn):
+        def cursor(self, **_kw):
+            return _Cur(self.rows)
+
+    fetch_invoices_insumo(_Conn([]))
+    assert recebido == [(21, INICIO_OPERACAO)]

@@ -37,6 +37,12 @@ _ABA = "Conferência Manual"
 _RANGE = "'Conferência Manual'!A:E"
 _COLUNA_CONFERIDO = 4   # E: "Conferido"
 
+# Notas em REVISAR_INSUMO (spec-conferencia-insumo): mesmas colunas, sem Divergencia.
+_ABA_INSUMO = "Conferência Insumo"
+_RANGE_INSUMO = "'Conferência Insumo'!A:D"
+_COLUNA_CONFERIDO_INSUMO = 3   # D
+_CABECALHO_INSUMO = ["Loja", "Fornecedor", "Nº Invoice", "Conferido"]
+
 
 class ItemConferencia(NamedTuple):
     """Uma linha pronta para a aba `Conferência Manual`."""
@@ -78,7 +84,8 @@ def invoices_conferidas(sheet_id: str) -> set[tuple[str, str, str]]:
     return conferidas
 
 
-def _checkbox_sem_falhar(sheet_id: str, total_linhas: int) -> None:
+def _checkbox_sem_falhar(sheet_id: str, total_linhas: int, aba: str = _ABA,
+                         coluna: int = _COLUNA_CONFERIDO) -> None:
     """Checkbox é secundário: as linhas já foram gravadas, falha só loga.
 
     `total_linhas` limita a validação às linhas que existem de fato — faixa
@@ -86,9 +93,36 @@ def _checkbox_sem_falhar(sheet_id: str, total_linhas: int) -> None:
     (ver `commons.sheets.garantir_checkbox`).
     """
     try:
-        garantir_checkbox(sheet_id, _ABA, _COLUNA_CONFERIDO, total_linhas)
+        garantir_checkbox(sheet_id, aba, coluna, total_linhas)
     except SheetsError:
-        log.exception("checkbox da Conferencia Manual nao aplicado")
+        log.exception("checkbox da aba %s nao aplicado", aba)
+
+
+def sincronizar_insumo(sheet_id: str | None, novas: list[ItemConferencia]) -> int:
+    """Igual a `sincronizar_pendentes`, na aba `Conferência Insumo` (sem Divergência,
+    spec-conferencia-insumo). Aba vazia ganha o cabeçalho."""
+    if not sheet_id or not novas:
+        return 0
+    existentes = read_values(sheet_id, _RANGE_INSUMO)
+    unicas = _novas_unicas(existentes, novas)
+    if not unicas:
+        return 0
+    linhas = [] if existentes else [_CABECALHO_INSUMO]
+    linhas += [[i.loja, i.fornecedor, i.numero_invoice, False] for i in unicas]
+    append_values(sheet_id, _RANGE_INSUMO, linhas)
+    _checkbox_sem_falhar(sheet_id, len(existentes) + len(linhas), _ABA_INSUMO, _COLUNA_CONFERIDO_INSUMO)
+    return len(unicas)
+
+
+def _novas_unicas(existentes: list[list], novas: list[ItemConferencia]) -> list[ItemConferencia]:
+    """`novas` sem as que já estão na aba nem repetidas no próprio lote."""
+    vistos = {_chave(row[0], row[1], row[2]) for row in existentes[1:] if len(row) >= 3}
+    unicas: dict[tuple[str, str, str], ItemConferencia] = {}
+    for item in novas:
+        chave = _chave(item.loja, item.fornecedor, item.numero_invoice)
+        if chave not in vistos:
+            unicas.setdefault(chave, item)
+    return list(unicas.values())
 
 
 def sincronizar_pendentes(sheet_id: str | None, novas: list[ItemConferencia]) -> int:
@@ -104,30 +138,14 @@ def sincronizar_pendentes(sheet_id: str | None, novas: list[ItemConferencia]) ->
         return 0
 
     existentes = read_values(sheet_id, _RANGE)
-    ja_vistos = {
-        _chave(row[0], row[1], row[2])
-        for row in existentes[1:]  # pula cabeçalho
-        if len(row) >= 3
-    }
-
-    a_gravar = [
-        item for item in novas
-        if _chave(item.loja, item.fornecedor, item.numero_invoice) not in ja_vistos
-    ]
-    if not a_gravar:
+    unicas = _novas_unicas(existentes, novas)
+    if not unicas:
         return 0
-
-    # Dentro do próprio lote também pode haver repetição — dedupe local antes
-    # de gravar (mesma situação de pendentes_sinonimo.py).
-    unicas: dict[tuple[str, str, str], ItemConferencia] = {}
-    for item in a_gravar:
-        chave = _chave(item.loja, item.fornecedor, item.numero_invoice)
-        unicas.setdefault(chave, item)
 
     append_values(
         sheet_id, _RANGE,
         [[item.loja, item.fornecedor, item.numero_invoice, item.motivo, False]
-         for item in unicas.values()],
+         for item in unicas],
     )
     _checkbox_sem_falhar(sheet_id, len(existentes) + len(unicas))
     return len(unicas)
