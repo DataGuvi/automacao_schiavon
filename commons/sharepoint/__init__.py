@@ -215,7 +215,7 @@ def get_folder_contents(context, site_url: str, folder_path: str, base: str) -> 
     api_url = (
         f"{site_url}/_api/web"
         f"/GetFolderByServerRelativePath(decodedurl=@p)"
-        f"?@p='{_odata_escape(folder_path)}'"
+        f"?@p='{urlquote(_odata_escape(folder_path))}'"
         f"&$expand=Folders,Files"
         f"&$select="
         f"Folders/Name,Folders/ServerRelativeUrl,Folders/ItemCount,"
@@ -384,7 +384,7 @@ def download_files(
         download_url = (
             f"{site_url}/_api/web"
             f"/GetFileByServerRelativePath(decodedurl=@p)/$value"
-            f"?@p='{_odata_escape(entry['server_relative_url'])}'"
+            f"?@p='{urlquote(_odata_escape(entry['server_relative_url']))}'"
         )
 
         try:
@@ -756,7 +756,7 @@ def create_file_sharing_link(
         f"{site_url}/_api/web"
         f"/GetFileByServerRelativePath(decodedurl=@p)"
         f"/ListItemAllFields/ShareLink"
-        f"?@p='{_odata_escape(server_relative_url)}'"
+        f"?@p='{urlquote(_odata_escape(server_relative_url))}'"
     )
     body = {
         "request": {
@@ -815,7 +815,7 @@ def ensure_folder_exists(context, site_url: str, folder_path: str) -> None:
         check_url = (
             f"{site_url}/_api/web"
             f"/GetFolderByServerRelativePath(decodedurl=@p)"
-            f"?@p='{_odata_escape(partial)}'"
+            f"?@p='{urlquote(_odata_escape(partial))}'"
         )
         resp = context.request.get(check_url, headers={"Accept": "application/json;odata=verbose"})
         if resp.ok:
@@ -875,7 +875,7 @@ def upload_file_to_sharepoint(
         f"{site_url}/_api/web"
         f"/GetFolderByServerRelativePath(decodedurl=@p)"
         f"/Files/add(url=@f,overwrite={ow})"
-        f"?@p='{_odata_escape(folder_path)}'"
+        f"?@p='{urlquote(_odata_escape(folder_path))}'"
         f"&@f='{urlquote(_odata_escape(file_name))}'"
     )
 
@@ -933,7 +933,7 @@ def get_file_sharing_url(context, site_url: str, server_relative_url: str) -> st
     api_url = (
         f"{site_url}/_api/web"
         f"/GetFileByServerRelativePath(decodedurl=@p)"
-        f"?@p='{_odata_escape(server_relative_url)}'"
+        f"?@p='{urlquote(_odata_escape(server_relative_url))}'"
         f"&$select=LinkingUri"
     )
     try:
@@ -953,7 +953,7 @@ def download_single_file(context, site_url: str, server_relative_url: str, dest_
     download_url = (
         f"{site_url}/_api/web"
         f"/GetFileByServerRelativePath(decodedurl=@p)/$value"
-        f"?@p='{_odata_escape(server_relative_url)}'"
+        f"?@p='{urlquote(_odata_escape(server_relative_url))}'"
     )
     resp = context.request.get(download_url)
     if not resp.ok:
@@ -973,7 +973,7 @@ def get_file_metadata(context, site_url: str, server_relative_url: str) -> dict:
     api_url = (
         f"{site_url}/_api/web"
         f"/GetFileByServerRelativePath(decodedurl=@p)"
-        f"?@p='{_odata_escape(server_relative_url)}'"
+        f"?@p='{urlquote(_odata_escape(server_relative_url))}'"
     )
     resp = context.request.get(api_url, headers={"Accept": "application/json;odata=verbose"})
     if not resp.ok:
