@@ -18,11 +18,24 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 
 from commons.matcher import norm_supplier
+
+
+def _numero(valor):
+    """'1,541.30' -> 1541.3; texto sem numero ('*NOT AVAIL') -> None (spec-vision-numero-texto)."""
+    if not isinstance(valor, str):
+        return valor
+    try:
+        return float(re.sub(r"[,$\s]", "", valor))
+    except ValueError:
+        return None
+
+
+Numero = Annotated[float | None, BeforeValidator(_numero)]
 
 # Achado do cliente: pedir pro modelo aplicar o multiplicador de pack embutido
 # na descricao ("<N>X<size>", ex. "12x200g", "90x30g") de forma confiavel em
@@ -180,11 +193,11 @@ class InvoiceItem(BaseModel):
             "quando nao ha essa coluna."
         ),
     )
-    quantity: float | None = None
+    quantity: Numero = None
     unit: str | None = None
-    unit_price: float | None = None
-    total_price: float | None = None
-    cases: float | None = Field(
+    unit_price: Numero = None
+    total_price: Numero = None
+    cases: Numero = Field(
         None,
         description=(
             "Numero de caixas da linha, SO quando a nota imprime uma coluna de "
@@ -198,7 +211,7 @@ class InvoiceItem(BaseModel):
             "variavel) — nesse caso 'quantity' ja É a caixa."
         ),
     )
-    qtd_caixa: float | None = Field(
+    qtd_caixa: Numero = Field(
         None,
         description=(
             "Quantos itens/unidades individuais tem dentro de 1 caixa/pack/display "
@@ -310,9 +323,9 @@ class InvoiceData(BaseModel):
         None, description="Data de vencimento exatamente como impressa",
     )
     currency: str | None = "USD"
-    subtotal: float | None = None
-    tax_amount: float | None = None
-    total_amount: float | None = None
+    subtotal: Numero = None
+    tax_amount: Numero = None
+    total_amount: Numero = None
 
     # ── Fornecedor (Supplier / From) ──────────────────────────────────────
     supplier_name: str | None = None
